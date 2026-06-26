@@ -85,12 +85,10 @@ sequenceDiagram
   Note over S,K: teardown kills K and (lid) restores SleepDisabled
 ```
 
-Teardown must survive a forcible `wake stop`:
+Teardown removes the keep-awake child and, for `--even-lid`, restores macOS `SleepDisabled`:
 
-- **Windows** — the child is placed in a kill-on-close Job Object; when `stop` calls `TerminateProcess`
-  on the supervisor, the job closes and the OS kills the child. No orphan keeps the machine awake.
-- **Unix** — the supervisor installs a SIGTERM/SIGINT flag that breaks its poll loop into the normal
-  cleanup path; `stop` also re-verifies and restores macOS `SleepDisabled` as a safety net.
+- **Windows** — the child runs in a kill-on-close Job Object, so it dies with the supervisor.
+- **Unix** — a SIGTERM/SIGINT handler runs the cleanup path; `stop` also re-verifies `SleepDisabled`.
 
 ## Key decisions
 

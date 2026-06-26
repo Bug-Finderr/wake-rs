@@ -44,13 +44,9 @@ Same commands, flags, and output. What differs:
 |---|---|---|
 | Language / build | Java 21, GraalVM `native-image`, Maven | Rust 2024, `cargo` |
 | Binary size | multi-MB | ~350 KB |
-| Windows sleep blocking | `[uint32]0x80000003` casts to a negative `Int32`, so the assertion silently no-ops | decimal flags stay in range, so sleep is actually blocked |
-| Windows charge-session stop | the supervisor's child is orphaned and keeps the machine awake | the child is in a kill-on-close Job Object and dies with the supervisor |
 | File locking | `java.nio` `FileLock` | native `std::fs` locks (Rust 1.89+) |
 | Interactive picker | raw mode via `stty` | `crossterm` |
 | Tests | CI smoke | unit + Windows/Linux smoke + macOS compile check |
-
-The two Windows rows are bugs fixed in the port; the rest are implementation choices.
 
 ## Tests
 

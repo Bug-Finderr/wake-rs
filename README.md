@@ -3,7 +3,7 @@
 Keep your machine awake from the CLI — macOS, Linux, Windows. No daemon. The binary is `wake`.
 
 Rust port of [AbhinavGupta-de/wake-cli](https://github.com/AbhinavGupta-de/wake-cli) (originally
-Java/GraalVM). Architecture: [architecture.md](architecture.md) · Behavior contract: [PLAN.md](PLAN.md).
+Java/GraalVM). Design notes: [architecture.md](architecture.md).
 
 ## Install
 
@@ -38,22 +38,19 @@ State lives at `~/.local/state/wake/session.properties` (override with `WAKE_STA
 
 ## wake-rs vs wake-cli
 
-| Aspect | wake-cli (Java) | wake-rs (Rust) |
-|---|---|---|
-| Runtime | Java 21 + GraalVM native-image | Rust, edition 2024 |
-| Binary | GraalVM native (multi-MB) | ~350 KB |
-| Build deps | GraalVM JDK 25, Maven, MSVC | `cargo` + 5 crates |
-| Commands / flags / output | — | identical |
-| Windows sleep blocking | `[uint32]0x80000003` cast throws → silently **no-ops** | decimal flags → **actually blocks** |
-| Charge supervisor stop (Windows) | child **orphaned** on `TerminateProcess` → stays awake | Job Object kill-on-close → child dies |
-| Detached child handle hygiene | JVM does not leak handles | explicit `HANDLE_FLAG_INHERIT` clear + `CREATE_NO_WINDOW` |
-| File lock | `java.nio` `FileLock` | native `std::fs::File` lock (1.89+) |
-| Interactive picker | raw `stty` shelling | `crossterm` |
-| Tests | CI smoke | 14 unit + Windows e2e smoke + Linux/macOS `cargo check` |
-| License | MIT | MIT |
+Same commands, flags, and output. What differs:
 
-Same observable behavior, with the two Windows correctness bugs above fixed. Internal architecture
-differs (free-function platform layer, process-identity verification, native locking).
+| | wake-cli | wake-rs |
+|---|---|---|
+| Language / build | Java 21, GraalVM `native-image`, Maven | Rust 2024, `cargo` |
+| Binary size | multi-MB | ~350 KB |
+| Windows sleep blocking | `[uint32]0x80000003` casts to a negative `Int32`, so the assertion silently no-ops | decimal flags stay in range, so sleep is actually blocked |
+| Windows charge-session stop | the supervisor's child is orphaned and keeps the machine awake | the child is in a kill-on-close Job Object and dies with the supervisor |
+| File locking | `java.nio` `FileLock` | native `std::fs` locks (Rust 1.89+) |
+| Interactive picker | raw mode via `stty` | `crossterm` |
+| Tests | CI smoke | unit + Windows/Linux smoke + macOS compile check |
+
+The two Windows rows are bugs fixed in the port; the rest are implementation choices.
 
 ## Tests
 
@@ -64,10 +61,7 @@ pwsh tests/smoke_windows.ps1     # Windows e2e (mirrors upstream CI)
 
 ## Contributing
 
-This repository does **not accept external contributions**. Pull requests are **closed automatically**
-by [`.github/workflows/close-prs.yml`](.github/workflows/close-prs.yml) (same approach as
-[Bug-Finderr/api-proxy](https://github.com/Bug-Finderr/api-proxy); see also
-[mitchellh/vouch](https://github.com/mitchellh/vouch)). Open an issue instead.
+External contributions are not accepted — pull requests are closed automatically. Open an issue instead.
 
 ## License
 

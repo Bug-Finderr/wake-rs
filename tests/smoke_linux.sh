@@ -29,8 +29,17 @@ run fail "invalid duration"         -- 5x
 run fail "no usable battery found"  -- --until-charge 80
 run ok   "no active session"        -- status
 run ok   "no active session"        -- stop
-# No systemd in a plain container -> graceful "not found", never a panic.
-run fail "systemd-inhibit not found" -- forever
+
+# `forever` depends on whether this host can take systemd inhibitor locks: a plain container has no
+# systemd-inhibit; CI runners have it but polkit may deny. Accept a started session OR any graceful
+# "wake:" error; only a panic (or empty output) is a failure. Always clean up afterwards.
+fout="$("$wake" forever 2>&1)"; fcode=$?
+"$wake" stop >/dev/null 2>&1
+case "$fout" in
+  *panicked*|*RUST_BACKTRACE*) printf 'FAIL : wake forever panicked [exit %s]\n%s\n' "$fcode" "$fout"; fail=1 ;;
+  *"session active"*|*"wake:"*) printf 'ok   : wake forever  [exit %s, graceful]\n' "$fcode" ;;
+  *) printf 'FAIL : wake forever - unrecognized output [exit %s]\n%s\n' "$fcode" "$fout"; fail=1 ;;
+esac
 
 if [ "$fail" = 0 ]; then echo; echo "ALL LINUX SMOKE TESTS PASSED"; else echo; echo "LINUX SMOKE FAILED"; fi
 exit "$fail"

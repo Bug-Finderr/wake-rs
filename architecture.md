@@ -102,5 +102,3 @@ Teardown must survive a forcible `wake stop`:
   only validated numerics and a base64-encoded body.
 - Minimal `unsafe`: confined to `sysutil.rs` for the Windows Job Object and clearing handle
   inheritance, via `windows-sys`.
-
-See [PLAN.md](PLAN.md) for the behavior contract and the intentional differences from the Java original.

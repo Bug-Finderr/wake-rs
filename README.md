@@ -1,6 +1,6 @@
 # wake
 
-Keep your machine awake from the CLI — macOS, Linux, Windows. No daemon. The binary is `wake`.
+Keep your machine awake from the CLI on macOS, Linux, and Windows. No daemon. The binary is `wake`.
 
 Rust port of [AbhinavGupta-de/wake-cli](https://github.com/AbhinavGupta-de/wake-cli) (originally
 Java/GraalVM). Design notes: [architecture.md](architecture.md).
@@ -11,7 +11,19 @@ Java/GraalVM). Design notes: [architecture.md](architecture.md).
 cargo build --release      # -> target/release/wake[.exe]
 ```
 
-Or grab a binary from [Releases](../../releases). Put it on PATH (it must be named `wake`).
+Or download a binary from [Releases](../../releases): one self-contained executable,
+no installer. Put it on your `PATH` as `wake` (`wake.exe` on Windows).
+
+- **Linux**: `install -Dm755 wake-linux-x64 ~/.local/bin/wake`
+- **macOS**: `install -m755 wake-macos-arm64 /usr/local/bin/wake`
+- **Windows** (PowerShell, then reopen the terminal):
+
+  ```powershell
+  $dir = "$env:LOCALAPPDATA\Programs\wake"; mkdir -Force $dir
+  Move-Item wake.exe "$dir\wake.exe"
+  [Environment]::SetEnvironmentVariable("Path",
+    [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
+  ```
 
 ## Usage
 
@@ -57,7 +69,7 @@ pwsh tests/smoke_windows.ps1     # Windows e2e (mirrors upstream CI)
 
 ## Contributing
 
-External contributions are not accepted — pull requests are closed automatically. Open an issue instead.
+External contributions are not accepted; pull requests are closed automatically. Open an issue instead.
 
 ## License
 

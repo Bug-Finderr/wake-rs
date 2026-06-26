@@ -1,4 +1,4 @@
-//! wake — keep your machine awake from the CLI. Rust port of wake-cli (binary name: `wake`).
+//! wake - keep your machine awake from the CLI. Rust port of wake-cli (binary name: `wake`).
 
 mod commands;
 mod durations;
@@ -59,7 +59,7 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
 
 fn print_help() {
     println!(
-        r#"wake — keep your machine awake from the CLI
+        r#"wake - keep your machine awake from the CLI
 
 platforms:
   macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;

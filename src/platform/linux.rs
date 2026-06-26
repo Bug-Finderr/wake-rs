@@ -11,7 +11,7 @@ const POWER_SUPPLY: &str = "/sys/class/power_supply";
 const EXPECTED: &[&str] = &["systemd-inhibit", "sleep", "tail", "wake"];
 const DISPLAY_SYSTEM_INHIBITORS: &[&str] = &["idle:sleep:handle-lid-switch", "idle:sleep", "sleep"];
 const SYSTEM_ONLY_INHIBITORS: &[&str] = &["sleep:handle-lid-switch", "sleep"];
-const INHIBIT_DENIED_MESSAGE: &str = "systemd-inhibit cannot take inhibitor locks in this session (polkit denied) — try from a local desktop session or as root";
+const INHIBIT_DENIED_MESSAGE: &str = "systemd-inhibit cannot take inhibitor locks in this session (polkit denied); try from a local desktop session or as root";
 
 pub fn expected_command_basenames() -> &'static [&'static str] {
     EXPECTED
@@ -201,12 +201,15 @@ fn start_note_for(requested: &str, what: &str) -> Option<String> {
         return None;
     }
     if what == "idle:sleep" {
-        return Some("note: lid-switch inhibition unavailable in this session — idle/sleep inhibition active".into());
+        return Some(
+            "note: lid-switch inhibition unavailable in this session; idle/sleep inhibition active"
+                .into(),
+        );
     }
     if what == "sleep" && requested.contains("idle") {
-        return Some("note: lid-switch and idle inhibition unavailable in this session — sleep inhibition active".into());
+        return Some("note: lid-switch and idle inhibition unavailable in this session; sleep inhibition active".into());
     }
-    Some("note: lid-switch inhibition unavailable in this session — sleep inhibition active".into())
+    Some("note: lid-switch inhibition unavailable in this session; sleep inhibition active".into())
 }
 
 struct Battery {

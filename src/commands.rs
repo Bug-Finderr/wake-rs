@@ -250,7 +250,7 @@ pub fn status() -> Result<()> {
     let started = s.started_at.unwrap_or(now);
     let elapsed = (now - started).num_seconds();
     let remaining = match s.ends_at {
-        None => "—".to_string(),
+        None => "-".to_string(),
         Some(e) => pretty_duration((e - now).num_seconds().max(0)),
     };
     println!("wake: session active (pid {})", s.pid);
@@ -292,8 +292,8 @@ pub fn stop() -> Result<()> {
 // ---- start confirmation + formatting ----
 
 fn print_start_confirmation(s: &Session, note: Option<&str>) {
-    let started = s.started_at.map(hms).unwrap_or_else(|| "—".into());
-    let ends = s.ends_at.map(hms).unwrap_or_else(|| "—".into());
+    let started = s.started_at.map(hms).unwrap_or_else(|| "-".into());
+    let ends = s.ends_at.map(hms).unwrap_or_else(|| "-".into());
     println!("wake: session active (pid {})", s.pid);
     println!("  mode    : {}", s.mode);
     println!("  trigger : {} ({})", s.trigger, s.detail);
@@ -569,7 +569,7 @@ pub fn print_sleep_restore_command(value: i32) {
 }
 
 pub fn print_sleep_restore_rescue(value: i32) {
-    eprintln!("wake: could not restore sleep — run: sudo pmset -a disablesleep {value}");
+    eprintln!("wake: could not restore sleep; run: sudo pmset -a disablesleep {value}");
     print_sleep_state_path();
 }
 
@@ -616,10 +616,10 @@ pub fn recover_stale_lid_session_unlocked() -> Result<()> {
                 )));
             }
             if saved.prior_disable_sleep == 0 {
-                eprintln!("wake: recovered a crashed lid session — restored normal sleep");
+                eprintln!("wake: recovered a crashed lid session; restored normal sleep");
             } else {
                 eprintln!(
-                    "wake: recovered a crashed lid session — restored prior SleepDisabled value"
+                    "wake: recovered a crashed lid session; restored prior SleepDisabled value"
                 );
             }
         }

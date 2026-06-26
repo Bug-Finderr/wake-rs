@@ -176,7 +176,7 @@ impl Picker {
         sb.push('\n');
         sb.push_str(&format!("  {}{}☕ wake{}", bold(), fg_cyan(), reset()));
         sb.push_str(&format!(
-            "  {}— keep your machine awake{}\n\n",
+            "  {}- keep your machine awake{}\n\n",
             dim(),
             reset()
         ));
@@ -382,7 +382,7 @@ fn append_detail(sb: &mut String, s: &Session) {
     let started = s.started_at.unwrap_or(now);
     let elapsed = (now - started).num_seconds();
     let remaining = match s.ends_at {
-        None => "—".to_string(),
+        None => "-".to_string(),
         Some(e) => commands::pretty_duration((e - now).num_seconds().max(0)),
     };
     sb.push_str(&format!("    mode      : {}\n", s.mode));

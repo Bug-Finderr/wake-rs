@@ -122,7 +122,7 @@ pub fn require_child_alive(pid: u32, cmd: &[String]) {
         return;
     }
     eprintln!(
-        "wake: keep-awake process exited immediately ({}) — see platform requirements",
+        "wake: keep-awake process exited immediately ({}); see platform requirements",
         command_basename(cmd)
     );
     std::process::exit(1);
@@ -178,7 +178,7 @@ fn detach(c: &mut Command) {
     c.creation_flags(CREATE_NO_WINDOW);
     // Stop the detached child from inheriting our std handles. If our stdout is a captured pipe
     // (CI, scripts), an inherited copy in the long-lived child would keep that pipe open forever
-    // and hang the caller waiting on EOF — even though we exit promptly.
+    // and hang the caller waiting on EOF, even though we exit promptly.
     win::prevent_std_handle_inheritance();
 }
 

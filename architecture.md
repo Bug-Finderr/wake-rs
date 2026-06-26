@@ -87,13 +87,13 @@ sequenceDiagram
 
 Teardown removes the keep-awake child and, for `--even-lid`, restores macOS `SleepDisabled`:
 
-- **Windows** — the child runs in a kill-on-close Job Object, so it dies with the supervisor.
-- **Unix** — a SIGTERM/SIGINT handler runs the cleanup path; `stop` also re-verifies `SleepDisabled`.
+- **Windows**: the child runs in a kill-on-close Job Object, so it dies with the supervisor.
+- **Unix**: a SIGTERM/SIGINT handler runs the cleanup path; `stop` also re-verifies `SleepDisabled`.
 
 ## Key decisions
 
-- **No `dyn`/trait objects** for platforms — `cfg`-selected free functions; only the target OS compiles.
-- **Process identity over bare pid** — guards against pid reuse without a daemon.
+- **No `dyn`/trait objects** for platforms: `cfg`-selected free functions; only the target OS compiles.
+- **Process identity over bare pid**: guards against pid reuse without a daemon.
 - **Native `std::fs` file locking** (Rust 1.89+) instead of a crate.
 - **Shell out to platform tools**, exactly as the original, passing values as argv (never a shell
   string) so app/pid names can't inject commands. The one generated script (Windows PowerShell) embeds

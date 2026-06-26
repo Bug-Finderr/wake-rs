@@ -1,0 +1,19 @@
+name: Close PRs
+
+# External contributions are not accepted; PRs from anyone else are closed automatically.
+on: pull_request_target
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    env:
+      ALLOWED_USERS: Bug-Finderr
+    steps:
+      - name: Close if not allowed
+        if: ${{ !contains(env.ALLOWED_USERS, github.actor) }}
+        run: gh pr close ${{ github.event.number }} --comment "This repository does not accept external pull requests. Please open an issue instead." --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

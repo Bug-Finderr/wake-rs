@@ -1,6 +1,6 @@
 [package]
 name = "wake-rs"
-version = "0.4.1"
+version = "0.1.0"
 edition = "2024"
 description = "Keep your machine awake from the CLI (Rust port of wake-cli)"
 license = "MIT"

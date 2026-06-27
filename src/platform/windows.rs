@@ -1,11 +1,17 @@
 //! Windows: PowerShell `SetThreadExecutionState` for sleep blocking, `Win32_Battery` for charge,
-//! `tasklist` for app lookup.
+//! `tasklist` for app lookup, and the power-plan lid-close action for `--even-lid`.
 
 use super::KeepAwake;
 use crate::error::{AppError, Result};
 use crate::supervisor::BatteryStatus;
 use base64::Engine;
 use std::process::{Command, Stdio};
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::System::Power::{
+    PowerGetActiveScheme, PowerReadACValueIndex, PowerReadDCValueIndex, PowerSetActiveScheme,
+    PowerWriteACValueIndex, PowerWriteDCValueIndex,
+};
+use windows_sys::core::GUID;
 
 const POWERSHELL_MISSING: &str =
     "powershell not found on PATH; wake requires Windows PowerShell on Windows";
@@ -21,7 +27,7 @@ pub fn supports_interactive() -> bool {
 }
 
 pub fn supports_even_lid() -> bool {
-    false
+    true
 }
 
 pub fn static_start_note() -> Option<String> {
@@ -116,27 +122,112 @@ pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
     Ok(None)
 }
 
-// ---- even-lid: unsupported on Windows ----
+// ---- even-lid: power-plan lid-close action ----
+//
+// `SetThreadExecutionState` (used for idle inhibition above) cannot stop the lid-close switch from
+// sleeping the machine; only the active power plan's lid action can. We read the prior AC/DC lid
+// action, set both to "Do nothing" (0) while a session is active, and restore them on stop/recover.
+// Reading is unprivileged; changing the value requires administrator rights, so the actual write is
+// run through an elevated helper (`__set_lid__`).
 
-fn unsupported<T>() -> Result<T> {
-    Err(AppError::fail(
-        "--even-lid is not supported on this platform",
-    ))
+// Power subgroup/setting GUIDs (verified on the machine):
+//   SUB_BUTTONS = {4f971e89-eebd-4455-a8de-9e59040e7347}
+//   LIDACTION   = {5ca83367-6e45-459f-a27b-476b1d01c936}  (0=do nothing, 1=sleep, 2=hibernate, 3=shut down)
+const SUB_BUTTONS: GUID = GUID {
+    data1: 0x4f97_1e89,
+    data2: 0xeebd,
+    data3: 0x4455,
+    data4: [0xa8, 0xde, 0x9e, 0x59, 0x04, 0x0e, 0x73, 0x47],
+};
+const LIDACTION: GUID = GUID {
+    data1: 0x5ca8_3367,
+    data2: 0x6e45,
+    data3: 0x459f,
+    data4: [0xa2, 0x7b, 0x47, 0x6b, 0x1d, 0x01, 0xc9, 0x36],
+};
+
+/// Pack the AC and DC lid actions into the session's `prior_disable_sleep` (`i32`) field. Each value
+/// is 0..=3, so a nibble each is plenty.
+pub fn encode_lid(ac: u32, dc: u32) -> i32 {
+    ac as i32 | ((dc as i32) << 4)
 }
-pub fn read_disable_sleep() -> Result<i32> {
-    unsupported()
+
+/// Inverse of [`encode_lid`].
+pub fn decode_lid(v: i32) -> (u32, u32) {
+    ((v & 0xF) as u32, ((v >> 4) & 0xF) as u32)
 }
-pub fn authenticate_sudo() -> Result<bool> {
-    unsupported()
+
+/// Read the active power plan's AC and DC lid-close actions. Unprivileged.
+pub fn read_lid_action() -> Result<(u32, u32)> {
+    // SAFETY: FFI into powrprof. `PowerGetActiveScheme` allocates a GUID we must `LocalFree`. The
+    // read calls only borrow `scheme`/our stack `out` for their duration.
+    unsafe {
+        let mut scheme: *mut GUID = std::ptr::null_mut();
+        if PowerGetActiveScheme(std::ptr::null_mut(), &mut scheme) != ERROR_SUCCESS {
+            return Err(AppError::fail("could not read the active power scheme"));
+        }
+        let result = (|| {
+            let mut ac: u32 = 0;
+            let mut dc: u32 = 0;
+            if PowerReadACValueIndex(
+                std::ptr::null_mut(),
+                scheme,
+                &SUB_BUTTONS,
+                &LIDACTION,
+                &mut ac,
+            ) != ERROR_SUCCESS
+            {
+                return Err(AppError::fail("could not read the AC lid action"));
+            }
+            if PowerReadDCValueIndex(
+                std::ptr::null_mut(),
+                scheme,
+                &SUB_BUTTONS,
+                &LIDACTION,
+                &mut dc,
+            ) != ERROR_SUCCESS
+            {
+                return Err(AppError::fail("could not read the DC lid action"));
+            }
+            Ok((ac, dc))
+        })();
+        LocalFree(scheme.cast());
+        result
+    }
 }
-pub fn set_disable_sleep_foreground(_value: i32) -> Result<()> {
-    unsupported()
-}
-pub fn set_disable_sleep_non_interactive(_value: i32) -> Result<bool> {
-    unsupported()
-}
-pub fn refresh_sudo_non_interactive() -> Result<bool> {
-    unsupported()
+
+/// Set the active power plan's AC and DC lid-close actions, then re-activate the scheme so the
+/// change takes effect. Requires administrator rights.
+pub fn write_lid_action(ac: u32, dc: u32) -> Result<()> {
+    // SAFETY: FFI into powrprof. `PowerGetActiveScheme` allocates a GUID we must `LocalFree`; the
+    // write/set calls only borrow `scheme` for their duration.
+    unsafe {
+        let mut scheme: *mut GUID = std::ptr::null_mut();
+        if PowerGetActiveScheme(std::ptr::null_mut(), &mut scheme) != ERROR_SUCCESS {
+            return Err(AppError::fail("could not read the active power scheme"));
+        }
+        let result = (|| {
+            // ERROR_ACCESS_DENIED is the common case (not elevated); any failure here means the
+            // write did not take, so report the same admin-rights guidance regardless of `rc`.
+            let denied = || AppError::fail("setting the lid action requires administrator rights");
+            if PowerWriteACValueIndex(std::ptr::null_mut(), scheme, &SUB_BUTTONS, &LIDACTION, ac)
+                != ERROR_SUCCESS
+            {
+                return Err(denied());
+            }
+            if PowerWriteDCValueIndex(std::ptr::null_mut(), scheme, &SUB_BUTTONS, &LIDACTION, dc)
+                != ERROR_SUCCESS
+            {
+                return Err(denied());
+            }
+            if PowerSetActiveScheme(std::ptr::null_mut(), scheme) != ERROR_SUCCESS {
+                return Err(denied());
+            }
+            Ok(())
+        })();
+        LocalFree(scheme.cast());
+        result
+    }
 }
 
 // ---- helpers ----
@@ -322,5 +413,14 @@ mod tests {
     fn image_candidates() {
         assert_eq!(image_name_candidates("foo"), vec!["foo.exe", "foo"]);
         assert_eq!(image_name_candidates("Foo.EXE"), vec!["Foo.EXE"]);
+    }
+
+    #[test]
+    fn lid_encode_roundtrip_all_combos() {
+        for ac in 0..=3u32 {
+            for dc in 0..=3u32 {
+                assert_eq!(decode_lid(encode_lid(ac, dc)), (ac, dc));
+            }
+        }
     }
 }

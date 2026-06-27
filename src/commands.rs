@@ -2,13 +2,17 @@
 //! recovery machinery and shared formatting helpers.
 
 use crate::error::{AppError, Result};
-use crate::session::{self, PHASE_ENABLING, Session};
+#[cfg(not(windows))]
+use crate::session::PHASE_ENABLING;
+use crate::session::{self, Session};
 use crate::supervisor::{plan_charge, read_battery_status};
 use crate::sysutil;
 use crate::{durations, platform};
 use chrono::{DateTime, Duration, Local, Utc};
 use std::io::IsTerminal;
 
+// Used by the unix picker and the macOS sudo prompt; the Windows even-lid path never prompts.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn is_console() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
@@ -154,14 +158,34 @@ pub fn start(args: &[String]) -> Result<()> {
     }
     .to_string();
 
-    if let Some(charge) = p.charge_target {
-        if p.even_lid {
-            return start_lid_supervisor(&p, &mode, Some(charge));
+    // macOS/Linux route even-lid through the lid supervisor (sudo + SleepDisabled). Windows instead
+    // overlays the power-plan lid action onto the normal session, so it falls through to the standard
+    // start path below and only diverges to set/restore the lid action.
+    #[cfg(not(windows))]
+    {
+        if let Some(charge) = p.charge_target {
+            if p.even_lid {
+                return start_lid_supervisor(&p, &mode, Some(charge));
+            }
+            return start_charge_supervisor(charge, &mode, p.no_display);
         }
-        return start_charge_supervisor(charge, &mode, p.no_display);
+        if p.even_lid {
+            return start_lid_supervisor(&p, &mode, None);
+        }
     }
-    if p.even_lid {
-        return start_lid_supervisor(&p, &mode, None);
+
+    #[cfg(windows)]
+    let prior_lid = if p.even_lid {
+        Some(platform::read_lid_action()?)
+    } else {
+        None
+    };
+
+    if let Some(charge) = p.charge_target {
+        #[cfg(windows)]
+        return start_charge_supervisor_windows(charge, &mode, p.no_display, prior_lid);
+        #[cfg(not(windows))]
+        return start_charge_supervisor(charge, &mode, p.no_display);
     }
 
     let ka = platform::keep_awake_command(p.no_display, p.timeout_sec, p.wait_pid)?;
@@ -172,6 +196,11 @@ pub fn start(args: &[String]) -> Result<()> {
     s.detail = p.trigger_detail.clone();
     s.started_at = Some(now);
     s.ends_at = p.timeout_sec.map(|t| now + Duration::seconds(t));
+    #[cfg(windows)]
+    if let Some((ac, dc)) = prior_lid {
+        s.even_lid = true;
+        s.prior_disable_sleep = platform::encode_lid(ac, dc);
+    }
 
     let mut child = sysutil::spawn_detached(&ka.cmd)?;
     s.pid = child.id();
@@ -183,6 +212,16 @@ pub fn start(args: &[String]) -> Result<()> {
         let _ = child.kill();
         return Err(e);
     }
+
+    #[cfg(windows)]
+    if s.even_lid
+        && let Err(e) = enable_even_lid_windows()
+    {
+        let _ = child.kill();
+        session::delete_state_file();
+        return Err(e);
+    }
+
     print_start_confirmation(&s, ka.note.as_deref());
     Ok(())
 }
@@ -199,6 +238,7 @@ pub fn start_forever(args: &[String]) -> Result<()> {
     start(rest)
 }
 
+#[cfg(not(windows))]
 fn start_charge_supervisor(charge: i32, mode: &str, no_display: bool) -> Result<()> {
     let status = read_battery_status()?;
     let plan = plan_charge(charge, &status)?;
@@ -263,6 +303,15 @@ pub fn status() -> Result<()> {
     );
     println!("  remaining : {remaining}");
     if s.even_lid {
+        #[cfg(windows)]
+        {
+            let (ac, dc) = platform::decode_lid(s.prior_disable_sleep);
+            println!(
+                "  even lid  : active (restore lid action AC={ac} DC={dc}, state {})",
+                session::state_file().display()
+            );
+        }
+        #[cfg(not(windows))]
         println!(
             "  even lid  : active (restore SleepDisabled={}, state {})",
             s.prior_disable_sleep,
@@ -282,6 +331,9 @@ pub fn stop() -> Result<()> {
     };
     sysutil::terminate(s.pid);
     if s.even_lid {
+        #[cfg(windows)]
+        restore_even_lid_windows(&s)?;
+        #[cfg(not(windows))]
         verify_disable_sleep_restored_after_stop(&s)?;
     }
     session::delete_state_file();
@@ -300,6 +352,9 @@ fn print_start_confirmation(s: &Session, note: Option<&str>) {
     println!("  started : {started}");
     println!("  ends    : {ends}");
     if s.even_lid {
+        #[cfg(windows)]
+        println!("note: --even-lid active; lid close will not sleep until this session ends");
+        #[cfg(not(windows))]
         println!(
             "note: --even-lid is active; this Mac should stay awake with the lid closed until the session ends"
         );
@@ -363,11 +418,106 @@ fn parse_int(s: &str, name: &str) -> Result<i32> {
 }
 
 fn even_lid_unsupported_message() -> String {
-    "--even-lid is macOS-only; Linux already handles lid-switch inhibition through systemd when privileged".into()
+    "--even-lid is unsupported on Linux; lid-switch inhibition is handled through systemd when privileged".into()
+}
+
+// ---- even-lid: power-plan lid action (Windows) ----
+
+/// Set the lid-close action to (ac, dc). Tries a direct write first (it succeeds unprivileged for
+/// admin accounts); only if the OS denies it does it retry via the elevated `__set_lid__` helper (UAC).
+#[cfg(windows)]
+fn set_lid(ac: u32, dc: u32) -> Result<()> {
+    if platform::write_lid_action(ac, dc).is_ok() {
+        return Ok(());
+    }
+    let (a, d) = (ac.to_string(), dc.to_string());
+    if sysutil::run_elevated_self(&["__set_lid__", &a, &d])? != 0 {
+        return Err(AppError::fail("could not set the lid-close action"));
+    }
+    Ok(())
+}
+
+/// Set the lid-close action to "Do nothing" (0,0) for a freshly recorded Windows even-lid session.
+#[cfg(windows)]
+fn enable_even_lid_windows() -> Result<()> {
+    set_lid(0, 0)?;
+    let after = platform::read_lid_action()?;
+    if after != (0, 0) {
+        return Err(AppError::fail(format!(
+            "failed to enable --even-lid; lid action is AC={} DC={}",
+            after.0, after.1
+        )));
+    }
+    Ok(())
+}
+
+/// Restore the prior lid action recorded in `s` when stopping a Windows even-lid session.
+#[cfg(windows)]
+fn restore_even_lid_windows(s: &Session) -> Result<()> {
+    let (ac, dc) = platform::decode_lid(s.prior_disable_sleep);
+    if (ac, dc) == (0, 0) {
+        // Prior action was already "do nothing"; nothing to restore.
+        return Ok(());
+    }
+    set_lid(ac, dc)?;
+    let after = platform::read_lid_action()?;
+    if after != (ac, dc) {
+        return Err(AppError::fail(format!(
+            "failed to restore the lid action to AC={ac} DC={dc}; current is AC={} DC={}",
+            after.0, after.1
+        )));
+    }
+    eprintln!("wake: restored the lid action to AC={ac} DC={dc}");
+    Ok(())
+}
+
+/// Windows charge + even-lid: spawn the normal charge supervisor (carrying the encoded prior lid
+/// action so teardown can restore it), then set the lid action once the session is published.
+#[cfg(windows)]
+fn start_charge_supervisor_windows(
+    charge: i32,
+    mode: &str,
+    no_display: bool,
+    prior_lid: Option<(u32, u32)>,
+) -> Result<()> {
+    let status = read_battery_status()?;
+    let plan = plan_charge(charge, &status)?;
+    if plan.already_met {
+        println!(
+            "wake: battery already at {}%; target {charge}% reached",
+            status.percent
+        );
+        return Ok(());
+    }
+    let prior_encoded = prior_lid.map(|(ac, dc)| platform::encode_lid(ac, dc));
+    let cmd = vec![
+        sysutil::self_exe()?,
+        "__supervise_charge__".into(),
+        charge.to_string(),
+        no_display.to_string(),
+        mode.to_string(),
+        prior_encoded.map(|v| v.to_string()).unwrap_or_default(),
+    ];
+    let _child = sysutil::spawn_detached(&cmd)?;
+    wait_for_state_file();
+    let Some(s) = session::read_if_alive(false) else {
+        eprintln!("wake: supervisor failed to start");
+        std::process::exit(1);
+    };
+    if prior_lid.is_some()
+        && let Err(e) = enable_even_lid_windows()
+    {
+        sysutil::terminate(s.pid);
+        session::delete_state_file();
+        return Err(e);
+    }
+    print_start_confirmation(&s, None);
+    Ok(())
 }
 
 // ---- even-lid: sudo + SleepDisabled (macOS) ----
 
+#[cfg(not(windows))]
 fn ensure_sudo_for_even_lid() -> Result<()> {
     if !is_console() {
         return Err(AppError::fail(
@@ -385,6 +535,7 @@ fn ensure_sudo_for_even_lid() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> Result<()> {
     let mut supervisor_detail = p.trigger_detail.clone();
     if let Some(target) = charge_target {
@@ -426,6 +577,7 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
     }
 }
 
+#[cfg(not(windows))]
 fn lid_enable_and_launch(
     p: &Parsed,
     _mode: &str,
@@ -457,6 +609,7 @@ fn lid_enable_and_launch(
         .ok_or_else(|| AppError::fail("lid supervisor failed to publish session state"))
 }
 
+#[cfg(not(windows))]
 fn write_lid_startup_recovery_record(
     trigger: &str,
     detail: &str,
@@ -479,6 +632,7 @@ fn write_lid_startup_recovery_record(
     session::write(&s)
 }
 
+#[cfg(not(windows))]
 fn wait_for_supervisor_session(supervisor_pid: u32, even_lid: bool) -> Option<Session> {
     for _ in 0..50 {
         if let Some(s) = session::read_if_alive(false)
@@ -495,6 +649,7 @@ fn wait_for_supervisor_session(supervisor_pid: u32, even_lid: bool) -> Option<Se
     None
 }
 
+#[cfg(not(windows))]
 fn verify_disable_sleep_restored_after_stop(s: &Session) -> Result<()> {
     for _ in 0..20 {
         if platform::read_disable_sleep()? == s.prior_disable_sleep {
@@ -524,6 +679,7 @@ fn verify_disable_sleep_restored_after_stop(s: &Session) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn restore_disable_sleep_foreground(prior: i32) -> Result<()> {
     if let Err(e) = platform::set_disable_sleep_foreground(prior) {
         print_sleep_restore_rescue(prior);
@@ -540,6 +696,7 @@ fn restore_disable_sleep_foreground(prior: i32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn restore_disable_sleep_with_prompt_if_possible(
     prior: i32,
     no_console_message: &str,
@@ -556,6 +713,7 @@ fn restore_disable_sleep_with_prompt_if_possible(
     restore_disable_sleep_foreground(prior)
 }
 
+#[cfg(not(windows))]
 fn restore_disable_sleep_best_effort(prior: i32) -> bool {
     let _ = platform::set_disable_sleep_foreground(prior);
     platform::read_disable_sleep()
@@ -563,16 +721,19 @@ fn restore_disable_sleep_best_effort(prior: i32) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(windows))]
 pub fn print_sleep_restore_command(value: i32) {
     eprintln!("wake: manual sleep restore command: sudo pmset -a disablesleep {value}");
     print_sleep_state_path();
 }
 
+#[cfg(not(windows))]
 pub fn print_sleep_restore_rescue(value: i32) {
     eprintln!("wake: could not restore sleep; run: sudo pmset -a disablesleep {value}");
     print_sleep_state_path();
 }
 
+#[cfg(not(windows))]
 fn print_sleep_state_path() {
     eprintln!("wake: recovery state: {}", session::state_file().display());
 }
@@ -599,32 +760,59 @@ pub fn recover_stale_lid_session_unlocked() -> Result<()> {
     if saved.even_lid {
         if !platform::supports_even_lid() {
             return Err(AppError::fail(
-                "stale --even-lid session found, but this platform cannot restore SleepDisabled",
+                "stale --even-lid session found, but this platform cannot restore the lid action",
             ));
         }
-        let current = platform::read_disable_sleep()?;
-        if current != saved.prior_disable_sleep {
-            restore_disable_sleep_with_prompt_if_possible(
-                saved.prior_disable_sleep,
-                "crashed lid session needs sudo recovery, but no interactive terminal is available",
-            )?;
-            let after = platform::read_disable_sleep()?;
-            if after != saved.prior_disable_sleep {
-                print_sleep_restore_rescue(saved.prior_disable_sleep);
-                return Err(AppError::fail(format!(
-                    "failed to recover crashed lid session; SleepDisabled is {after}"
-                )));
-            }
-            if saved.prior_disable_sleep == 0 {
-                eprintln!("wake: recovered a crashed lid session; restored normal sleep");
-            } else {
-                eprintln!(
-                    "wake: recovered a crashed lid session; restored prior SleepDisabled value"
-                );
-            }
-        }
+        #[cfg(windows)]
+        recover_crashed_even_lid_windows(&saved)?;
+        #[cfg(not(windows))]
+        recover_crashed_even_lid_unix(&saved)?;
     }
     session::delete_state_file();
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn recover_crashed_even_lid_unix(saved: &Session) -> Result<()> {
+    let current = platform::read_disable_sleep()?;
+    if current != saved.prior_disable_sleep {
+        restore_disable_sleep_with_prompt_if_possible(
+            saved.prior_disable_sleep,
+            "crashed lid session needs sudo recovery, but no interactive terminal is available",
+        )?;
+        let after = platform::read_disable_sleep()?;
+        if after != saved.prior_disable_sleep {
+            print_sleep_restore_rescue(saved.prior_disable_sleep);
+            return Err(AppError::fail(format!(
+                "failed to recover crashed lid session; SleepDisabled is {after}"
+            )));
+        }
+        if saved.prior_disable_sleep == 0 {
+            eprintln!("wake: recovered a crashed lid session; restored normal sleep");
+        } else {
+            eprintln!("wake: recovered a crashed lid session; restored prior SleepDisabled value");
+        }
+    }
+    Ok(())
+}
+
+/// Crash recovery for a stale Windows even-lid session: re-elevate and restore the prior lid action.
+#[cfg(windows)]
+fn recover_crashed_even_lid_windows(saved: &Session) -> Result<()> {
+    let (ac, dc) = platform::decode_lid(saved.prior_disable_sleep);
+    let current = platform::read_lid_action()?;
+    if current == (ac, dc) {
+        return Ok(());
+    }
+    set_lid(ac, dc)?;
+    let after = platform::read_lid_action()?;
+    if after != (ac, dc) {
+        return Err(AppError::fail(format!(
+            "failed to recover crashed lid session; lid action is AC={} DC={}",
+            after.0, after.1
+        )));
+    }
+    eprintln!("wake: recovered a crashed lid session; restored the prior lid action");
     Ok(())
 }
 
@@ -632,14 +820,21 @@ fn recover_malformed_lid_session_unlocked(m: &session::MalformedState) -> Result
     if !platform::supports_even_lid() {
         if m.has_lid_recovery_hints() {
             return Err(AppError::fail(format!(
-                "malformed --even-lid recovery state found at {}, but this platform cannot restore SleepDisabled",
+                "malformed --even-lid recovery state found at {}, but this platform cannot restore the lid action",
                 session::state_file().display()
             )));
         }
         session::delete_state_file();
         return Ok(());
     }
+    #[cfg(windows)]
+    return recover_malformed_lid_session_windows(m);
+    #[cfg(not(windows))]
+    recover_malformed_lid_session_unix(m)
+}
 
+#[cfg(not(windows))]
+fn recover_malformed_lid_session_unix(m: &session::MalformedState) -> Result<()> {
     let current = platform::read_disable_sleep().ok();
     if !m.has_lid_recovery_hints() && current != Some(1) {
         session::delete_state_file();
@@ -674,6 +869,34 @@ fn recover_malformed_lid_session_unlocked(m: &session::MalformedState) -> Result
         return Err(AppError::fail(format!(
             "failed to recover malformed lid session; SleepDisabled is {after}"
         )));
+    }
+    session::delete_state_file();
+    Ok(())
+}
+
+/// Windows malformed-state recovery: the prior lid action is not trustworthy, so restore the OS
+/// default (lid close = Sleep) so the machine is not left unable to sleep on lid close.
+#[cfg(windows)]
+fn recover_malformed_lid_session_windows(m: &session::MalformedState) -> Result<()> {
+    if !m.has_lid_recovery_hints() {
+        session::delete_state_file();
+        return Ok(());
+    }
+    let (safe_ac, safe_dc) = (1u32, 1u32); // Sleep on lid close
+    eprintln!(
+        "wake: malformed --even-lid recovery state at {}; restoring lid close to Sleep",
+        session::state_file().display()
+    );
+    let current = platform::read_lid_action()?;
+    if current != (safe_ac, safe_dc) {
+        set_lid(safe_ac, safe_dc)?;
+        let after = platform::read_lid_action()?;
+        if after != (safe_ac, safe_dc) {
+            return Err(AppError::fail(format!(
+                "failed to recover malformed lid session; lid action is AC={} DC={}",
+                after.0, after.1
+            )));
+        }
     }
     session::delete_state_file();
     Ok(())

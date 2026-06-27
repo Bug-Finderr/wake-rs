@@ -21,7 +21,7 @@ run() { # run <expect-exit:ok|fail> <needle> -- <args...>
   else printf 'FAIL : wake %s  [exit %s]\n%s\n' "$*" "$code" "$out"; fail=1; fi
 }
 
-run ok   "wake 0.1.0"               -- --version
+run ok   "wake 0.2.0"               -- --version
 run ok   "wake --until-charge N"    -- --help
 run fail "conflicting triggers"     -- --until-charge 80 --while-pid 1
 run fail "unknown flag"             -- --bogus

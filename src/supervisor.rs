@@ -1,10 +1,14 @@
 //! Detached supervisors: `until-charge` (all platforms) and `even-lid` (macOS), plus the battery
 //! status / charge-plan model they share with the foreground command.
 
+#[cfg(not(windows))]
+use crate::commands;
 use crate::error::{AppError, Result};
-use crate::session::{self, PHASE_ACTIVE, Session};
+use crate::platform;
+#[cfg(not(windows))]
+use crate::session::PHASE_ACTIVE;
+use crate::session::{self, Session};
 use crate::sysutil;
-use crate::{commands, platform};
 use chrono::Utc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +17,7 @@ use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const LID_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(not(windows))]
 const SUDO_HEARTBEAT: Duration = Duration::from_secs(180);
 
 #[derive(Clone)]
@@ -104,6 +109,12 @@ pub fn run_charge(args: &[String]) -> Result<()> {
         .map_err(|_| AppError::fail("supervisor: bad target"))?;
     let no_display = args[2] == "true";
     let mode = args[3].clone();
+    // arg[4] (Windows even-lid only): encoded prior lid action to restore on teardown.
+    #[cfg(windows)]
+    let prior_lid: Option<i32> = args
+        .get(4)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok());
 
     let (initial, plan) =
         match read_battery_status().and_then(|s| plan_charge(target, &s).map(|p| (s, p))) {
@@ -137,6 +148,11 @@ pub fn run_charge(args: &[String]) -> Result<()> {
     );
     s.started_at = Some(Utc::now());
     s.ends_at = None;
+    #[cfg(windows)]
+    if let Some(prior) = prior_lid {
+        s.even_lid = true;
+        s.prior_disable_sleep = prior;
+    }
     if let Err(e) = s
         .capture_process_identity()
         .and_then(|_| session::write(&s))
@@ -171,12 +187,35 @@ pub fn run_charge(args: &[String]) -> Result<()> {
     }
     let _ = child.kill();
     let _ = child.wait();
+    #[cfg(windows)]
+    if let Some(prior) = prior_lid {
+        restore_lid_on_windows(prior);
+    }
     session::delete_state_file();
     Ok(())
 }
 
+/// Restore the prior lid action when a Windows even-lid charge supervisor tears down (target reached
+/// or stop). Re-elevates via the `__set_lid__` helper; best-effort, never blocks teardown.
+#[cfg(windows)]
+fn restore_lid_on_windows(prior: i32) {
+    let (ac, dc) = platform::decode_lid(prior);
+    if (ac, dc) == (0, 0) {
+        return;
+    }
+    let _ = sysutil::run_elevated_self(&["__set_lid__", &ac.to_string(), &dc.to_string()]);
+}
+
 // ---- even-lid supervisor (macOS) ----
 
+/// Windows never spawns the lid supervisor (even-lid is overlaid on the normal session via the
+/// power-plan lid action), so this is an inert stub there.
+#[cfg(windows)]
+pub fn run_lid(_args: &[String]) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
 pub fn run_lid(args: &[String]) -> Result<()> {
     if args.len() < 7 {
         return Err(AppError::fail("lid supervisor: bad args"));
@@ -271,6 +310,7 @@ pub fn run_lid(args: &[String]) -> Result<()> {
 }
 
 /// Restore SleepDisabled and remove state, matching the reference lid teardown.
+#[cfg(not(windows))]
 fn lid_cleanup(child_pid: u32, prior_disable_sleep: i32) {
     if let Ok(current) = platform::read_disable_sleep()
         && current != prior_disable_sleep
@@ -288,6 +328,7 @@ fn lid_cleanup(child_pid: u32, prior_disable_sleep: i32) {
     }
 }
 
+#[cfg(not(windows))]
 fn charge_reached(target: i32, charging_up: Option<bool>) -> bool {
     match charging_up {
         None => false,
@@ -303,6 +344,7 @@ fn charge_reached(target: i32, charging_up: Option<bool>) -> bool {
     }
 }
 
+#[cfg(not(windows))]
 fn optional_i64(raw: &str) -> Option<i64> {
     if raw.trim().is_empty() {
         None
@@ -311,6 +353,7 @@ fn optional_i64(raw: &str) -> Option<i64> {
     }
 }
 
+#[cfg(not(windows))]
 fn optional_u32(raw: &str) -> Option<u32> {
     if raw.trim().is_empty() {
         None
@@ -319,6 +362,7 @@ fn optional_u32(raw: &str) -> Option<u32> {
     }
 }
 
+#[cfg(not(windows))]
 fn parse_disable_sleep(raw: &str) -> Result<i32> {
     match raw.trim().parse::<i32>() {
         Ok(v @ (0 | 1)) => Ok(v),

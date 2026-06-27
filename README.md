@@ -36,7 +36,7 @@ wake --until-charge 80   # until battery hits N% (1-100)
 wake --while-pid 1234    # while a pid is alive
 wake --while-app Slack   # while a process is alive
 wake --no-display        # block system sleep, allow display sleep
-wake --even-lid          # macOS only: stay awake with the lid closed (sudo)
+wake --even-lid          # stay awake with the lid closed (macOS: sudo; Windows: sets lid-close action)
 wake status | stop | help | version
 ```
 
@@ -46,7 +46,7 @@ State lives at `~/.local/state/wake/session.properties` (override with `WAKE_STA
 |---|---|
 | macOS | `caffeinate` + `pmset`; `--even-lid` via `sudo pmset -a disablesleep` |
 | Linux | `systemd-inhibit` (systemd ≥ 190), degrading when polkit denies lid locks; sysfs battery |
-| Windows | PowerShell `SetThreadExecutionState`; `Win32_Battery`; `tasklist` (no picker) |
+| Windows | PowerShell `SetThreadExecutionState`; `Win32_Battery`; `tasklist` (no picker); `--even-lid` sets the power-plan lid-close action to Do Nothing (UAC only if the direct write is denied) |
 
 ## wake-rs vs wake-cli
 

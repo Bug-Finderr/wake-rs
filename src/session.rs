@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 
+#[cfg(not(windows))]
 pub const PHASE_ENABLING: &str = "enabling";
 pub const PHASE_ACTIVE: &str = "active";
 
@@ -99,6 +100,9 @@ pub enum SavedState {
 pub struct MalformedState {
     pub even_lid_true: bool,
     pub has_prior_disable_sleep: bool,
+    // Only the macOS malformed-recovery path inspects the parsed prior; Windows recovery restores a
+    // safe default instead.
+    #[cfg_attr(windows, allow(dead_code))]
     pub parsed_prior_disable_sleep: Option<i32>,
 }
 
@@ -198,10 +202,25 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+// The `priorDisableSleep` field is reused on Windows to store the encoded prior lid action
+// (`ac | (dc << 4)`, each nibble 0..=3), so accept that range there; elsewhere it is macOS's
+// SleepDisabled which is strictly 0 or 1.
+#[cfg(not(windows))]
 fn parse_disable_sleep(raw: &str) -> Option<i32> {
     match raw.trim().parse::<i32>().ok()? {
         v @ (0 | 1) => Some(v),
         _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn parse_disable_sleep(raw: &str) -> Option<i32> {
+    let v = raw.trim().parse::<i32>().ok()?;
+    let (ac, dc) = (v & 0xF, (v >> 4) & 0xF);
+    if v == (ac | (dc << 4)) && (0..=3).contains(&ac) && (0..=3).contains(&dc) {
+        Some(v)
+    } else {
+        None
     }
 }
 

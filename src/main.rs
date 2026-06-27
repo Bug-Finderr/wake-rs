@@ -42,6 +42,8 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
             "forever" | "indefinite" => return commands::start_forever(args),
             "__supervise_charge__" => return supervisor::run_charge(args),
             "__supervise_lid__" => return supervisor::run_lid(args),
+            #[cfg(windows)]
+            "__set_lid__" => return set_lid(&args[1..]),
             _ => return commands::start(args),
         }
     }
@@ -55,6 +57,24 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
         }
     }
     commands::start(&[])
+}
+
+/// Hidden, Windows-only helper meant to run elevated: set the power-plan lid action to `<ac> <dc>`.
+/// Success is a silent exit 0; failure prints to stderr (via `main`) and exits non-zero.
+#[cfg(windows)]
+fn set_lid(args: &[String]) -> Result<(), AppError> {
+    fn parse(raw: &str) -> Result<u32, AppError> {
+        match raw.trim().parse::<u32>() {
+            Ok(v @ 0..=3) => Ok(v),
+            _ => Err(AppError::fail(
+                "__set_lid__ expects two lid actions in 0..=3",
+            )),
+        }
+    }
+    let (Some(ac), Some(dc)) = (args.first(), args.get(1)) else {
+        return Err(AppError::fail("__set_lid__ expects <ac> <dc>"));
+    };
+    platform::write_lid_action(parse(ac)?, parse(dc)?)
 }
 
 fn print_help() {
@@ -78,7 +98,8 @@ direct:
   wake --while-pid PID       stay awake while PID is running
   wake --while-app NAME      stay awake while named app/process is running
   wake --no-display          prevent system sleep only, allow display sleep
-  wake --even-lid            macOS only: use sudo to stay awake with lid closed
+  wake --even-lid            stay awake with the lid closed (macOS uses sudo; Windows sets
+                             the lid-close action to Do Nothing)
   wake status                show current session
   wake stop                  end current session
   wake version               print version

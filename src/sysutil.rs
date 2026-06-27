@@ -169,6 +169,15 @@ pub fn spawn_supervised_child(cmd: &[String]) -> std::io::Result<Child> {
     Ok(child)
 }
 
+/// Relaunch our own executable elevated (UAC `runas`) with `args`, wait for it, and return its exit
+/// code. Used on Windows for `--even-lid`, where changing the power-plan lid action needs admin.
+#[cfg(windows)]
+pub fn run_elevated_self(args: &[&str]) -> Result<i32> {
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::fail(format!("can't determine executable path: {e}")))?;
+    win::shell_execute_runas(&exe, args)
+}
+
 #[cfg(windows)]
 fn detach(c: &mut Command) {
     use std::os::windows::process::CommandExt;
@@ -184,10 +193,15 @@ fn detach(c: &mut Command) {
 
 #[cfg(windows)]
 mod win {
+    use crate::error::{AppError, Result};
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
     use std::process::Child;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        CloseHandle, ERROR_CANCELLED, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+        SetHandleInformation,
     };
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -197,6 +211,66 @@ mod win {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject,
     };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, INFINITE, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+
+    /// NUL-terminated UTF-16 buffer for a Win32 wide-string argument.
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// Run `exe` elevated via the shell `runas` verb (triggers a UAC prompt), wait for it to exit,
+    /// and return its exit code. The child window is hidden.
+    pub fn shell_execute_runas(exe: &Path, args: &[&str]) -> Result<i32> {
+        // Quote each argument so spaces are preserved; the args we pass are our own literals/numbers.
+        let params: String = args
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let verb = wide(OsStr::new("runas"));
+        let file = wide(exe.as_os_str());
+        let params_w = wide(OsStr::new(&params));
+
+        // SAFETY: FFI into shell32/kernel32. `info` is zeroed then fully initialized; the wide-string
+        // buffers outlive the `ShellExecuteExW` call. On success `hProcess` is an owned handle we wait
+        // on and then close.
+        unsafe {
+            let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+            info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+            info.fMask = SEE_MASK_NOCLOSEPROCESS;
+            info.lpVerb = verb.as_ptr();
+            info.lpFile = file.as_ptr();
+            info.lpParameters = params_w.as_ptr();
+            info.nShow = 0; // SW_HIDE
+
+            if ShellExecuteExW(&mut info) == 0 {
+                if GetLastError() == ERROR_CANCELLED {
+                    return Err(AppError::fail(
+                        "elevation was cancelled; --even-lid needs administrator rights to change the lid action",
+                    ));
+                }
+                return Err(AppError::fail("failed to launch the elevated helper"));
+            }
+            if info.hProcess.is_null() {
+                return Err(AppError::fail("elevated helper did not start"));
+            }
+            WaitForSingleObject(info.hProcess, INFINITE);
+            let mut code: u32 = 0;
+            let got = GetExitCodeProcess(info.hProcess, &mut code);
+            CloseHandle(info.hProcess);
+            if got == 0 {
+                return Err(AppError::fail(
+                    "could not read the elevated helper's exit code",
+                ));
+            }
+            Ok(code as i32)
+        }
+    }
 
     pub fn prevent_std_handle_inheritance() {
         for n in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {

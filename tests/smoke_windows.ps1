@@ -50,7 +50,7 @@ function Assert-Contains {
 $failed = $false
 try {
   Assert-Contains (Assert-Success @('--version')) 'wake '
-  Assert-Contains (Assert-Success @('version'))   'wake 0.1.0'
+  Assert-Contains (Assert-Success @('version'))   'wake 0.2.0'
   Assert-Contains (Assert-Success @('--help'))    'wake --until-charge N'
 
   $conflict = Assert-Failure @('--until-charge', '80', '--while-pid', '1') -ExpectedCode 2

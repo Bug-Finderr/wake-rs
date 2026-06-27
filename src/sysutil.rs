@@ -24,6 +24,19 @@ fn refreshed(pid: u32) -> System {
     sys
 }
 
+/// Existence-only refresh: `nothing()` skips exe/cmd/cwd/user/disk/mem, but the process is still
+/// found by the underlying scan, so `.process(pid).is_some()` reflects liveness. Used on the hot
+/// per-second liveness path where the heavier `everything()` fields are not read.
+fn process_exists(pid: u32) -> bool {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(Pid::from_u32(pid)).is_some()
+}
+
 fn identity_of(sys: &System, pid: u32) -> Option<Identity> {
     let p = sys.process(Pid::from_u32(pid))?;
     let command = p
@@ -51,7 +64,7 @@ fn identity_of(sys: &System, pid: u32) -> Option<Identity> {
 }
 
 pub fn is_alive(pid: u32) -> bool {
-    refreshed(pid).process(Pid::from_u32(pid)).is_some()
+    process_exists(pid)
 }
 
 /// Live identity of a running pid, or None if it is gone.
@@ -143,6 +156,17 @@ pub fn self_exe() -> Result<String> {
     std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| AppError::fail(format!("can't determine executable path: {e}")))
+}
+
+/// Like [`spawn_detached`], but on failure names the program basename and adds a hint, so a bare
+/// `Access is denied. (os error 5)` becomes `couldn't launch <prog>: <err> ...`.
+pub fn spawn_named(cmd: &[String]) -> Result<Child> {
+    spawn_detached(cmd).map_err(|e| {
+        AppError::fail(format!(
+            "couldn't launch {}: {e}; check it is installed and on PATH",
+            command_basename(cmd)
+        ))
+    })
 }
 
 /// Spawn a fully detached child with null stdio. The returned `Child` is not waited on by callers

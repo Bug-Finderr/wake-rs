@@ -13,7 +13,7 @@ mod interactive;
 
 use error::AppError;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -77,7 +77,7 @@ fn set_lid(args: &[String]) -> Result<(), AppError> {
     platform::write_lid_action(parse(ac)?, parse(dc)?)
 }
 
-fn print_help() {
+pub(crate) fn print_help() {
     println!(
         r#"wake - keep your machine awake from the CLI
 
@@ -88,6 +88,7 @@ platforms:
 
 interactive:
   wake                       open the picker on macOS/Linux; on Windows, start indefinitely
+                             (macOS/Linux: a non-interactive or piped 'wake' starts indefinitely)
 
 direct:
   wake forever               stay awake indefinitely (no menu)
@@ -102,14 +103,18 @@ direct:
                              the lid-close action to Do Nothing)
   wake status                show current session
   wake stop                  end current session
-  wake version               print version
-  wake help                  this message
+  wake version, -v           print version
+  wake help, -h              this message
 
 duration syntax:
   90s, 5m, 1h, 1h30m, 2h45m30s, 1d, or plain seconds (3600)
   maximum: 30d
 
+exit codes:
+  2 usage, 1 error
+
 state file:
-  ~/.local/state/wake/session.properties (override dir with WAKE_STATE_DIR)"#
+  ~/.local/state/wake/session.properties (override dir with WAKE_STATE_DIR)
+  Windows: %LOCALAPPDATA%\wake\session.properties"#
     );
 }

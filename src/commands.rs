@@ -109,7 +109,15 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
                     return Err(AppError::usage(format!("unknown flag: {other}")));
                 }
                 trigger_flag = claim_trigger(trigger_flag, "duration")?;
-                p.timeout_sec = Some(durations::parse(other)?);
+                p.timeout_sec = Some(durations::parse(other).map_err(|e| {
+                    // A bare all-alphabetic token (e.g. `wake statsu`) is a mistyped subcommand, not a
+                    // duration; report that instead of the misleading "invalid duration" error.
+                    if !other.is_empty() && other.chars().all(|c| c.is_ascii_alphabetic()) {
+                        AppError::usage(format!("unknown command or duration: {other}"))
+                    } else {
+                        e
+                    }
+                })?);
                 p.trigger_detail = other.to_string();
                 p.trigger = "timed".into();
             }
@@ -134,6 +142,16 @@ fn claim_trigger(current: Option<String>, next: &str) -> Result<Option<String>> 
 }
 
 pub fn start(args: &[String]) -> Result<()> {
+    // Honor help/version anywhere in the args (not just as the first token), so `wake 1h --help`
+    // prints help instead of erroring on an "unknown flag".
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        crate::print_help();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "-v" || a == "--version") {
+        println!("wake {}", crate::VERSION);
+        return Ok(());
+    }
     let p = parse_start_args(args)?;
 
     if p.even_lid && !platform::supports_even_lid() {
@@ -202,7 +220,7 @@ pub fn start(args: &[String]) -> Result<()> {
         s.prior_disable_sleep = platform::encode_lid(ac, dc);
     }
 
-    let mut child = sysutil::spawn_detached(&ka.cmd)?;
+    let mut child = sysutil::spawn_named(&ka.cmd)?;
     s.pid = child.id();
     sysutil::require_child_alive(s.pid, &ka.cmd);
     if let Err(e) = s
@@ -256,7 +274,7 @@ fn start_charge_supervisor(charge: i32, mode: &str, no_display: bool) -> Result<
         no_display.to_string(),
         mode.to_string(),
     ];
-    let _child = sysutil::spawn_detached(&cmd)?;
+    let _child = sysutil::spawn_named(&cmd)?;
     wait_for_state_file();
     match session::read_if_alive(false) {
         Some(s) => print_start_confirmation(&s, None),
@@ -498,7 +516,7 @@ fn start_charge_supervisor_windows(
         mode.to_string(),
         prior_encoded.map(|v| v.to_string()).unwrap_or_default(),
     ];
-    let _child = sysutil::spawn_detached(&cmd)?;
+    let _child = sysutil::spawn_named(&cmd)?;
     wait_for_state_file();
     let Some(s) = session::read_if_alive(false) else {
         eprintln!("wake: supervisor failed to start");
@@ -604,7 +622,7 @@ fn lid_enable_and_launch(
         supervisor_detail.to_string(),
         charge_target.map(|c| c.to_string()).unwrap_or_default(),
     ];
-    let child = sysutil::spawn_detached(&cmd)?;
+    let child = sysutil::spawn_named(&cmd)?;
     wait_for_supervisor_session(child.id(), true)
         .ok_or_else(|| AppError::fail("lid supervisor failed to publish session state"))
 }

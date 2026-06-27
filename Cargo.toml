@@ -1,7 +1,8 @@
 [package]
 name = "wake-rs"
-version = "0.2.0"
+version = "0.1.1"
 edition = "2024"
+rust-version = "1.89"
 description = "Keep your machine awake from the CLI (Rust port of wake-cli)"
 license = "MIT"
 
@@ -12,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 base64 = "0.22.1"
 chrono = "0.4.45"
-sysinfo = "0.39.5"
+sysinfo = { version = "0.39.5", default-features = false, features = ["system"] }
 
 [target."cfg(unix)".dependencies]
 crossterm = "0.29.0"

@@ -26,8 +26,8 @@ graph TD
 ```
 
 `platform` is a trait-free abstraction: each OS module exposes the same free functions, selected at
-compile time by `cfg` and re-exported from `platform/mod.rs`. Even-lid functions are real on macOS and
-unsupported stubs elsewhere.
+compile time by `cfg` and re-exported from `platform/mod.rs`. Even-lid is real on macOS (sudo +
+SleepDisabled) and on Windows (the power-plan lid action via powrprof); Linux leaves it unsupported.
 
 ## Command dispatch
 
@@ -98,5 +98,6 @@ Teardown removes the keep-awake child and, for `--even-lid`, restores macOS `Sle
 - **Shell out to platform tools**, exactly as the original, passing values as argv (never a shell
   string) so app/pid names can't inject commands. The one generated script (Windows PowerShell) embeds
   only validated numerics and a base64-encoded body.
-- Minimal `unsafe`: confined to `sysutil.rs` for the Windows Job Object and clearing handle
-  inheritance, via `windows-sys`.
+- Minimal `unsafe`, all Windows-only via `windows-sys`: `sysutil.rs` for the Job Object, clearing
+  handle inheritance, and `ShellExecuteExW` elevation; `platform/windows.rs` for the powrprof
+  lid-action read/write (`read_lid_action`/`write_lid_action`).

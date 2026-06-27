@@ -278,6 +278,7 @@ pub fn run_lid(args: &[String]) -> Result<()> {
     let stop = install_stop_flag();
     let start = Instant::now();
     let mut next_sudo = start + SUDO_HEARTBEAT;
+    let mut last_check = Instant::now();
     loop {
         sleep(LID_POLL_INTERVAL);
         if stop.load(Ordering::Relaxed) || !sysutil::is_alive(child.id()) {
@@ -293,10 +294,15 @@ pub fn run_lid(args: &[String]) -> Result<()> {
         {
             break;
         }
-        if let Some(target) = charge_target
-            && charge_reached(target, charging_up)
-        {
-            break;
+        // Gate the battery poll to POLL_INTERVAL: forking pmset every second would run it ~86k
+        // times/day. Liveness/timeout/wait_pid stay at 1s; the sudo heartbeat keeps its own cadence.
+        if last_check.elapsed() >= POLL_INTERVAL {
+            last_check = Instant::now();
+            if let Some(target) = charge_target
+                && charge_reached(target, charging_up)
+            {
+                break;
+            }
         }
         if Instant::now() >= next_sudo {
             let _ = platform::refresh_sudo_non_interactive();
@@ -367,5 +373,77 @@ fn parse_disable_sleep(raw: &str) -> Result<i32> {
     match raw.trim().parse::<i32>() {
         Ok(v @ (0 | 1)) => Ok(v),
         _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(
+        percent: i32,
+        charging: bool,
+        discharging: bool,
+        neutral: Option<&str>,
+    ) -> BatteryStatus {
+        BatteryStatus {
+            percent,
+            charging,
+            discharging,
+            neutral_state: neutral.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn discharging_at_target_is_already_met() {
+        let p = plan_charge(80, &status(80, false, true, None)).unwrap();
+        assert!(p.already_met);
+    }
+
+    #[test]
+    fn discharging_below_target_errors() {
+        assert!(plan_charge(80, &status(70, false, true, None)).is_err());
+    }
+
+    #[test]
+    fn discharging_above_target_waits_not_charging_up() {
+        let p = plan_charge(80, &status(90, false, true, None)).unwrap();
+        assert!(!p.already_met);
+        assert!(!p.charging_up);
+    }
+
+    #[test]
+    fn charging_at_or_above_target_is_already_met() {
+        let p = plan_charge(80, &status(80, true, false, None)).unwrap();
+        assert!(p.already_met);
+    }
+
+    #[test]
+    fn charging_below_target_waits_charging_up() {
+        let p = plan_charge(80, &status(60, true, false, None)).unwrap();
+        assert!(!p.already_met);
+        assert!(p.charging_up);
+    }
+
+    #[test]
+    fn neutral_at_target_is_already_met() {
+        let p = plan_charge(80, &status(80, false, false, None)).unwrap();
+        assert!(p.already_met);
+    }
+
+    #[test]
+    fn neutral_off_target_with_state_errors() {
+        assert!(
+            plan_charge(
+                80,
+                &status(70, false, false, Some("not charging or discharging"))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn neutral_off_target_indeterminate_errors() {
+        assert!(plan_charge(80, &status(70, false, false, None)).is_err());
     }
 }

@@ -18,6 +18,27 @@ pub fn state_dir() -> PathBuf {
     {
         return PathBuf::from(dir);
     }
+    default_state_dir()
+}
+
+// NOTE: the Windows base moved from ~/.local/state to %LOCALAPPDATA%; any session written under the
+// old location is orphaned, but recovery is best-effort and a stale child dies on its own.
+#[cfg(windows)]
+fn default_state_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join("AppData").join("Local"));
+    base.join("wake")
+}
+
+#[cfg(unix)]
+fn default_state_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+        let p = PathBuf::from(xdg);
+        if p.is_absolute() {
+            return p.join("wake");
+        }
+    }
     home().join(".local").join("state").join("wake")
 }
 
@@ -239,9 +260,18 @@ fn malformed_from(p: &HashMap<String, String>) -> MalformedState {
 
 // ---- write ----
 
+/// Wrap a state-file IO error with the offending path and the `WAKE_STATE_DIR` escape hatch, so
+/// permission/quota failures point at the directory instead of surfacing a bare OS error.
+fn state_io_err(path: &std::path::Path, e: std::io::Error) -> AppError {
+    AppError::fail(format!(
+        "state IO failed at {}: {e}; set WAKE_STATE_DIR to a writable directory",
+        path.display()
+    ))
+}
+
 pub fn write(s: &Session) -> Result<()> {
     let dir = state_dir();
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir).map_err(|e| state_io_err(&dir, e))?;
     let mut out = String::new();
     let push = |out: &mut String, k: &str, v: &str| {
         out.push_str(k);
@@ -279,10 +309,10 @@ pub fn write(s: &Session) -> Result<()> {
     );
 
     let tmp = dir.join("session.properties.tmp");
-    fs::write(&tmp, out)?;
+    fs::write(&tmp, out).map_err(|e| state_io_err(&tmp, e))?;
     if let Err(e) = fs::rename(&tmp, state_file()) {
         let _ = fs::remove_file(&tmp);
-        return Err(e.into());
+        return Err(state_io_err(&state_file(), e));
     }
     Ok(())
 }
@@ -308,18 +338,78 @@ impl Drop for LockGuard {
 }
 
 pub fn acquire_lock() -> Result<LockGuard> {
-    fs::create_dir_all(state_dir())?;
-    let path = state_dir().join("wake.lock");
+    let dir = state_dir();
+    fs::create_dir_all(&dir).map_err(|e| state_io_err(&dir, e))?;
+    let path = dir.join("wake.lock");
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(path)?;
+        .open(&path)
+        .map_err(|e| state_io_err(&path, e))?;
     match file.try_lock() {
         Ok(()) => Ok(LockGuard { file }),
         Err(std::fs::TryLockError::WouldBlock) => Err(AppError::usage(
             "another wake invocation is in progress; try again",
         )),
         Err(std::fs::TryLockError::Error(e)) => Err(AppError::fail(e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn properties_round_trip_builds_session() {
+        let text = "pid=4321\n\
+             mode=display+system\n\
+             trigger=timed\n\
+             detail=1h\n\
+             startedAt=2024-01-02T03:04:05+00:00\n\
+             endsAt=2024-01-02T04:04:05+00:00\n\
+             processStartMs=1700000000\n\
+             processCommand=/usr/bin/caffeinate\n\
+             processCommandLine=/usr/bin/caffeinate -d\n\
+             evenLid=false\n\
+             priorDisableSleep=0\n\
+             phase=active\n";
+        let s = build_session(&parse_properties(text)).expect("valid session");
+        assert_eq!(s.pid, 4321);
+        assert_eq!(s.mode, "display+system");
+        assert_eq!(s.trigger, "timed");
+        assert_eq!(s.detail, "1h");
+        assert_eq!(s.process_start, 1_700_000_000);
+        assert_eq!(s.process_command, "/usr/bin/caffeinate");
+        assert!(s.started_at.is_some());
+        assert!(s.ends_at.is_some());
+        assert!(!s.even_lid);
+        assert_eq!(s.phase, PHASE_ACTIVE);
+    }
+
+    #[test]
+    fn missing_started_at_is_none() {
+        let text = "pid=1\nprocessStartMs=10\n";
+        assert!(build_session(&parse_properties(text)).is_none());
+    }
+
+    #[test]
+    fn parse_properties_skips_comments_and_blanks() {
+        let text = "# a comment\n! also a comment\n\n  \nkey=value\n  spaced = trimmed-key\n";
+        let p = parse_properties(text);
+        assert_eq!(p.get("key").map(String::as_str), Some("value"));
+        assert_eq!(p.get("spaced").map(String::as_str), Some(" trimmed-key"));
+        assert!(!p.contains_key("# a comment"));
+        assert_eq!(p.len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_disable_sleep_packed_nibbles() {
+        // 0x21 = 33 -> ac=1, dc=2 (both in 0..=3): accepted.
+        assert_eq!(parse_disable_sleep("33"), Some(33));
+        assert_eq!(platform::decode_lid(33), (1, 2));
+        // 0x44 = 68 -> ac=4, dc=4 (out of 0..=3): rejected.
+        assert_eq!(parse_disable_sleep("68"), None);
     }
 }

@@ -79,7 +79,7 @@ pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
 pub fn read_disable_sleep() -> Result<i32> {
     let out = capture(PMSET, &["-g"])?;
     for line in out.lines() {
-        let mut parts = line.trim().split_whitespace();
+        let mut parts = line.split_whitespace();
         if let Some(first) = parts.next()
             && first.eq_ignore_ascii_case("SleepDisabled")
             && let (Some(num), None) = (parts.next(), parts.clone().next())

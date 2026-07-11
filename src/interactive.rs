@@ -141,8 +141,11 @@ struct Picker {
 
 impl Picker {
     fn pick(&mut self) -> Result<Option<(Action, bool)>> {
+        let lock = session::acquire_lock()?;
+        commands::recover_stale_lid_session_unlocked()?;
+        let existing = session::read_current()?;
+        drop(lock);
         let _terminal = Terminal::enter();
-        let existing = session::read_if_alive()?;
         let items = build_menu(existing.is_some());
         self.selected = items
             .iter()

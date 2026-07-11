@@ -31,14 +31,13 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
         match first.as_str() {
             "__supervise__" => return supervisor::run(&args[1..]),
             #[cfg(any(windows, target_os = "macos"))]
-            "__lid_watchdog__" => return lid::run_watchdog(),
+            "__lid_watchdog__" => return lid::run_watchdog(&args[1..]),
             #[cfg(any(windows, target_os = "macos"))]
-            "__lid_restore__" => return lid::run_restore(),
+            "__lid_restore__" => return lid::run_restore(&args[1..]),
             _ => {}
         }
     }
 
-    commands::recover_stale_lid_session_foreground()?;
     if let Some(first) = args.first() {
         match first.as_str() {
             "-h" | "--help" | "help" => {

@@ -1,9 +1,10 @@
 use crate::error::{AppError, Result};
 use crate::run::ProcessRef;
+use crate::session::{self, LeaseRef};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 fn refreshed(pid: u32) -> System {
     let mut system = System::new();
@@ -34,6 +35,21 @@ pub fn capture_process(pid: u32) -> Result<ProcessRef> {
 
 pub fn process_matches(reference: &ProcessRef) -> bool {
     live_process(reference.pid).as_ref() == Some(reference)
+}
+
+pub fn lease_is_live(reference: &LeaseRef) -> Result<bool> {
+    session::process_lease_is_held(reference)
+}
+
+pub fn wait_lease_exit(reference: &LeaseRef, within: Duration) -> Result<bool> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if !lease_is_live(reference)? {
+            return Ok(true);
+        }
+        sleep(Duration::from_millis(100));
+    }
+    lease_is_live(reference).map(|live| !live)
 }
 
 pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
@@ -104,42 +120,6 @@ pub fn current_pid() -> u32 {
     std::process::id()
 }
 
-pub fn terminate_exact(reference: &ProcessRef) -> bool {
-    {
-        let system = refreshed(reference.pid);
-        let Some(process) = system.process(Pid::from_u32(reference.pid)) else {
-            return false;
-        };
-        if process_of(&system, reference.pid).as_ref() != Some(reference) {
-            return false;
-        }
-        if process.kill_with(Signal::Term).is_none() {
-            process.kill();
-        }
-    }
-    if wait_identity_gone(reference, Duration::from_secs(5)) {
-        return true;
-    }
-    let system = refreshed(reference.pid);
-    if process_of(&system, reference.pid).as_ref() == Some(reference)
-        && let Some(process) = system.process(Pid::from_u32(reference.pid))
-    {
-        process.kill();
-    }
-    wait_identity_gone(reference, Duration::from_secs(1))
-}
-
-fn wait_identity_gone(reference: &ProcessRef, within: Duration) -> bool {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if !process_matches(reference) {
-            return true;
-        }
-        sleep(Duration::from_millis(100));
-    }
-    !process_matches(reference)
-}
-
 pub fn self_exe() -> Result<String> {
     std::env::current_exe()
         .map(|path| path.to_string_lossy().into_owned())
@@ -177,7 +157,7 @@ fn command_basename(command: &[String]) -> String {
 }
 
 #[cfg(windows)]
-pub use win::{ElevatedChild, OwnerHandle};
+pub use win::ElevatedChild;
 
 #[cfg(windows)]
 pub fn launch_elevated_self(command: &str) -> Result<ElevatedChild> {
@@ -201,7 +181,6 @@ fn detach(command: &mut Command) {
 
 #[cfg(windows)]
 mod win {
-    use super::{ProcessRef, process_matches};
     use crate::error::{AppError, Result};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -214,8 +193,7 @@ mod win {
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessId, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE,
-        PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        GetExitCodeProcess, GetProcessId, INFINITE, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -250,47 +228,6 @@ mod win {
     impl Drop for ElevatedChild {
         fn drop(&mut self) {
             close(&mut self.handle);
-        }
-    }
-
-    pub struct OwnerHandle {
-        handle: HANDLE,
-    }
-
-    impl OwnerHandle {
-        pub fn open(owner: &ProcessRef) -> Result<Self> {
-            // SAFETY: requests a process handle for a numeric PID without inheriting it.
-            let handle =
-                unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, owner.pid) };
-            if handle.is_null() {
-                return Err(os_error("could not open supervisor process"));
-            }
-            if !process_matches(owner) {
-                // SAFETY: handle is owned and closed once on the rejected identity path.
-                unsafe { CloseHandle(handle) };
-                return Err(AppError::fail("supervisor identity changed"));
-            }
-            Ok(Self { handle })
-        }
-
-        pub fn alive(&self) -> Result<bool> {
-            Ok(wait_handle(self.handle, 0)?.is_none())
-        }
-
-        pub fn terminate(&self) -> Result<()> {
-            // SAFETY: handle was opened with PROCESS_TERMINATE and remains owned here.
-            if unsafe { TerminateProcess(self.handle, 1) } == 0 {
-                return Err(os_error("could not terminate supervisor"));
-            }
-            wait_handle(self.handle, 15_000)?
-                .ok_or_else(|| AppError::fail("supervisor did not exit after termination"))
-        }
-    }
-
-    impl Drop for OwnerHandle {
-        fn drop(&mut self) {
-            // SAFETY: closes the non-null owned process handle once.
-            unsafe { CloseHandle(self.handle) };
         }
     }
 

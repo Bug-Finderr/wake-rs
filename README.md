@@ -20,7 +20,7 @@ wake forever             # indefinite
 wake 1h | 30m | 1h30m    # timed
 wake --until 23:00       # until a local clock time
 wake --until-charge 80   # until battery reaches 80%
-wake --while-pid 1234    # while an exact process is alive
+wake --while-pid 1234    # while the observed process is alive
 wake --while-app Slack   # while a named process is alive
 wake --no-display        # allow display sleep
 wake --even-lid          # keep running with the lid closed

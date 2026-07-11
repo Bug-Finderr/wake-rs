@@ -195,16 +195,26 @@ pub fn start(args: &[String]) -> Result<()> {
             "--even-lid is unsupported on this platform",
         ));
     }
-    let _lock = session::acquire_lock()?;
+    let lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
     session::reconcile_stop()?;
-    if let Some(existing) = session::read_if_alive()? {
+    if let Some(existing) = session::read_current()? {
+        let state = if existing.owner.pid > 0 {
+            "active"
+        } else {
+            "starting"
+        };
         return Err(AppError::fail(format!(
-            "session already active (pid {}, {} {}); run 'wake stop' first",
+            "session already {state} (pid {}, {} {}); run 'wake stop' first",
             existing.owner.pid,
             existing.spec.trigger.label(),
             existing.spec.trigger.detail()
         )));
+    }
+    if session::read_lid_restore()?.is_some() || session::read_watchdog()?.is_some() {
+        return Err(AppError::fail(
+            "lid session cleanup is still in progress; try again",
+        ));
     }
 
     let trigger = match resolve_trigger(parsed.trigger)? {
@@ -224,54 +234,151 @@ pub fn start(args: &[String]) -> Result<()> {
         even_lid: parsed.even_lid,
     };
     let prepared = lid::prepare_start(&spec)?;
-    let (mut child, saved) = match spawn_supervisor(&spec) {
+    let (mut child, saved) = match spawn_supervisor(&spec, lock) {
         Ok(started) => started,
         Err(error) => {
-            if let Some(prepared) = &prepared
-                && let Err(rollback) = lid::rollback_start(prepared)
-            {
-                return Err(AppError::fail(format!(
-                    "{error}; lid rollback failed: {rollback}"
-                )));
+            if let Some(prepared) = &prepared {
+                let _lock = session::acquire_lock_wait()?;
+                if session::read_saved_for_recovery()?.is_none()
+                    && let Err(rollback) = lid::rollback_start(prepared)
+                {
+                    return Err(AppError::fail(format!(
+                        "{error}; lid rollback failed: {rollback}"
+                    )));
+                }
             }
             return Err(error);
         }
     };
-    if prepared.is_some()
-        && let Err(error) = lid::launch_watchdog(&saved)
-    {
-        stop_child(&mut child);
-        return Err(error);
+    if let Some(prepared) = &prepared {
+        let lock = session::acquire_lock_wait()?;
+        let current = session::read_saved_for_recovery()?;
+        let changed = current
+            .as_ref()
+            .is_none_or(|current| current.owner != saved.owner)
+            || !saved.owner_is_live()?
+            || session::stop_requested(&saved)?;
+        if changed {
+            stop_child(&mut child);
+            let cleanup = if current
+                .as_ref()
+                .is_none_or(|current| current.owner.token == saved.owner.token)
+            {
+                lid::rollback_start(prepared)
+                    .and_then(|()| session::remove_if_owner(&saved.owner).map(|_| ()))
+                    .and_then(|()| session::clear_stop(&saved).map(|_| ()))
+            } else {
+                Ok(())
+            };
+            return match cleanup {
+                Ok(()) => Err(AppError::fail("lid session changed during startup")),
+                Err(cleanup) => Err(AppError::fail(format!(
+                    "lid session changed during startup; cleanup failed: {cleanup}"
+                ))),
+            };
+        }
+        if let Err(error) = lid::launch_watchdog(&saved, lock) {
+            stop_child(&mut child);
+            return Err(error);
+        }
     }
     print_start_confirmation(&saved);
     Ok(())
 }
 
-fn spawn_supervisor(spec: &RunSpec) -> Result<(Child, Session)> {
+fn spawn_supervisor(spec: &RunSpec, lock: session::LockGuard) -> Result<(Child, Session)> {
     spec.validate()?;
+    let reservation = session::reserve_process_lease()?;
     let command = vec![
         sysutil::self_exe()?,
         "__supervise__".into(),
         serde_json::to_string(spec)
             .map_err(|error| AppError::fail(format!("could not encode run: {error}")))?,
+        reservation.token().into(),
     ];
-    let mut child = sysutil::spawn_named(&command)?;
-    match wait_for_session(&mut child, spec) {
+    let pending_started = Utc::now();
+    let pending = Session {
+        owner: session::LeaseRef {
+            pid: 0,
+            token: reservation.token().into(),
+        },
+        ends_at: spec.trigger.session_ends_at(pending_started),
+        note: None,
+        spec: spec.clone(),
+        started_at: pending_started,
+    };
+    session::write_pending(&pending)?;
+    let mut child = match sysutil::spawn_named(&command) {
+        Ok(child) => child,
+        Err(error) => {
+            session::remove_if_matches(&pending)?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = wait_for_lease_claim(&mut child, &reservation) {
+        stop_child(&mut child);
+        let cleanup = session::remove_if_matches(&pending)
+            .and_then(|_| session::clear_stop(&pending).map(|_| ()));
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(AppError::fail(format!(
+                "{error}; process lease cleanup failed: {cleanup}"
+            ))),
+        };
+    }
+    let token = reservation.commit();
+    drop(lock);
+    match wait_for_session(&mut child, spec, &token) {
         Ok(saved) => Ok((child, saved)),
         Err(error) => {
             stop_child(&mut child);
-            if let Ok(Some(saved)) = session::read_saved_for_recovery()
-                && saved.owner.pid == child.id()
-            {
-                let _ = session::remove_if_matches(&saved);
-                let _ = session::clear_stop(&saved);
-            }
-            Err(error)
+            let _lock = session::acquire_lock_wait()?;
+            finish_supervisor_start_error(error, &token, &pending)
         }
     }
 }
 
-fn wait_for_session(child: &mut Child, spec: &RunSpec) -> Result<Session> {
+fn wait_for_lease_claim(
+    child: &mut Child,
+    reservation: &session::ProcessLeaseReservation,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| AppError::fail(format!("could not inspect supervisor: {error}")))?
+        {
+            return Err(AppError::fail(format!(
+                "supervisor exited during startup with {status}"
+            )));
+        }
+        if reservation.is_claimed()? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(AppError::fail("supervisor did not claim its process lease"))
+}
+
+fn finish_supervisor_start_error(
+    error: AppError,
+    token: &str,
+    pending: &Session,
+) -> Result<(Child, Session)> {
+    let cleanup = (|| {
+        session::remove_if_owner(&pending.owner)?;
+        session::clear_stop(pending)?;
+        session::discard_process_lease(token)
+    })();
+    match cleanup {
+        Ok(()) => Err(error),
+        Err(cleanup) => Err(AppError::fail(format!(
+            "{error}; process lease cleanup failed: {cleanup}"
+        ))),
+    }
+}
+
+fn wait_for_session(child: &mut Child, spec: &RunSpec, token: &str) -> Result<Session> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Some(status) = child
@@ -283,8 +390,16 @@ fn wait_for_session(child: &mut Child, spec: &RunSpec) -> Result<Session> {
             )));
         }
         if let Some(saved) = session::read_saved_for_recovery()? {
-            if saved.owner.pid != child.id() || saved.spec != *spec || !saved.matches_live_process()
-            {
+            if saved.owner.token != token || saved.spec != *spec {
+                return Err(AppError::fail(
+                    "supervisor published mismatched session state",
+                ));
+            }
+            if saved.owner.pid == 0 {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            if saved.owner.pid != child.id() || !saved.owner_is_live()? {
                 return Err(AppError::fail(
                     "supervisor published mismatched session state",
                 ));
@@ -304,10 +419,14 @@ fn stop_child(child: &mut Child) {
 pub fn status() -> Result<()> {
     let _lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
-    let Some(saved) = session::read_if_alive()? else {
+    let Some(saved) = session::read_current()? else {
         println!("wake: no active session");
         return Ok(());
     };
+    if saved.owner.pid == 0 {
+        println!("wake: session starting");
+        return Ok(());
+    }
     let now = Utc::now();
     let remaining = saved
         .ends_at
@@ -338,7 +457,7 @@ pub fn status() -> Result<()> {
 pub fn stop() -> Result<()> {
     let lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
-    let Some(saved) = session::read_if_alive()? else {
+    let Some(saved) = session::read_current()? else {
         println!("wake: no active session");
         session::remove_state_file()?;
         return Ok(());
@@ -346,20 +465,19 @@ pub fn stop() -> Result<()> {
     session::request_stop(&saved)?;
     let owner = saved.identity();
     drop(lock);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && sysutil::process_matches(&owner) {
-        std::thread::sleep(Duration::from_millis(100));
+    if !sysutil::wait_lease_exit(&owner, Duration::from_secs(5))? {
+        return Err(AppError::fail("supervisor did not stop within 5 seconds"));
     }
-    let fallback = sysutil::process_matches(&owner).then(|| sysutil::terminate_exact(&owner));
-    if let Some(message) = stop_failure(fallback, sysutil::process_matches(&owner)) {
-        return Err(AppError::fail(message));
-    }
-    let _lock = session::acquire_lock()?;
-    if saved.spec.even_lid {
-        lid::finish_stop(&saved)?;
-    } else {
-        session::remove_if_matches(&saved)?;
-        session::clear_stop(&saved)?;
+    let _lock = session::acquire_lock_wait()?;
+    let changed = session::read_saved_for_recovery()?
+        .is_some_and(|current| !current.owner.same_lease(&saved.owner));
+    if !changed {
+        if saved.spec.even_lid {
+            lid::finish_stop(&saved)?;
+        } else {
+            session::remove_if_owner(&saved.owner)?;
+            session::clear_stop(&saved)?;
+        }
     }
     println!(
         "wake: stopped (pid {}, {})",
@@ -367,16 +485,6 @@ pub fn stop() -> Result<()> {
         saved.spec.trigger.label()
     );
     Ok(())
-}
-
-fn stop_failure(fallback: Option<bool>, exact_process_alive: bool) -> Option<&'static str> {
-    if !exact_process_alive {
-        None
-    } else if fallback == Some(false) {
-        Some("could not terminate supervisor")
-    } else {
-        Some("supervisor remained alive")
-    }
 }
 
 fn print_start_confirmation(saved: &Session) {
@@ -423,10 +531,6 @@ fn parse_int(value: &str, name: &str) -> Result<i32> {
         .map_err(|_| AppError::usage(format!("{name}: not an integer: '{value}'")))
 }
 
-pub fn recover_stale_lid_session_foreground() -> Result<()> {
-    lid::recover_foreground()
-}
-
 pub fn recover_stale_lid_session_unlocked() -> Result<()> {
     lid::recover_unlocked()
 }
@@ -469,19 +573,5 @@ mod tests {
             resolve_trigger(parsed.trigger),
             Err(AppError::Usage(_))
         ));
-    }
-
-    #[test]
-    fn stop_confirmation_requires_exact_process_exit() {
-        let cases = [
-            (None, false, None),
-            (Some(true), false, None),
-            (Some(false), false, None),
-            (Some(false), true, Some("could not terminate supervisor")),
-            (Some(true), true, Some("supervisor remained alive")),
-        ];
-        for (fallback, alive, expected) in cases {
-            assert_eq!(stop_failure(fallback, alive), expected);
-        }
     }
 }

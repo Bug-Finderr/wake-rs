@@ -1,5 +1,5 @@
 use crate::error::{AppError, Result};
-use crate::run::{ProcessRef, RunSpec};
+use crate::run::RunSpec;
 use crate::sysutil;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -7,14 +7,38 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::OnceLock;
+
+#[cfg(windows)]
+static HELPER_STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn state_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(dir) = HELPER_STATE_DIR.get() {
+        return dir.clone();
+    }
     if let Some(dir) = std::env::var_os("WAKE_STATE_DIR")
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
     default_state_dir()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn absolute_state_dir() -> Result<PathBuf> {
+    std::path::absolute(state_dir()).map_err(AppError::from)
+}
+
+#[cfg(windows)]
+pub fn set_helper_state_dir(dir: PathBuf) -> Result<()> {
+    if !dir.is_absolute() {
+        return Err(AppError::fail("helper state directory must be absolute"));
+    }
+    HELPER_STATE_DIR
+        .set(dir)
+        .map_err(|_| AppError::fail("helper state directory is already configured"))
 }
 
 #[cfg(windows)]
@@ -53,6 +77,236 @@ pub fn lid_watchdog_file() -> PathBuf {
     state_dir().join("lid-watchdog.json")
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct LeaseRef {
+    pub pid: u32,
+    pub token: String,
+}
+
+impl LeaseRef {
+    fn has_valid_token(&self) -> bool {
+        valid_lease_token(&self.token)
+    }
+
+    fn is_valid(&self) -> bool {
+        self.pid > 0 && self.has_valid_token()
+    }
+
+    pub(crate) fn same_lease(&self, other: &Self) -> bool {
+        self.token == other.token
+    }
+}
+
+pub struct ProcessLeaseReservation {
+    token: String,
+    path: PathBuf,
+    keep: bool,
+}
+
+impl ProcessLeaseReservation {
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn commit(mut self) -> String {
+        self.keep = true;
+        std::mem::take(&mut self.token)
+    }
+
+    pub fn is_claimed(&self) -> Result<bool> {
+        process_lease_is_claimed_at(&self.path)
+    }
+}
+
+impl Drop for ProcessLeaseReservation {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub struct ProcessLease {
+    file: Option<File>,
+    path: PathBuf,
+    reference: LeaseRef,
+}
+
+impl Drop for ProcessLease {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.unlock();
+            drop(file);
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl ProcessLease {
+    pub fn reference(&self) -> LeaseRef {
+        self.reference.clone()
+    }
+}
+
+fn valid_lease_token(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn process_lease_path(dir: &Path, token: &str) -> Result<PathBuf> {
+    if !valid_lease_token(token) {
+        return Err(AppError::fail("invalid process lease token"));
+    }
+    Ok(dir.join(format!("process-{token}.lock")))
+}
+
+fn reserve_process_lease_at(dir: &Path) -> Result<ProcessLeaseReservation> {
+    fs::create_dir_all(dir).map_err(|error| state_io_err(dir, error))?;
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| AppError::fail(format!("could not create process identity: {error}")))?;
+    let token = format!("{:032x}", u128::from_ne_bytes(bytes));
+    let path = process_lease_path(dir, &token)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| state_io_err(&path, error))?;
+    Ok(ProcessLeaseReservation {
+        token,
+        path,
+        keep: false,
+    })
+}
+
+fn claim_process_lease_at(dir: &Path, token: &str, pid: u32) -> Result<ProcessLease> {
+    let reference = LeaseRef {
+        pid,
+        token: token.into(),
+    };
+    if !reference.is_valid() {
+        return Err(AppError::fail("invalid process lease"));
+    }
+    let path = process_lease_path(dir, token)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| state_io_err(&path, error))?;
+    finish_process_lease_claim(file, path, reference)
+}
+
+fn finish_process_lease_claim(
+    file: File,
+    path: PathBuf,
+    reference: LeaseRef,
+) -> Result<ProcessLease> {
+    file.lock().map_err(|error| {
+        AppError::fail(format!(
+            "could not claim process lease at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !path
+        .try_exists()
+        .map_err(|error| state_io_err(&path, error))?
+    {
+        return Err(AppError::fail("process lease was cancelled"));
+    }
+    Ok(ProcessLease {
+        file: Some(file),
+        path,
+        reference,
+    })
+}
+
+fn process_lease_is_claimed_at(path: &Path) -> Result<bool> {
+    process_lease_is_locked_at(path, false)
+}
+
+fn process_lease_is_held_at(dir: &Path, token: &str) -> Result<bool> {
+    process_lease_is_locked_at(&process_lease_path(dir, token)?, true)
+}
+
+fn process_lease_is_locked_at(path: &Path, remove_unlocked: bool) -> Result<bool> {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(state_io_err(path, error)),
+    };
+    match file.try_lock_shared() {
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(state_io_err(path, error)),
+        Ok(()) => {
+            if remove_unlocked {
+                remove_lease_file(path)?;
+            }
+            file.unlock().map_err(|error| state_io_err(path, error))?;
+            drop(file);
+            Ok(false)
+        }
+    }
+}
+
+fn remove_lease_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(state_io_err(path, error)),
+    }
+}
+
+fn cleanup_process_leases_at(dir: &Path) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(state_io_err(dir, error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| state_io_err(dir, error))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(token) = name
+            .strip_prefix("process-")
+            .and_then(|name| name.strip_suffix(".lock"))
+            .filter(|token| valid_lease_token(token))
+        else {
+            continue;
+        };
+        process_lease_is_held_at(dir, token)?;
+    }
+    Ok(())
+}
+
+pub fn reserve_process_lease() -> Result<ProcessLeaseReservation> {
+    reserve_process_lease_at(&state_dir())
+}
+
+pub fn claim_process_lease(token: &str) -> Result<ProcessLease> {
+    claim_process_lease_at(&state_dir(), token, std::process::id())
+}
+
+pub fn process_lease_is_held(reference: &LeaseRef) -> Result<bool> {
+    if !reference.has_valid_token() {
+        return Err(AppError::fail("invalid process lease"));
+    }
+    process_lease_is_held_at(&state_dir(), &reference.token)
+}
+
+pub fn discard_process_lease(token: &str) -> Result<()> {
+    process_lease_is_held_at(&state_dir(), token).map(|_| ())
+}
+
+pub fn cleanup_process_leases() -> Result<()> {
+    cleanup_process_leases_at(&state_dir())
+}
+
 fn home() -> PathBuf {
     #[cfg(windows)]
     let var = std::env::var_os("USERPROFILE");
@@ -66,7 +320,7 @@ fn home() -> PathBuf {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Session {
-    pub owner: ProcessRef,
+    pub owner: LeaseRef,
     pub spec: RunSpec,
     pub started_at: DateTime<Utc>,
     pub ends_at: Option<DateTime<Utc>>,
@@ -76,14 +330,17 @@ pub struct Session {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WatchdogState {
-    pub owner: ProcessRef,
-    pub watchdog: ProcessRef,
+    pub owner: LeaseRef,
+    pub watchdog: LeaseRef,
     pub ready: bool,
 }
 
 impl WatchdogState {
     fn is_valid(&self) -> bool {
-        self.owner.is_valid() && self.watchdog.is_valid() && self.owner != self.watchdog
+        self.owner.is_valid()
+            && self.watchdog.has_valid_token()
+            && (!self.ready || self.watchdog.pid > 0)
+            && self.owner.token != self.watchdog.token
     }
 }
 
@@ -137,16 +394,16 @@ fn is_guid(value: &str) -> bool {
 
 impl Session {
     fn is_valid(&self) -> bool {
-        self.owner.is_valid()
+        self.owner.has_valid_token()
             && self.spec.validate().is_ok()
             && self.ends_at == self.spec.trigger.session_ends_at(self.started_at)
     }
 
-    pub fn matches_live_process(&self) -> bool {
-        sysutil::process_matches(&self.owner)
+    pub fn owner_is_live(&self) -> Result<bool> {
+        sysutil::lease_is_live(&self.owner)
     }
 
-    pub fn identity(&self) -> ProcessRef {
+    pub fn identity(&self) -> LeaseRef {
         self.owner.clone()
     }
 }
@@ -154,7 +411,13 @@ impl Session {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StopRequest {
-    session: ProcessRef,
+    session: LeaseRef,
+}
+
+impl StopRequest {
+    fn is_valid(&self) -> bool {
+        self.session.has_valid_token()
+    }
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -263,10 +526,17 @@ fn write_session_at(path: &Path, session: &Session) -> Result<()> {
 }
 
 fn write_stop_at(path: &Path, session: &Session) -> Result<()> {
+    write_stop_owner_at(path, &session.owner)
+}
+
+fn write_stop_owner_at(path: &Path, owner: &LeaseRef) -> Result<()> {
+    if !owner.has_valid_token() {
+        return Err(AppError::fail("invalid process lease"));
+    }
     write_json(
         path,
         &StopRequest {
-            session: session.identity(),
+            session: owner.clone(),
         },
     )
 }
@@ -277,9 +547,9 @@ fn read_stop_at(path: &Path) -> Result<Option<StopRequest>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(state_io_err(path, error)),
     };
-    match serde_json::from_slice(&data) {
-        Ok(request) => Ok(Some(request)),
-        Err(_) => {
+    match serde_json::from_slice::<StopRequest>(&data) {
+        Ok(request) if request.is_valid() => Ok(Some(request)),
+        _ => {
             remove_state_file_at(path)?;
             Ok(None)
         }
@@ -288,7 +558,7 @@ fn read_stop_at(path: &Path) -> Result<Option<StopRequest>> {
 
 fn stop_requested_at(path: &Path, session: &Session) -> Result<bool> {
     let request = read_stop_at(path)?;
-    Ok(request.is_some_and(|request| request.session == session.identity()))
+    Ok(request.is_some_and(|request| request.session.same_lease(&session.owner)))
 }
 
 fn clear_stop_at(path: &Path, session: &Session) -> Result<bool> {
@@ -299,11 +569,11 @@ fn clear_stop_at(path: &Path, session: &Session) -> Result<bool> {
     Ok(true)
 }
 
-fn reconcile_stop_at(path: &Path, is_live: impl FnOnce(&ProcessRef) -> bool) -> Result<()> {
+fn reconcile_stop_at(path: &Path, is_live: impl FnOnce(&LeaseRef) -> Result<bool>) -> Result<()> {
     let Some(request) = read_stop_at(path)? else {
         return Ok(());
     };
-    if is_live(&request.session) {
+    if is_live(&request.session)? {
         return Err(AppError::fail(format!(
             "stop request still targets a live process at {}",
             path.display()
@@ -317,6 +587,17 @@ fn remove_session_if_matches_at(path: &Path, expected: &Session) -> Result<bool>
         return Ok(false);
     };
     if actual.identity() != expected.identity() {
+        return Ok(false);
+    }
+    remove_state_file_at(path)?;
+    Ok(true)
+}
+
+fn remove_session_if_owner_at(path: &Path, owner: &LeaseRef) -> Result<bool> {
+    let Some(actual) = read_session_at(path)? else {
+        return Ok(false);
+    };
+    if !actual.owner.same_lease(owner) {
         return Ok(false);
     }
     remove_state_file_at(path)?;
@@ -363,7 +644,8 @@ fn write_watchdog_at(path: &Path, state: &WatchdogState) -> Result<()> {
     }
     if let Some(saved) = read_watchdog_at(path)?
         && (saved.owner != state.owner
-            || saved.watchdog != state.watchdog
+            || !saved.watchdog.same_lease(&state.watchdog)
+            || (saved.watchdog.pid != state.watchdog.pid && saved.watchdog.pid != 0)
             || (saved.ready && !state.ready))
     {
         return Err(AppError::fail(format!(
@@ -375,7 +657,7 @@ fn write_watchdog_at(path: &Path, state: &WatchdogState) -> Result<()> {
 }
 
 #[cfg(any(test, windows, target_os = "macos"))]
-fn remove_watchdog_if_owner_at(path: &Path, owner: &ProcessRef) -> Result<bool> {
+fn remove_watchdog_if_owner_at(path: &Path, owner: &LeaseRef) -> Result<bool> {
     let Some(state) = read_watchdog_at(path)? else {
         return Ok(false);
     };
@@ -434,7 +716,7 @@ pub fn write_watchdog(state: &WatchdogState) -> Result<()> {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub fn remove_watchdog_if_owner(owner: &ProcessRef) -> Result<bool> {
+pub fn remove_watchdog_if_owner(owner: &LeaseRef) -> Result<bool> {
     remove_watchdog_if_owner_at(&lid_watchdog_file(), owner)
 }
 
@@ -446,11 +728,11 @@ pub fn read_saved_for_recovery() -> Result<Option<Session>> {
     read_session_at(&state_file())
 }
 
-pub fn read_if_alive() -> Result<Option<Session>> {
+pub fn read_current() -> Result<Option<Session>> {
     let Some(session) = read_saved_for_recovery()? else {
         return Ok(None);
     };
-    if session.matches_live_process() {
+    if session.owner_is_live()? || session.spec.even_lid {
         Ok(Some(session))
     } else {
         remove_state_file()?;
@@ -465,12 +747,47 @@ fn state_io_err(path: &Path, e: std::io::Error) -> AppError {
     ))
 }
 
-pub fn write(s: &Session) -> Result<()> {
-    write_session_at(&state_file(), s)
+fn write_pending_at(path: &Path, session: &Session) -> Result<()> {
+    if session.owner.pid != 0 || !session.is_valid() {
+        return Err(AppError::fail("invalid pending session"));
+    }
+    if read_session_at(path)?.is_some() {
+        return Err(AppError::fail("session state already exists"));
+    }
+    write_session_at(path, session)
+}
+
+fn write_ready_at(path: &Path, session: &Session) -> Result<()> {
+    if !session.owner.is_valid() || !session.is_valid() {
+        return Err(AppError::fail("invalid ready session"));
+    }
+    let Some(pending) = read_session_at(path)? else {
+        return Err(AppError::fail("pending session was cancelled"));
+    };
+    if pending.owner.pid != 0
+        || !pending.owner.same_lease(&session.owner)
+        || pending.spec != session.spec
+    {
+        return Err(AppError::fail("pending session changed before readiness"));
+    }
+    write_session_at(path, session)
+}
+
+pub fn write_pending(session: &Session) -> Result<()> {
+    write_pending_at(&state_file(), session)
+}
+
+pub fn write_ready(session: &Session) -> Result<()> {
+    write_ready_at(&state_file(), session)
 }
 
 pub fn request_stop(session: &Session) -> Result<()> {
     write_stop_at(&stop_file(), session)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn request_stop_owner(owner: &LeaseRef) -> Result<()> {
+    write_stop_owner_at(&stop_file(), owner)
 }
 
 pub fn stop_requested(session: &Session) -> Result<bool> {
@@ -482,11 +799,15 @@ pub fn clear_stop(session: &Session) -> Result<bool> {
 }
 
 pub fn reconcile_stop() -> Result<()> {
-    reconcile_stop_at(&stop_file(), sysutil::process_matches)
+    reconcile_stop_at(&stop_file(), sysutil::lease_is_live)
 }
 
 pub fn remove_if_matches(session: &Session) -> Result<bool> {
     remove_session_if_matches_at(&state_file(), session)
+}
+
+pub fn remove_if_owner(owner: &LeaseRef) -> Result<bool> {
+    remove_session_if_owner_at(&state_file(), owner)
 }
 
 fn remove_state_file_at(path: &Path) -> Result<()> {
@@ -516,23 +837,37 @@ impl Drop for LockGuard {
     }
 }
 
-pub fn acquire_lock() -> Result<LockGuard> {
+fn open_lock_file() -> Result<File> {
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|e| state_io_err(&dir, e))?;
     let path = dir.join("wake.lock");
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&path)
-        .map_err(|e| state_io_err(&path, e))?;
+        .map_err(|e| state_io_err(&path, e))
+}
+
+pub fn try_acquire_lock() -> Result<Option<LockGuard>> {
+    let file = open_lock_file()?;
     match file.try_lock() {
-        Ok(()) => Ok(LockGuard { file }),
-        Err(std::fs::TryLockError::WouldBlock) => Err(AppError::usage(
-            "another wake invocation is in progress; try again",
-        )),
+        Ok(()) => Ok(Some(LockGuard { file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(AppError::fail(e.to_string())),
     }
+}
+
+pub fn acquire_lock() -> Result<LockGuard> {
+    try_acquire_lock()?
+        .ok_or_else(|| AppError::usage("another wake invocation is in progress; try again"))
+}
+
+pub fn acquire_lock_wait() -> Result<LockGuard> {
+    let file = open_lock_file()?;
+    file.lock()
+        .map_err(|error| AppError::fail(format!("could not acquire state lock: {error}")))?;
+    Ok(LockGuard { file })
 }
 
 #[cfg(test)]
@@ -568,10 +903,9 @@ mod tests {
 
     fn sample_session() -> Session {
         Session {
-            owner: ProcessRef {
+            owner: LeaseRef {
                 pid: 4321,
-                start: 1_700_000_000,
-                command: "/usr/bin/wake".into(),
+                token: "0123456789abcdef0123456789abcdef".into(),
             },
             spec: crate::run::RunSpec {
                 mode: crate::run::Mode::DisplaySystem,
@@ -604,6 +938,28 @@ mod tests {
     }
 
     #[test]
+    fn session_startup_transition_is_identity_bound_and_monotonic() {
+        let dir = TestDir::new("session-startup");
+        let path = dir.join("session.json");
+        let mut pending = sample_session();
+        pending.owner.pid = 0;
+        write_pending_at(&path, &pending).unwrap();
+
+        let mut ready = pending.clone();
+        ready.owner.pid = 42;
+        let mut wrong = ready.clone();
+        wrong.owner.token = "11111111111111111111111111111111".into();
+        assert!(write_ready_at(&path, &wrong).is_err());
+
+        write_ready_at(&path, &ready).unwrap();
+        assert_eq!(read_session_at(&path).unwrap().unwrap().owner, ready.owner);
+        assert!(write_ready_at(&path, &ready).is_err());
+
+        fs::remove_file(&path).unwrap();
+        assert!(write_ready_at(&path, &ready).is_err());
+    }
+
+    #[test]
     fn atomic_write_does_not_follow_an_existing_temp_link() {
         let dir = TestDir::new("state-temp-link");
         let path = dir.join("session.json");
@@ -628,6 +984,75 @@ mod tests {
     }
 
     #[test]
+    fn process_lease_is_live_only_while_held() {
+        let dir = TestDir::new("process-lease");
+        let abandoned = reserve_process_lease_at(&dir.0).unwrap();
+        let abandoned_path = process_lease_path(&dir.0, abandoned.token()).unwrap();
+        drop(abandoned);
+        assert!(!abandoned_path.exists());
+
+        let reservation = reserve_process_lease_at(&dir.0).unwrap();
+        assert!(!reservation.is_claimed().unwrap());
+        let token = reservation.token().to_owned();
+        let lease = claim_process_lease_at(&dir.0, &token, 42).unwrap();
+        assert!(reservation.is_claimed().unwrap());
+        let token = reservation.commit();
+
+        assert!(process_lease_is_held_at(&dir.0, &token).unwrap());
+        cleanup_process_leases_at(&dir.0).unwrap();
+        assert!(process_lease_path(&dir.0, &token).unwrap().exists());
+        drop(lease);
+        assert!(!process_lease_is_held_at(&dir.0, &token).unwrap());
+        assert!(!process_lease_path(&dir.0, &token).unwrap().exists());
+
+        let crashed = reserve_process_lease_at(&dir.0).unwrap().commit();
+        cleanup_process_leases_at(&dir.0).unwrap();
+        assert!(!process_lease_path(&dir.0, &crashed).unwrap().exists());
+
+        let delayed = reserve_process_lease_at(&dir.0).unwrap().commit();
+        let delayed_path = process_lease_path(&dir.0, &delayed).unwrap();
+        let delayed_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&delayed_path)
+            .unwrap();
+        assert!(!process_lease_is_held_at(&dir.0, &delayed).unwrap());
+        assert!(
+            finish_process_lease_claim(
+                delayed_file,
+                delayed_path,
+                LeaseRef {
+                    pid: 42,
+                    token: delayed,
+                },
+            )
+            .is_err()
+        );
+
+        let concurrent = reserve_process_lease_at(&dir.0).unwrap().commit();
+        let concurrent_path = process_lease_path(&dir.0, &concurrent).unwrap();
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&concurrent_path)
+            .unwrap();
+        probe.try_lock_shared().unwrap();
+        assert!(!process_lease_is_held_at(&dir.0, &concurrent).unwrap());
+        probe.unlock().unwrap();
+        assert!(!concurrent_path.exists());
+    }
+
+    #[test]
+    fn process_lease_rejects_unsafe_tokens() {
+        let dir = TestDir::new("process-lease-token");
+        let short = "a".repeat(31);
+        for token in ["", "../escape", "ABCDEF", short.as_str()] {
+            assert!(process_lease_path(&dir.0, token).is_err());
+            assert!(claim_process_lease_at(&dir.0, token, 42).is_err());
+        }
+    }
+
+    #[test]
     fn malformed_session_is_an_error_and_is_retained() {
         let dir = TestDir::new("session-malformed");
         let path = dir.join("session.json");
@@ -643,10 +1068,9 @@ mod tests {
     fn semantic_session_validation_table() {
         let dir = TestDir::new("session-invalid");
         let path = dir.join("session.json");
-        let mut cases: [Session; 3] = std::array::from_fn(|_| sample_session());
-        cases[0].owner.pid = 0;
-        cases[1].owner.start = 0;
-        cases[2].owner.command.clear();
+        let mut cases: [Session; 2] = std::array::from_fn(|_| sample_session());
+        cases[0].owner.token.clear();
+        cases[1].ends_at = None;
 
         for saved in cases {
             write_json(&path, &saved).unwrap();
@@ -679,27 +1103,34 @@ mod tests {
         let path = dir.join("lid-watchdog.json");
         let state = WatchdogState {
             owner: sample_session().owner,
-            watchdog: ProcessRef {
-                pid: 9876,
-                start: 1_700_000_100,
-                command: "/usr/bin/wake".into(),
+            watchdog: LeaseRef {
+                pid: 0,
+                token: "fedcba9876543210fedcba9876543210".into(),
             },
             ready: false,
         };
 
         write_watchdog_at(&path, &state).unwrap();
         assert_eq!(read_watchdog_at(&path).unwrap(), Some(state.clone()));
+        let starting = WatchdogState {
+            watchdog: LeaseRef {
+                pid: 9876,
+                ..state.watchdog.clone()
+            },
+            ..state.clone()
+        };
+        write_watchdog_at(&path, &starting).unwrap();
         let ready = WatchdogState {
             ready: true,
-            ..state.clone()
+            ..starting.clone()
         };
         write_watchdog_at(&path, &ready).unwrap();
         assert_eq!(read_watchdog_at(&path).unwrap(), Some(ready));
-        assert!(write_watchdog_at(&path, &state).is_err());
+        assert!(write_watchdog_at(&path, &starting).is_err());
         assert!(
             !remove_watchdog_if_owner_at(
                 &path,
-                &ProcessRef {
+                &LeaseRef {
                     pid: 1,
                     ..state.owner.clone()
                 }
@@ -727,10 +1158,9 @@ mod tests {
         let path = dir.join("lid-watchdog.json");
         let mut first = WatchdogState {
             owner: sample_session().owner,
-            watchdog: ProcessRef {
+            watchdog: LeaseRef {
                 pid: 9876,
-                start: 1_700_000_100,
-                command: "/usr/bin/wake".into(),
+                token: "fedcba9876543210fedcba9876543210".into(),
             },
             ready: false,
         };
@@ -815,7 +1245,7 @@ mod tests {
         let path = dir.join("stop.json");
         let expected = sample_session();
         let mut other = sample_session();
-        other.owner.start += 1;
+        other.owner.token = "11111111111111111111111111111111".into();
 
         write_stop_at(&path, &other).unwrap();
         write_stop_at(&path, &expected).unwrap();
@@ -830,6 +1260,18 @@ mod tests {
         fs::write(&path, b"not json").unwrap();
         assert!(!stop_requested_at(&path, &expected).unwrap());
         assert!(!path.exists());
+        write_json(
+            &path,
+            &StopRequest {
+                session: LeaseRef {
+                    pid: 0,
+                    token: expected.owner.token.clone(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(stop_requested_at(&path, &expected).unwrap());
+        assert!(clear_stop_at(&path, &expected).unwrap());
         write_stop_at(&path, &expected).unwrap();
         assert!(stop_requested_at(&path, &expected).unwrap());
     }
@@ -840,21 +1282,26 @@ mod tests {
         let session = sample_session();
 
         let missing = dir.join("missing.json");
-        reconcile_stop_at(&missing, |_| false).unwrap();
+        reconcile_stop_at(&missing, |_| Ok(false)).unwrap();
 
         let dead = dir.join("dead.json");
         write_stop_at(&dead, &session).unwrap();
-        reconcile_stop_at(&dead, |_| false).unwrap();
+        reconcile_stop_at(&dead, |_| Ok(false)).unwrap();
         assert!(!dead.exists());
 
         let live = dir.join("live.json");
         write_stop_at(&live, &session).unwrap();
-        assert!(reconcile_stop_at(&live, |_| true).is_err());
+        assert!(reconcile_stop_at(&live, |_| Ok(true)).is_err());
         assert!(live.exists());
+
+        let unknown = dir.join("unknown.json");
+        write_stop_at(&unknown, &session).unwrap();
+        assert!(reconcile_stop_at(&unknown, |_| Err(AppError::fail("unreadable lease"))).is_err());
+        assert!(unknown.exists());
 
         let malformed = dir.join("malformed.json");
         fs::write(&malformed, b"not json").unwrap();
-        reconcile_stop_at(&malformed, |_| false).unwrap();
+        reconcile_stop_at(&malformed, |_| Ok(false)).unwrap();
         assert!(!malformed.exists());
     }
 

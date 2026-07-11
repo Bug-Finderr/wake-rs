@@ -29,31 +29,32 @@ fn install_stop_flag() -> Arc<AtomicBool> {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let [json] = args else {
-        return Err(AppError::fail("supervisor expects one run specification"));
+    let [json, token] = args else {
+        return Err(AppError::fail(
+            "supervisor expects a run specification and process lease",
+        ));
     };
     let spec: RunSpec = serde_json::from_str(json)
         .map_err(|error| AppError::fail(format!("invalid supervisor specification: {error}")))?;
     spec.validate()?;
-    supervise(spec)
+    let lease = session::claim_process_lease(token)?;
+    supervise(spec, lease.reference())
 }
 
-fn supervise(spec: RunSpec) -> Result<()> {
-    let mut inhibitor = platform::Inhibitor::start(spec.mode)?;
-    sleep(STARTUP_SETTLE);
-    if !inhibitor.alive() {
-        return Err(AppError::fail("sleep inhibitor exited during startup"));
-    }
-    let started = Instant::now();
-    let started_at = Utc::now();
-    let saved = Session {
-        owner: sysutil::capture_process(sysutil::current_pid())?,
-        ends_at: spec.trigger.session_ends_at(started_at),
-        note: inhibitor.note().map(str::to_string),
-        spec,
-        started_at,
+fn supervise(spec: RunSpec, owner: session::LeaseRef) -> Result<()> {
+    let startup = start_session(spec, owner.clone());
+    let (mut inhibitor, saved, started) = match startup {
+        Ok(started) => started,
+        Err(error) => {
+            let cleanup = session::remove_if_owner(&owner).map(|_| ());
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(AppError::fail(format!(
+                    "{error}; startup cleanup failed: {cleanup}"
+                ))),
+            };
+        }
     };
-    session::write(&saved)?;
     if saved.spec.even_lid {
         lid::wait_ready(&saved)?;
     }
@@ -66,6 +67,53 @@ fn supervise(spec: RunSpec) -> Result<()> {
     let remove = session::remove_if_matches(&saved).map(|_| ());
     let clear = session::clear_stop(&saved).map(|_| ());
     result.and(remove).and(clear)
+}
+
+fn start_session(
+    spec: RunSpec,
+    owner: session::LeaseRef,
+) -> Result<(platform::Inhibitor, Session, Instant)> {
+    let pending = session::read_saved_for_recovery()?
+        .ok_or_else(|| AppError::fail("supervisor startup was cancelled"))?;
+    if pending.owner.pid != 0 || pending.owner.token != owner.token || pending.spec != spec {
+        return Err(AppError::fail("pending supervisor state changed"));
+    }
+
+    let lock = loop {
+        if session::stop_requested(&pending)? {
+            return Err(AppError::fail("session stopped during startup"));
+        }
+        if let Some(lock) = session::try_acquire_lock()? {
+            break lock;
+        }
+        sleep(Duration::from_millis(100));
+    };
+    let current = session::read_saved_for_recovery()?;
+    if current
+        .as_ref()
+        .is_none_or(|current| current.owner != pending.owner || current.spec != pending.spec)
+        || session::stop_requested(&pending)?
+    {
+        return Err(AppError::fail("supervisor startup was cancelled"));
+    }
+
+    let mut inhibitor = platform::Inhibitor::start(spec.mode)?;
+    sleep(STARTUP_SETTLE);
+    if !inhibitor.alive() {
+        return Err(AppError::fail("sleep inhibitor exited during startup"));
+    }
+    let started = Instant::now();
+    let started_at = Utc::now();
+    let saved = Session {
+        owner,
+        ends_at: spec.trigger.session_ends_at(started_at),
+        note: inhibitor.note().map(str::to_string),
+        spec,
+        started_at,
+    };
+    session::write_ready(&saved)?;
+    drop(lock);
+    Ok((inhibitor, saved, started))
 }
 
 fn supervise_loop(

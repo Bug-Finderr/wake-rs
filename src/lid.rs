@@ -1,10 +1,10 @@
 use crate::error::{AppError, Result};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::platform;
-use crate::run::{ProcessRef, RunSpec};
+use crate::run::RunSpec;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::session::LidRestore;
-use crate::session::{self, Session, WatchdogState};
+use crate::session::{self, LeaseRef, Session, WatchdogState};
 use crate::sysutil;
 #[cfg(target_os = "macos")]
 use std::io::IsTerminal;
@@ -195,21 +195,21 @@ fn abort_start_cleanup(
 }
 
 fn watchdog_health(
-    owner: &ProcessRef,
+    owner: &LeaseRef,
     state: Option<&WatchdogState>,
-    is_live: impl FnOnce(&ProcessRef) -> bool,
-) -> WatchdogHealth {
+    is_live: impl FnOnce(&LeaseRef) -> Result<bool>,
+) -> Result<WatchdogHealth> {
     let Some(state) = state else {
-        return WatchdogHealth::Missing;
+        return Ok(WatchdogHealth::Missing);
     };
     if &state.owner != owner {
-        WatchdogHealth::Mismatch
-    } else if !is_live(&state.watchdog) {
-        WatchdogHealth::Dead
+        Ok(WatchdogHealth::Mismatch)
+    } else if !is_live(&state.watchdog)? {
+        Ok(WatchdogHealth::Dead)
     } else if state.ready {
-        WatchdogHealth::Ready
+        Ok(WatchdogHealth::Ready)
     } else {
-        WatchdogHealth::Starting
+        Ok(WatchdogHealth::Starting)
     }
 }
 
@@ -259,29 +259,78 @@ pub fn rollback_start(_prepared: &Prepared) -> Result<()> {
     }
 }
 
-pub fn launch_watchdog(saved: &Session) -> Result<()> {
+pub fn launch_watchdog(saved: &Session, lock: session::LockGuard) -> Result<()> {
     if !saved.spec.even_lid {
         return Ok(());
     }
     #[cfg(windows)]
+    let helper_state = match session::absolute_state_dir() {
+        Ok(dir) => encode_helper_state_dir(&dir),
+        Err(error) => {
+            drop(lock);
+            return abort_watchdog_start(saved, error, || Ok(()));
+        }
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    let reservation = match session::reserve_process_lease() {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            drop(lock);
+            return abort_watchdog_start(saved, error, || Ok(()));
+        }
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Err(error) = session::write_watchdog(&WatchdogState {
+        owner: saved.owner.clone(),
+        watchdog: LeaseRef {
+            pid: 0,
+            token: reservation.token().into(),
+        },
+        ready: false,
+    }) {
+        drop(lock);
+        return abort_watchdog_start(saved, error, || Ok(()));
+    }
+    #[cfg(windows)]
     {
-        let mut child = match sysutil::launch_elevated_self("__lid_watchdog__") {
+        let command = format!("__lid_watchdog__ {} {helper_state}", reservation.token());
+        let mut child = match sysutil::launch_elevated_self(&command) {
             Ok(child) => child,
-            Err(error) => return abort_watchdog_start(saved, error, || Ok(())),
+            Err(error) => {
+                drop(lock);
+                return abort_watchdog_start(saved, error, || Ok(()));
+            }
         };
-        match wait_for_child_ready(saved, Some(child.id()), || child.try_wait()) {
+        let pid = child.id();
+        if let Err(error) = wait_for_child_claimed(&reservation, || child.try_wait()) {
+            drop(lock);
+            return abort_watchdog_start(saved, error, || {
+                wait_for_helper_exit(|| child.try_wait())
+            });
+        }
+        let token = reservation.commit();
+        drop(lock);
+        let result = match wait_for_child_ready(saved, Some(pid), || child.try_wait()) {
             Ok(()) => Ok(()),
             Err(error) => {
                 abort_watchdog_start(saved, error, || wait_for_helper_exit(|| child.try_wait()))
             }
-        }
+        };
+        finish_watchdog_launch(result, &token)
     }
     #[cfg(target_os = "macos")]
     {
-        let command = mac_helper_command("__lid_watchdog__")?;
+        let command = match mac_helper_command(&["__lid_watchdog__", reservation.token()]) {
+            Ok(command) => command,
+            Err(error) => {
+                drop(lock);
+                return abort_watchdog_start(saved, error, || Ok(()));
+            }
+        };
         let mut child = match sysutil::spawn_detached(&command) {
             Ok(child) => child,
             Err(error) => {
+                drop(lock);
                 return abort_watchdog_start(
                     saved,
                     AppError::fail(format!("could not launch lid watchdog: {error}")),
@@ -295,13 +344,54 @@ pub fn launch_watchdog(saved: &Session) -> Result<()> {
                 .map(|status| status.map(|status| status.code().unwrap_or(1) as u32))
                 .map_err(AppError::from)
         };
-        match wait_for_child_ready(saved, None, &mut status) {
+        if let Err(error) = wait_for_child_claimed(&reservation, &mut status) {
+            drop(lock);
+            return abort_watchdog_start(saved, error, || wait_for_helper_exit(&mut status));
+        }
+        let token = reservation.commit();
+        drop(lock);
+        let result = match wait_for_child_ready(saved, None, &mut status) {
             Ok(()) => Ok(()),
             Err(error) => abort_watchdog_start(saved, error, || wait_for_helper_exit(&mut status)),
-        }
+        };
+        finish_watchdog_launch(result, &token)
     }
     #[cfg(target_os = "linux")]
-    Err(AppError::fail("lid watchdog is unavailable on Linux"))
+    {
+        drop(lock);
+        Err(AppError::fail("lid watchdog is unavailable on Linux"))
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn wait_for_child_claimed(
+    reservation: &session::ProcessLeaseReservation,
+    mut child_status: impl FnMut() -> Result<Option<u32>>,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Some(code) = child_status()? {
+            return Err(AppError::fail(format!(
+                "lid watchdog exited during startup with code {code}"
+            )));
+        }
+        if reservation.is_claimed()? {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100));
+    }
+    Err(AppError::fail(
+        "lid watchdog did not claim its process lease",
+    ))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn finish_watchdog_launch(result: Result<()>, token: &str) -> Result<()> {
+    if result.is_ok() {
+        result
+    } else {
+        merge_results(result, session::discard_process_lease(token))
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -311,12 +401,19 @@ fn abort_watchdog_start(
     wait_helper: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let cleanup = abort_start_cleanup(
-        || stop_exact_owner(saved),
+        || request_owner_stop(saved),
         || {
             wait_helper()?;
             wait_recorded_watchdog_exit(saved)
         },
         || {
+            let _lock = session::acquire_lock_wait()?;
+            if session::read_saved_for_recovery()?
+                .is_some_and(|current| current.owner != saved.owner)
+                || session::read_watchdog()?.is_some_and(|current| current.owner != saved.owner)
+            {
+                return Ok(());
+            }
             rollback_pending_marker()?;
             finish_recovered_state(saved)
         },
@@ -334,11 +431,7 @@ fn wait_recorded_watchdog_exit(saved: &Session) -> Result<()> {
             "lid watchdog state changed during startup cleanup",
         ));
     }
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline && sysutil::process_matches(&state.watchdog) {
-        sleep(Duration::from_millis(100));
-    }
-    if sysutil::process_matches(&state.watchdog) {
+    if !sysutil::wait_lease_exit(&state.watchdog, Duration::from_secs(15))? {
         Err(AppError::fail(
             "lid watchdog remained alive after its owner",
         ))
@@ -362,12 +455,9 @@ fn wait_for_helper_exit(mut status: impl FnMut() -> Result<Option<u32>>) -> Resu
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn stop_exact_owner(saved: &Session) -> Result<()> {
+fn request_owner_stop(saved: &Session) -> Result<()> {
     session::request_stop(saved)?;
-    if sysutil::process_matches(&saved.owner)
-        && !sysutil::terminate_exact(&saved.owner)
-        && sysutil::process_matches(&saved.owner)
-    {
+    if !sysutil::wait_lease_exit(&saved.owner, Duration::from_secs(15))? {
         Err(AppError::fail("could not stop lid session owner"))
     } else {
         Ok(())
@@ -412,54 +502,115 @@ fn wait_for_child_ready(
     Err(AppError::fail("lid watchdog did not publish ready state"))
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn ready_state(saved: &Session, expected_pid: Option<u32>) -> Result<Option<WatchdogState>> {
-    let Some(state) = session::read_watchdog()? else {
+    let Some(state) = published_watchdog_state(saved, expected_pid)? else {
         return Ok(None);
     };
-    if state.owner != saved.owner || expected_pid.is_some_and(|pid| state.watchdog.pid != pid) {
-        return Err(AppError::fail(
-            "lid watchdog published mismatched ready state",
-        ));
-    }
-    if !sysutil::process_matches(&state.watchdog) {
-        return Err(AppError::fail("lid watchdog exited during startup"));
-    }
     if !state.ready {
         return Ok(None);
     }
     Ok(Some(state))
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn published_watchdog_state(
+    saved: &Session,
+    expected_pid: Option<u32>,
+) -> Result<Option<WatchdogState>> {
+    let Some(state) = session::read_watchdog()? else {
+        return Ok(None);
+    };
+    if state.owner != saved.owner {
+        return Err(AppError::fail(
+            "lid watchdog published mismatched ready state",
+        ));
+    }
+    if state.watchdog.pid == 0 {
+        return Ok(None);
+    }
+    if expected_pid.is_some_and(|pid| state.watchdog.pid != pid) {
+        return Err(AppError::fail(
+            "lid watchdog published mismatched ready state",
+        ));
+    }
+    if !sysutil::lease_is_live(&state.watchdog)? {
+        return Err(AppError::fail("lid watchdog exited during startup"));
+    }
+    Ok(Some(state))
+}
+
 pub fn wait_ready(saved: &Session) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
+    let publish_deadline = Instant::now() + Duration::from_secs(15);
+    let ready_deadline = Instant::now() + Duration::from_secs(300);
+    let mut published = false;
+    loop {
         if session::stop_requested(saved)? {
             return Err(AppError::fail("session stopped during lid startup"));
         }
-        if ready_state(saved, None)?.is_some() {
-            return Ok(());
+        match session::read_watchdog()? {
+            Some(state) if state.owner != saved.owner => {
+                return Err(AppError::fail(
+                    "lid watchdog published mismatched ready state",
+                ));
+            }
+            Some(state) => {
+                published = true;
+                if state.watchdog.pid > 0 {
+                    if !sysutil::lease_is_live(&state.watchdog)? {
+                        return Err(AppError::fail("lid watchdog exited during startup"));
+                    }
+                    if state.ready {
+                        return Ok(());
+                    }
+                }
+            }
+            None if published => {
+                return Err(AppError::fail(
+                    "lid watchdog state disappeared during startup",
+                ));
+            }
+            None if Instant::now() >= publish_deadline => {
+                return Err(AppError::fail("lid watchdog did not publish startup state"));
+            }
+            None => {}
+        }
+        if published && Instant::now() >= ready_deadline {
+            return Err(AppError::fail("lid watchdog did not become ready"));
         }
         sleep(Duration::from_millis(100));
     }
-    Err(AppError::fail("lid watchdog did not become ready"))
 }
 
 pub fn ensure_ready(saved: &Session) -> Result<()> {
     match watchdog_health(
         &saved.owner,
         session::read_watchdog()?.as_ref(),
-        sysutil::process_matches,
-    ) {
+        sysutil::lease_is_live,
+    )? {
         WatchdogHealth::Ready => Ok(()),
         _ => Err(AppError::fail("lid watchdog is no longer active")),
     }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub fn run_watchdog() -> Result<()> {
+pub fn run_watchdog(args: &[String]) -> Result<()> {
+    #[cfg(windows)]
+    let [token, state_dir] = args else {
+        return Err(AppError::fail(
+            "lid watchdog expects a process lease and state directory",
+        ));
+    };
+    #[cfg(windows)]
+    session::set_helper_state_dir(decode_helper_state_dir(state_dir)?)?;
+    #[cfg(target_os = "macos")]
+    let [token] = args else {
+        return Err(AppError::fail("lid watchdog expects a process lease"));
+    };
+    let lease = session::claim_process_lease(token)?;
     let saved = session::read_saved_for_recovery()?
         .ok_or_else(|| AppError::fail("lid watchdog found no session"))?;
-    if !saved.spec.even_lid || !saved.matches_live_process() {
+    if !saved.spec.even_lid || !saved.owner_is_live()? {
         return Err(AppError::fail(
             "lid watchdog requires a matching live even-lid session",
         ));
@@ -467,17 +618,44 @@ pub fn run_watchdog() -> Result<()> {
     let marker = session::read_lid_restore()?
         .ok_or_else(|| AppError::fail("lid watchdog found no restoration marker"))?;
     let snapshot = snapshot_from_marker(&marker)?;
-    #[cfg(windows)]
-    let owner = sysutil::OwnerHandle::open(&saved.owner)?;
+    let pending = session::read_watchdog()?
+        .ok_or_else(|| AppError::fail("lid watchdog startup was cancelled"))?;
+    if pending.owner != saved.owner
+        || pending.ready
+        || pending.watchdog.pid != 0
+        || pending.watchdog.token != token.as_str()
+    {
+        return Err(AppError::fail("lid watchdog startup state changed"));
+    }
     let starting = WatchdogState {
         owner: saved.owner.clone(),
-        watchdog: sysutil::capture_process(sysutil::current_pid())?,
+        watchdog: lease.reference(),
         ready: false,
     };
     let ready = WatchdogState {
         ready: true,
         ..starting.clone()
     };
+
+    let lock = loop {
+        if !saved.owner_is_live()? || session::stop_requested(&saved)? {
+            let error = AppError::fail("lid watchdog startup was cancelled");
+            return merge_results(
+                Err(error),
+                session::remove_watchdog_if_owner(&saved.owner).map(|_| ()),
+            );
+        }
+        if let Some(lock) = session::try_acquire_lock()? {
+            break lock;
+        }
+        sleep(Duration::from_millis(100));
+    };
+    if let Err(error) = validate_watchdog_start(&saved, &marker, &pending) {
+        return merge_results(
+            Err(error),
+            session::remove_watchdog_if_owner(&saved.owner).map(|_| ()),
+        );
+    }
 
     begin_change(
         || session::write_watchdog(&starting),
@@ -487,12 +665,10 @@ pub fn run_watchdog() -> Result<()> {
         || session::clear_lid_restore(&marker),
         || session::remove_watchdog_if_owner(&saved.owner).map(|_| ()),
     )?;
+    drop(lock);
     let primary = (|| -> Result<()> {
         loop {
-            #[cfg(windows)]
-            let owner_alive = owner.alive()?;
-            #[cfg(target_os = "macos")]
-            let owner_alive = sysutil::process_matches(&saved.owner);
+            let owner_alive = sysutil::lease_is_live(&saved.owner)?;
             if !owner_alive {
                 return Ok(());
             }
@@ -505,16 +681,13 @@ pub fn run_watchdog() -> Result<()> {
         }
     })();
     let primary = if primary.is_err() {
-        #[cfg(windows)]
-        let stopped = owner
-            .alive()
-            .and_then(|alive| if alive { owner.terminate() } else { Ok(()) });
-        #[cfg(target_os = "macos")]
-        let stopped = if sysutil::process_matches(&saved.owner) {
-            stop_exact_owner(&saved)
-        } else {
-            Ok(())
-        };
+        let stopped = sysutil::lease_is_live(&saved.owner).and_then(|alive| {
+            if alive {
+                request_owner_stop(&saved)
+            } else {
+                Ok(())
+            }
+        });
         merge_results(primary, stopped)
     } else {
         primary
@@ -534,7 +707,36 @@ pub fn run_watchdog() -> Result<()> {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub fn run_restore() -> Result<()> {
+fn validate_watchdog_start(
+    saved: &Session,
+    marker: &LidRestore,
+    pending: &WatchdogState,
+) -> Result<()> {
+    let current = session::read_saved_for_recovery()?;
+    if current.as_ref().is_none_or(|current| {
+        current.owner != saved.owner || !current.spec.even_lid || current.spec != saved.spec
+    }) || !saved.owner_is_live()?
+        || session::stop_requested(saved)?
+        || session::read_lid_restore()?.as_ref() != Some(marker)
+        || session::read_watchdog()?.as_ref() != Some(pending)
+    {
+        return Err(AppError::fail("lid watchdog startup was cancelled"));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn run_restore(args: &[String]) -> Result<()> {
+    #[cfg(windows)]
+    let [state_dir] = args else {
+        return Err(AppError::fail("lid restore expects a state directory"));
+    };
+    #[cfg(windows)]
+    session::set_helper_state_dir(decode_helper_state_dir(state_dir)?)?;
+    #[cfg(target_os = "macos")]
+    if !args.is_empty() {
+        return Err(AppError::fail("lid restore expects no arguments"));
+    }
     let marker = session::read_lid_restore()?
         .ok_or_else(|| AppError::fail("no lid restoration marker found"))?;
     let snapshot = snapshot_from_marker(&marker)?;
@@ -547,23 +749,27 @@ pub fn finish_stop(_saved: &Session) -> Result<()> {
     #[cfg(any(windows, target_os = "macos"))]
     {
         let watchdog = session::read_watchdog()?;
+        if session::read_saved_for_recovery()?
+            .is_some_and(|current| !current.owner.same_lease(&_saved.owner))
+            || watchdog
+                .as_ref()
+                .is_some_and(|current| !current.owner.same_lease(&_saved.owner))
+        {
+            return Ok(());
+        }
         quiesce_recovery(Some(_saved), watchdog.as_ref())?;
-        restore_pending_marker()?;
+        rollback_pending_marker()?;
         finish_recovered_state(_saved)
     }
 }
 
-pub fn recover_foreground() -> Result<()> {
-    let _lock = session::acquire_lock()?;
-    recover_unlocked()
-}
-
 pub fn recover_unlocked() -> Result<()> {
+    session::cleanup_process_leases()?;
     let marker = session::read_lid_restore()?;
     let saved = session::read_saved_for_recovery();
     let watchdog = session::read_watchdog();
-    let session_state = recovery_session(&saved);
-    let watchdog_state = recovery_watchdog(&saved, &watchdog);
+    let session_state = recovery_session(&saved)?;
+    let watchdog_state = recovery_watchdog(&saved, &watchdog)?;
     let decision = decide_recovery(marker.is_some(), session_state, watchdog_state);
     match decision {
         RecoveryDecision::Keep => Ok(()),
@@ -595,7 +801,7 @@ pub fn recover_unlocked() -> Result<()> {
                         watchdog.as_ref().ok().and_then(Option::as_ref),
                     )?;
                 }
-                restore_pending_marker()?;
+                rollback_pending_marker()?;
                 session::remove_state_file()?;
                 session::remove_watchdog_file()?;
                 session::reconcile_stop()
@@ -604,33 +810,33 @@ pub fn recover_unlocked() -> Result<()> {
     }
 }
 
-fn recovery_session(saved: &Result<Option<Session>>) -> RecoverySession {
-    match saved {
+fn recovery_session(saved: &Result<Option<Session>>) -> Result<RecoverySession> {
+    Ok(match saved {
         Err(_) => RecoverySession::Malformed,
         Ok(None) => RecoverySession::Missing,
-        Ok(Some(saved)) if !saved.matches_live_process() => RecoverySession::Stale,
+        Ok(Some(saved)) if !saved.owner_is_live()? => RecoverySession::Stale,
         Ok(Some(saved)) if saved.spec.even_lid => RecoverySession::LiveLid,
         Ok(Some(_)) => RecoverySession::LiveOrdinary,
-    }
+    })
 }
 
 fn recovery_watchdog(
     saved: &Result<Option<Session>>,
     watchdog: &Result<Option<WatchdogState>>,
-) -> RecoveryWatchdog {
-    match watchdog {
+) -> Result<RecoveryWatchdog> {
+    Ok(match watchdog {
         Err(_) => RecoveryWatchdog::Malformed,
         Ok(None) => RecoveryWatchdog::Missing,
         Ok(Some(state)) => RecoveryWatchdog::Valid {
-            watchdog_live: sysutil::process_matches(&state.watchdog),
-            owner_live: sysutil::process_matches(&state.owner),
+            watchdog_live: sysutil::lease_is_live(&state.watchdog)?,
+            owner_live: sysutil::lease_is_live(&state.owner)?,
             owner_matches_session: saved
                 .as_ref()
                 .ok()
                 .and_then(Option::as_ref)
                 .is_some_and(|saved| saved.owner == state.owner),
         },
-    }
+    })
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -639,24 +845,16 @@ fn quiesce_recovery(saved: Option<&Session>, watchdog: Option<&WatchdogState>) -
         .filter(|saved| saved.spec.even_lid)
         .map(|saved| &saved.owner)
         .or_else(|| watchdog.map(|state| &state.owner));
-    if let Some(saved) = saved.filter(|saved| saved.spec.even_lid) {
-        session::request_stop(saved)?;
+    if let Some(owner) = owner {
+        session::request_stop_owner(owner)?;
+        if !sysutil::wait_lease_exit(owner, Duration::from_secs(15))? {
+            return Err(AppError::fail("could not stop lid session owner"));
+        }
     }
-    if let Some(owner) = owner
-        && sysutil::process_matches(owner)
-        && !sysutil::terminate_exact(owner)
-        && sysutil::process_matches(owner)
+    if let Some(state) = watchdog
+        && !sysutil::wait_lease_exit(&state.watchdog, Duration::from_secs(15))?
     {
-        return Err(AppError::fail("could not stop lid session owner"));
-    }
-    if let Some(state) = watchdog {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline && sysutil::process_matches(&state.watchdog) {
-            sleep(Duration::from_millis(100));
-        }
-        if sysutil::process_matches(&state.watchdog) {
-            return Err(AppError::fail("lid watchdog did not exit after its owner"));
-        }
+        return Err(AppError::fail("lid watchdog did not exit after its owner"));
     }
     Ok(())
 }
@@ -674,11 +872,14 @@ fn restore_pending_marker() -> Result<()> {
 fn remove_matching_session(saved: &Session) -> Result<()> {
     match session::read_saved_for_recovery()? {
         None => Ok(()),
-        Some(actual) if actual.owner == saved.owner && actual.matches_live_process() => Err(
-            AppError::fail("lid session owner is still running after watchdog exit"),
-        ),
         Some(actual) if actual.owner == saved.owner => {
-            session::remove_if_matches(saved).map(|_| ())
+            if actual.owner_is_live()? {
+                Err(AppError::fail(
+                    "lid session owner is still running after watchdog exit",
+                ))
+            } else {
+                session::remove_if_matches(saved).map(|_| ())
+            }
         }
         Some(_) => Err(AppError::fail(
             "session owner changed before lid restoration",
@@ -753,7 +954,8 @@ fn restore_and_clear(marker: &LidRestore, snapshot: &platform::LidSnapshot) -> R
 
 #[cfg(windows)]
 fn restore_elevated() -> Result<()> {
-    let code = sysutil::run_elevated_self("__lid_restore__")?;
+    let state_dir = encode_helper_state_dir(&session::absolute_state_dir()?);
+    let code = sysutil::run_elevated_self(&format!("__lid_restore__ {state_dir}"))?;
     if code == 0 {
         Ok(())
     } else {
@@ -766,7 +968,7 @@ fn restore_elevated() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn restore_elevated() -> Result<()> {
     let run = || -> Result<bool> {
-        let command = mac_helper_command("__lid_restore__")?;
+        let command = mac_helper_command(&["__lid_restore__"])?;
         Ok(std::process::Command::new(&command[0])
             .args(&command[1..])
             .status()?
@@ -789,15 +991,57 @@ fn restore_elevated() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn mac_helper_command(action: &str) -> Result<Vec<String>> {
-    Ok(vec![
+fn mac_helper_command(args: &[&str]) -> Result<Vec<String>> {
+    let mut command = vec![
         "/usr/bin/sudo".into(),
         "-n".into(),
         "/usr/bin/env".into(),
-        format!("WAKE_STATE_DIR={}", session::state_dir().display()),
+        format!(
+            "WAKE_STATE_DIR={}",
+            session::absolute_state_dir()?.display()
+        ),
         sysutil::self_exe()?,
-        action.into(),
-    ])
+    ];
+    command.extend(args.iter().map(|arg| (*arg).into()));
+    Ok(command)
+}
+
+#[cfg(windows)]
+fn encode_helper_state_dir(path: &std::path::Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::new();
+    for unit in path.as_os_str().encode_wide() {
+        for shift in [12, 8, 4, 0] {
+            encoded.push(HEX[usize::from((unit >> shift) & 0xf)] as char);
+        }
+    }
+    encoded
+}
+
+#[cfg(windows)]
+fn decode_helper_state_dir(encoded: &str) -> Result<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    if encoded.is_empty() || !encoded.len().is_multiple_of(4) {
+        return Err(AppError::fail("invalid helper state directory"));
+    }
+    let mut units = Vec::with_capacity(encoded.len() / 4);
+    for chunk in encoded.as_bytes().chunks_exact(4) {
+        let value = std::str::from_utf8(chunk)
+            .ok()
+            .and_then(|chunk| u16::from_str_radix(chunk, 16).ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(|| AppError::fail("invalid helper state directory"))?;
+        units.push(value);
+    }
+    let path = std::path::PathBuf::from(OsString::from_wide(&units));
+    if !path.is_absolute() {
+        return Err(AppError::fail("helper state directory must be absolute"));
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -805,11 +1049,24 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    fn process(pid: u32) -> ProcessRef {
-        ProcessRef {
+    fn process(pid: u32) -> LeaseRef {
+        LeaseRef {
             pid,
-            start: u64::from(pid) * 10,
-            command: format!("wake-{pid}"),
+            token: format!("{pid:032x}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_helper_state_directory_round_trips() {
+        let path = std::path::PathBuf::from(r"C:\Users\Δ user\状態");
+        let encoded = encode_helper_state_dir(&path);
+
+        assert!(encoded.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(decode_helper_state_dir(&encoded).unwrap(), path);
+        let relative = encode_helper_state_dir(std::path::Path::new("relative"));
+        for invalid in ["", "0", "zzzz", relative.as_str()] {
+            assert!(decode_helper_state_dir(invalid).is_err());
         }
     }
 
@@ -984,24 +1241,30 @@ mod tests {
         };
 
         assert_eq!(
-            watchdog_health(&owner, Some(&ready), |candidate| candidate == &watchdog),
+            watchdog_health(&owner, Some(&ready), |candidate| Ok(candidate == &watchdog)).unwrap(),
             WatchdogHealth::Ready
         );
         assert_eq!(
-            watchdog_health(&owner, None, |_| true),
+            watchdog_health(&owner, None, |_| Ok(true)).unwrap(),
             WatchdogHealth::Missing
         );
         assert_eq!(
-            watchdog_health(&owner, Some(&wrong), |_| true),
+            watchdog_health(&owner, Some(&wrong), |_| Ok(true)).unwrap(),
             WatchdogHealth::Mismatch
         );
         assert_eq!(
-            watchdog_health(&owner, Some(&starting), |_| true),
+            watchdog_health(&owner, Some(&starting), |_| Ok(true)).unwrap(),
             WatchdogHealth::Starting
         );
         assert_eq!(
-            watchdog_health(&owner, Some(&ready), |_| false),
+            watchdog_health(&owner, Some(&ready), |_| Ok(false)).unwrap(),
             WatchdogHealth::Dead
+        );
+        assert!(
+            watchdog_health(&owner, Some(&ready), |_| Err(AppError::fail(
+                "unreadable lease"
+            )))
+            .is_err()
         );
     }
 

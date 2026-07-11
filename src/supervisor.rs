@@ -44,13 +44,13 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 fn supervise(spec: RunSpec) -> Result<()> {
-    let started = Instant::now();
-    let started_at = Utc::now();
     let mut inhibitor = platform::Inhibitor::start(spec.mode)?;
     sleep(STARTUP_SETTLE);
     if !inhibitor.alive() {
         return Err(AppError::fail("sleep inhibitor exited during startup"));
     }
+    let started = Instant::now();
+    let started_at = Utc::now();
     let mut session = Session {
         pid: sysutil::current_pid(),
         mode: spec.mode.label().into(),

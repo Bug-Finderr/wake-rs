@@ -1,7 +1,6 @@
 //! Durable session and lid-restoration state.
 
 use crate::error::{AppError, Result};
-use crate::platform;
 use crate::run::ProcessRef;
 use crate::sysutil;
 use chrono::{DateTime, Utc};
@@ -138,21 +137,14 @@ impl Session {
     }
 
     pub fn capture_process_identity(&mut self) -> Result<()> {
-        let id = sysutil::capture_identity(self.pid)?;
-        self.process_start = id.start;
-        self.process_command = id.command;
+        let process = sysutil::capture_process(self.pid)?;
+        self.process_start = process.start;
+        self.process_command = process.command;
         Ok(())
     }
 
     pub fn matches_live_process(&self) -> bool {
-        match sysutil::live_identity(self.pid) {
-            None => false,
-            Some(live) => {
-                self.process_start == live.start
-                    && self.process_command == live.command
-                    && is_expected_command(&live.command, &live.command_line)
-            }
-        }
+        sysutil::live_process(self.pid).as_ref() == Some(&self.identity())
     }
 
     pub fn identity(&self) -> ProcessRef {
@@ -176,15 +168,6 @@ fn valid_prior_lid_state(value: i32) -> bool {
             let (ac, dc) = (value & 0xF, (value >> 4) & 0xF);
             value == ac | (dc << 4) && (0..=3).contains(&ac) && (0..=3).contains(&dc)
         }
-}
-
-fn is_expected_command(command: &str, command_line: &str) -> bool {
-    let base = std::path::Path::new(command)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let line = command_line.to_lowercase();
-    platform::expected_command_basenames().contains(&base.as_str()) || line.contains("wake")
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -282,18 +265,12 @@ fn write_session_at(path: &Path, session: &Session) -> Result<()> {
 }
 
 fn write_stop_at(path: &Path, session: &Session) -> Result<()> {
-    let request = StopRequest {
-        session: session.identity(),
-    };
-    if let Some(existing) = read_json::<StopRequest>(path)?
-        && existing != request
-    {
-        return Err(AppError::fail(format!(
-            "stop request changed at {}; refusing to replace it",
-            path.display()
-        )));
-    }
-    write_json(path, &request)
+    write_json(
+        path,
+        &StopRequest {
+            session: session.identity(),
+        },
+    )
 }
 
 fn stop_requested_at(path: &Path, session: &Session) -> Result<bool> {
@@ -530,14 +507,13 @@ mod tests {
     }
 
     #[test]
-    fn session_json_round_trips_without_storing_command_line() {
+    fn session_json_round_trips() {
         let dir = TestDir::new("session-round-trip");
         let path = dir.join("session.json");
         let expected = sample_session();
 
         write_session_at(&path, &expected).unwrap();
         let saved = read_session_at(&path).unwrap().unwrap();
-        let text = fs::read_to_string(&path).unwrap();
 
         assert_eq!(saved.pid, expected.pid);
         assert_eq!(saved.mode, expected.mode);
@@ -547,7 +523,6 @@ mod tests {
         assert_eq!(saved.ends_at, expected.ends_at);
         assert_eq!(saved.process_start, expected.process_start);
         assert_eq!(saved.process_command, expected.process_command);
-        assert!(!text.contains("processCommandLine"));
         assert!(!path.with_extension("json.tmp").exists());
     }
 
@@ -680,26 +655,28 @@ mod tests {
     }
 
     #[test]
-    fn stop_request_requires_exact_session_identity() {
-        let dir = TestDir::new("stop-exact");
+    fn stop_request_replaces_disposable_marker_and_clears_exactly() {
+        let dir = TestDir::new("stop-replace");
         let path = dir.join("stop.json");
         let expected = sample_session();
         let mut other = sample_session();
         other.process_start += 1;
 
+        write_stop_at(&path, &other).unwrap();
         write_stop_at(&path, &expected).unwrap();
         assert!(stop_requested_at(&path, &expected).unwrap());
         assert!(!stop_requested_at(&path, &other).unwrap());
-        assert!(path.exists());
 
         assert!(!clear_stop_at(&path, &other).unwrap());
         assert!(path.exists());
         assert!(clear_stop_at(&path, &expected).unwrap());
         assert!(!path.exists());
 
-        write_stop_at(&path, &other).unwrap();
-        assert!(write_stop_at(&path, &expected).is_err());
-        assert!(stop_requested_at(&path, &other).unwrap());
+        fs::write(&path, b"not json").unwrap();
+        assert!(stop_requested_at(&path, &expected).is_err());
+        assert!(path.exists());
+        write_stop_at(&path, &expected).unwrap();
+        assert!(stop_requested_at(&path, &expected).unwrap());
     }
 
     #[test]
@@ -724,16 +701,6 @@ mod tests {
         fs::write(&malformed, b"not json").unwrap();
         assert!(reconcile_stop_at(&malformed, |_| false).is_err());
         assert!(malformed.exists());
-    }
-
-    #[test]
-    fn malformed_stop_request_errors_and_is_retained() {
-        let dir = TestDir::new("stop-malformed");
-        let path = dir.join("stop.json");
-        fs::write(&path, br#"{"session":{"pid":"bad"}}"#).unwrap();
-
-        assert!(stop_requested_at(&path, &sample_session()).is_err());
-        assert!(path.exists());
     }
 
     #[test]

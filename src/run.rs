@@ -123,10 +123,6 @@ pub struct ProcessRef {
 }
 
 impl ProcessRef {
-    pub fn matches(&self, pid: u32, start: u64, command: &str) -> bool {
-        self.pid == pid && self.start == start && self.command == command
-    }
-
     fn is_valid(&self) -> bool {
         self.pid > 0 && self.start > 0 && !self.command.trim().is_empty()
     }
@@ -412,15 +408,6 @@ mod tests {
             let actual = plan_charge(target, &status).map_err(|error| error.message().to_string());
             assert_eq!(actual, expected.map_err(str::to_string));
         }
-    }
-
-    #[test]
-    fn process_identity_requires_all_fields() {
-        let expected = process();
-        assert!(expected.matches(42, 1_700_000_000, "/usr/bin/editor"));
-        assert!(!expected.matches(43, 1_700_000_000, "/usr/bin/editor"));
-        assert!(!expected.matches(42, 1_700_000_001, "/usr/bin/editor"));
-        assert!(!expected.matches(42, 1_700_000_000, "/usr/bin/other"));
     }
 
     #[test]

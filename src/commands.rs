@@ -125,7 +125,7 @@ fn resolve_trigger(parsed: ParsedTrigger) -> Result<ResolvedTrigger> {
             let pid = raw
                 .trim()
                 .parse::<u32>()
-                .map_err(|_| AppError::fail(format!("invalid pid: '{raw}'")))?;
+                .map_err(|_| AppError::usage(format!("invalid pid: '{raw}'")))?;
             Trigger::Pid {
                 process: sysutil::capture_process(pid)
                     .map_err(|_| AppError::usage(format!("pid {pid} is not running")))?,
@@ -162,6 +162,7 @@ fn resolve_trigger(parsed: ParsedTrigger) -> Result<ResolvedTrigger> {
 
 fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a String> {
     args.get(i + 1)
+        .filter(|value| !value.starts_with('-'))
         .ok_or_else(|| AppError::usage(format!("missing value for {flag}")))
 }
 
@@ -409,10 +410,7 @@ fn print_start_confirmation(s: &Session, note: Option<&str>) {
         println!(
             "caution: closed lid + battery + no external display can run hot and drain quickly"
         );
-    } else if let Some(n) = note
-        .map(str::to_string)
-        .or_else(platform::static_start_note)
-    {
+    } else if let Some(n) = note {
         println!("{n}");
     }
 }
@@ -915,6 +913,20 @@ mod tests {
             };
             assert!(error.message().contains(expected), "{}", error.message());
         }
+
+        let flag_value = ["--while-pid", "--bogus"].map(str::to_string);
+        let error = parse_start_args(&flag_value).err().unwrap();
+        assert_eq!(error.message(), "missing value for --while-pid");
+
+        let invalid_pid = ["--while-pid", "not-a-pid"].map(str::to_string);
+        let parsed = match parse_start_args(&invalid_pid) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("unexpected parse error: {error}"),
+        };
+        assert!(matches!(
+            resolve_trigger(parsed.trigger),
+            Err(AppError::Usage(_))
+        ));
     }
 
     #[test]

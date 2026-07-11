@@ -9,22 +9,12 @@ const CAFFEINATE: &str = "/usr/bin/caffeinate";
 const PMSET: &str = "/usr/bin/pmset";
 const SUDO: &str = "/usr/bin/sudo";
 const LID_CLOSE_NOTE: &str = "note: closing the lid still sleeps the mac unless you use --even-lid";
-const EXPECTED: &[&str] = &["caffeinate", "wake"];
-
-pub fn expected_command_basenames() -> &'static [&'static str] {
-    EXPECTED
-}
-
 pub fn supports_interactive() -> bool {
     true
 }
 
 pub fn supports_even_lid() -> bool {
     true
-}
-
-pub fn static_start_note() -> Option<String> {
-    Some(LID_CLOSE_NOTE.to_string())
 }
 
 pub struct Inhibitor {

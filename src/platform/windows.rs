@@ -23,12 +23,6 @@ use windows_sys::core::GUID;
 
 const POWERSHELL_MISSING: &str =
     "powershell not found on PATH; wake requires Windows PowerShell on Windows";
-const EXPECTED: &[&str] = &["powershell.exe", "powershell", "wake.exe", "wake"];
-
-pub fn expected_command_basenames() -> &'static [&'static str] {
-    EXPECTED
-}
-
 #[allow(dead_code)] // part of the platform surface; the picker is gated to unix
 pub fn supports_interactive() -> bool {
     false
@@ -36,10 +30,6 @@ pub fn supports_interactive() -> bool {
 
 pub fn supports_even_lid() -> bool {
     true
-}
-
-pub fn static_start_note() -> Option<String> {
-    None
 }
 
 pub struct Inhibitor {

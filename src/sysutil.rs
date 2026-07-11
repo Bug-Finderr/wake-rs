@@ -8,13 +8,6 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
-/// Identity fingerprint of a process: start time (epoch seconds), executable path, full command line.
-pub struct Identity {
-    pub start: u64,
-    pub command: String,
-    pub command_line: String,
-}
-
 fn refreshed(pid: u32) -> System {
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -38,29 +31,16 @@ fn process_exists(pid: u32) -> bool {
     sys.process(Pid::from_u32(pid)).is_some()
 }
 
-fn identity_of(sys: &System, pid: u32) -> Option<Identity> {
+fn process_of(sys: &System, pid: u32) -> Option<ProcessRef> {
     let p = sys.process(Pid::from_u32(pid))?;
     let command = p
         .exe()
         .map(|e| e.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.name().to_string_lossy().into_owned());
-    let command_line = {
-        let joined = p
-            .cmd()
-            .iter()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if joined.is_empty() {
-            command.clone()
-        } else {
-            joined
-        }
-    };
-    Some(Identity {
+    Some(ProcessRef {
+        pid,
         start: p.start_time(),
         command,
-        command_line,
     })
 }
 
@@ -68,28 +48,17 @@ pub fn is_alive(pid: u32) -> bool {
     process_exists(pid)
 }
 
-/// Live identity of a running pid, or None if it is gone.
-pub fn live_identity(pid: u32) -> Option<Identity> {
+pub fn live_process(pid: u32) -> Option<ProcessRef> {
     let sys = refreshed(pid);
-    identity_of(&sys, pid)
-}
-
-pub fn capture_identity(pid: u32) -> Result<Identity> {
-    live_identity(pid).ok_or_else(|| AppError::fail(format!("process {pid} is not running")))
+    process_of(&sys, pid)
 }
 
 pub fn capture_process(pid: u32) -> Result<ProcessRef> {
-    let identity = capture_identity(pid)?;
-    Ok(ProcessRef {
-        pid,
-        start: identity.start,
-        command: identity.command,
-    })
+    live_process(pid).ok_or_else(|| AppError::fail(format!("process {pid} is not running")))
 }
 
 pub fn process_matches(reference: &ProcessRef) -> bool {
-    live_identity(reference.pid)
-        .is_some_and(|identity| reference.matches(reference.pid, identity.start, &identity.command))
+    live_process(reference.pid).as_ref() == Some(reference)
 }
 
 pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
@@ -102,88 +71,74 @@ pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
         true,
         ProcessRefreshKind::everything().without_tasks(),
     );
-    let current = current_pid();
-    let parent = parent_pid();
-    let mut matches = system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| {
-            let pid = pid.as_u32();
-            if pid == current || Some(pid) == parent {
-                return None;
-            }
-            let command = process
-                .exe()
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_else(|| process.name().to_string_lossy().into_owned());
-            let rank = app_match_rank(name, &process.name().to_string_lossy(), &command)?;
-            let wake = std::path::Path::new(&command)
-                .file_stem()
-                .is_some_and(|stem| stem.eq_ignore_ascii_case("wake"));
-            (!wake).then_some((rank, pid, process.start_time(), command))
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|(rank, pid, ..)| (*rank, *pid));
-    Ok(matches
-        .into_iter()
-        .next()
-        .map(|(_, pid, start, command)| ProcessRef {
-            pid,
-            start,
+    let current = Pid::from_u32(current_pid());
+    let parent = system.process(current).and_then(|process| process.parent());
+    let mut found: Option<ProcessRef> = None;
+    for (&pid, process) in system.processes() {
+        if pid == current || Some(pid) == parent {
+            continue;
+        }
+        let command = process
+            .exe()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| process.name().to_string_lossy().into_owned());
+        if !app_name_matches(name, &process.name().to_string_lossy(), &command)
+            || app_name_matches("wake", &process.name().to_string_lossy(), &command)
+        {
+            continue;
+        }
+        let candidate = ProcessRef {
+            pid: pid.as_u32(),
+            start: process.start_time(),
             command,
-        }))
+        };
+        if found
+            .as_ref()
+            .is_none_or(|current| candidate.pid < current.pid)
+        {
+            found = Some(candidate);
+        }
+    }
+    Ok(found)
 }
 
-fn app_match_rank(needle: &str, process_name: &str, executable: &str) -> Option<u8> {
-    let needle = needle.trim().to_lowercase();
-    if needle.is_empty() {
+fn app_name_matches(wanted: &str, process_name: &str, executable: &str) -> bool {
+    let Some(wanted) = normalized_name(wanted) else {
+        return false;
+    };
+    [process_name, executable]
+        .into_iter()
+        .filter_map(normalized_name)
+        .any(|candidate| candidate == wanted)
+}
+
+fn normalized_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
         return None;
     }
-    let wanted = needle.strip_suffix(".exe").unwrap_or(&needle);
-    let name = process_name.trim().to_lowercase();
-    let simple = name.strip_suffix(".exe").unwrap_or(&name);
-    let executable = executable.trim().to_lowercase();
-    let executable = executable
-        .find(".exe")
-        .map_or(executable.as_str(), |end| &executable[..end + 4]);
-    let executable = std::path::Path::new(executable)
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if simple == wanted {
-        Some(0)
-    } else if simple.contains(wanted) || executable.contains(wanted) {
-        Some(1)
-    } else {
-        None
-    }
+    let basename = std::path::Path::new(value)
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(value))
+        .to_string_lossy()
+        .to_lowercase();
+    Some(basename.strip_suffix(".exe").unwrap_or(&basename).into())
 }
 
 pub fn current_pid() -> u32 {
     std::process::id()
 }
 
-pub fn parent_pid() -> Option<u32> {
-    let me = current_pid();
-    refreshed(me)
-        .process(Pid::from_u32(me))
-        .and_then(|p| p.parent())
-        .map(|p| p.as_u32())
-}
-
 pub fn terminate_exact(reference: &ProcessRef) -> bool {
-    if !process_matches(reference) {
-        return false;
-    }
     {
         let system = refreshed(reference.pid);
         let Some(process) = system.process(Pid::from_u32(reference.pid)) else {
             return false;
         };
-        let Some(identity) = identity_of(&system, reference.pid) else {
+        let Some(snapshot) = process_of(&system, reference.pid) else {
             return false;
         };
-        if !reference.matches(reference.pid, identity.start, &identity.command) {
+        if &snapshot != reference {
             return false;
         }
         if process.kill_with(Signal::Term).is_none() {
@@ -194,8 +149,7 @@ pub fn terminate_exact(reference: &ProcessRef) -> bool {
         return true;
     }
     let system = refreshed(reference.pid);
-    if let Some(identity) = identity_of(&system, reference.pid)
-        && reference.matches(reference.pid, identity.start, &identity.command)
+    if process_of(&system, reference.pid).as_ref() == Some(reference)
         && let Some(process) = system.process(Pid::from_u32(reference.pid))
     {
         process.kill();
@@ -438,15 +392,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_name_matching_prefers_exact_and_rejects_blank() {
-        assert_eq!(app_match_rank("Code", "Code.exe", "C:/Code.exe"), Some(0));
-        assert_eq!(app_match_rank("code.exe", "Code", "C:/Code.exe"), Some(0));
-        assert_eq!(
-            app_match_rank("visual", "Code", "Visual Studio Code"),
-            Some(1)
-        );
-        assert_eq!(app_match_rank("report", "Code", "C:/Code.exe report"), None);
-        assert_eq!(app_match_rank("other", "Code", "C:/Code.exe"), None);
-        assert_eq!(app_match_rank(" ", "Code", "C:/Code.exe"), None);
+    fn app_name_matching_is_exact_and_normalized() {
+        let cases = [
+            ("Awake", "Awake.exe", "C:/bin/Awake.exe", true),
+            ("awake.exe", "Awake", "C:/bin/Awake.exe", true),
+            ("me", "someapp", "/usr/bin/someapp", false),
+            ("visual", "Code", "Visual Studio Code", false),
+            (" ", "Code", "C:/Code.exe", false),
+        ];
+        for (wanted, name, executable, expected) in cases {
+            assert_eq!(app_name_matches(wanted, name, executable), expected);
+        }
     }
 }

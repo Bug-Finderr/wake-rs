@@ -8,14 +8,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
-const EXPECTED: &[&str] = &["systemd-inhibit", "sleep", "tail", "wake"];
 const DISPLAY_SYSTEM_INHIBITORS: &[&str] = &["idle:sleep:handle-lid-switch", "idle:sleep", "sleep"];
 const SYSTEM_ONLY_INHIBITORS: &[&str] = &["sleep:handle-lid-switch", "sleep"];
 const INHIBIT_DENIED_MESSAGE: &str = "systemd-inhibit cannot take inhibitor locks in this session (polkit denied); try from a local desktop session or as root";
-
-pub fn expected_command_basenames() -> &'static [&'static str] {
-    EXPECTED
-}
 
 pub fn supports_interactive() -> bool {
     true
@@ -23,10 +18,6 @@ pub fn supports_interactive() -> bool {
 
 pub fn supports_even_lid() -> bool {
     false
-}
-
-pub fn static_start_note() -> Option<String> {
-    None
 }
 
 pub struct Inhibitor {
@@ -142,7 +133,7 @@ pub fn read_battery() -> Result<BatteryStatus> {
             _ => {}
         }
         if let Some((now, full)) = b.measurement {
-            percentages.push(100.0 * now as f64 / full as f64);
+            percentages.push((100.0 * now as f64 / full as f64).clamp(0.0, 100.0));
         } else if let Some(capacity) = b.capacity {
             percentages.push(f64::from(capacity));
         }

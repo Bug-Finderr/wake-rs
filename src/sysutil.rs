@@ -1,6 +1,3 @@
-//! Process helpers backed by `sysinfo`: liveness, identity capture/match, termination,
-//! detached spawning, and locating our own executable.
-
 use crate::error::{AppError, Result};
 use crate::run::ProcessRef;
 use std::process::{Child, Command, Stdio};
@@ -9,48 +6,26 @@ use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
 fn refreshed(pid: u32) -> System {
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
+    let mut system = System::new();
+    system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
         ProcessRefreshKind::everything().without_tasks(),
     );
-    sys
+    system
 }
 
-/// Existence-only refresh: `nothing()` skips exe/cmd/cwd/user/disk/mem, but the process is still
-/// found by the underlying scan, so `.process(pid).is_some()` reflects liveness. Used on the hot
-/// per-second liveness path where the heavier `everything()` fields are not read.
-fn process_exists(pid: u32) -> bool {
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
-        true,
-        ProcessRefreshKind::nothing().without_tasks(),
-    );
-    sys.process(Pid::from_u32(pid)).is_some()
-}
-
-fn process_of(sys: &System, pid: u32) -> Option<ProcessRef> {
-    let p = sys.process(Pid::from_u32(pid))?;
-    let command = p
-        .exe()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.name().to_string_lossy().into_owned());
+fn process_of(system: &System, pid: u32) -> Option<ProcessRef> {
+    let process = system.process(Pid::from_u32(pid))?;
     Some(ProcessRef {
         pid,
-        start: p.start_time(),
-        command,
+        start: process.start_time(),
+        command: process.name().to_string_lossy().into_owned(),
     })
 }
 
-pub fn is_alive(pid: u32) -> bool {
-    process_exists(pid)
-}
-
 pub fn live_process(pid: u32) -> Option<ProcessRef> {
-    let sys = refreshed(pid);
-    process_of(&sys, pid)
+    process_of(&refreshed(pid), pid)
 }
 
 pub fn capture_process(pid: u32) -> Result<ProcessRef> {
@@ -73,7 +48,7 @@ pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
     );
     let current = Pid::from_u32(current_pid());
     let parent = system.process(current).and_then(|process| process.parent());
-    let mut found: Option<ProcessRef> = None;
+    let mut found = None;
     for (&pid, process) in system.processes() {
         if pid == current || Some(pid) == parent {
             continue;
@@ -90,11 +65,11 @@ pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
         let candidate = ProcessRef {
             pid: pid.as_u32(),
             start: process.start_time(),
-            command,
+            command: process.name().to_string_lossy().into_owned(),
         };
         if found
             .as_ref()
-            .is_none_or(|current| candidate.pid < current.pid)
+            .is_none_or(|current: &ProcessRef| candidate.pid < current.pid)
         {
             found = Some(candidate);
         }
@@ -135,10 +110,7 @@ pub fn terminate_exact(reference: &ProcessRef) -> bool {
         let Some(process) = system.process(Pid::from_u32(reference.pid)) else {
             return false;
         };
-        let Some(snapshot) = process_of(&system, reference.pid) else {
-            return false;
-        };
-        if &snapshot != reference {
+        if process_of(&system, reference.pid).as_ref() != Some(reference) {
             return false;
         }
         if process.kill_with(Signal::Term).is_none() {
@@ -168,228 +140,273 @@ fn wait_identity_gone(reference: &ProcessRef, within: Duration) -> bool {
     !process_matches(reference)
 }
 
-/// True if the child is still alive after a short settle delay.
-pub fn verify_child_alive(pid: u32) -> bool {
-    sleep(Duration::from_millis(300));
-    is_alive(pid)
-}
-
-pub fn require_child_alive(pid: u32, cmd: &[String]) -> Result<()> {
-    if verify_child_alive(pid) {
-        return Ok(());
-    }
-    Err(AppError::fail(format!(
-        "keep-awake process exited immediately ({}); see platform requirements",
-        command_basename(cmd)
-    )))
-}
-
-fn command_basename(cmd: &[String]) -> String {
-    match cmd.first() {
-        Some(exe) if !exe.trim().is_empty() => std::path::Path::new(exe)
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| exe.clone()),
-        _ => "unknown".to_string(),
-    }
-}
-
-/// Absolute path to our own executable, used to relaunch detached supervisors.
 pub fn self_exe() -> Result<String> {
     std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .map_err(|e| AppError::fail(format!("can't determine executable path: {e}")))
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| AppError::fail(format!("can't determine executable path: {error}")))
 }
 
-/// Like [`spawn_detached`], but on failure names the program basename and adds a hint, so a bare
-/// `Access is denied. (os error 5)` becomes `couldn't launch <prog>: <err> ...`.
-pub fn spawn_named(cmd: &[String]) -> Result<Child> {
-    spawn_detached(cmd).map_err(|e| {
+pub fn spawn_named(command: &[String]) -> Result<Child> {
+    spawn_detached(command).map_err(|error| {
         AppError::fail(format!(
-            "couldn't launch {}: {e}; check it is installed and on PATH",
-            command_basename(cmd)
+            "couldn't launch {}: {error}",
+            command_basename(command)
         ))
     })
 }
 
-/// Spawn a fully detached child with null stdio. The returned `Child` is not waited on by callers
-/// that fire-and-forget; dropping it does not kill the child.
-pub fn spawn_detached(cmd: &[String]) -> std::io::Result<Child> {
-    let (exe, args) = cmd.split_first().expect("command must be non-empty");
-    let mut c = Command::new(exe);
-    c.args(args)
+pub fn spawn_detached(command: &[String]) -> std::io::Result<Child> {
+    let (executable, args) = command.split_first().expect("command must be non-empty");
+    let mut process = Command::new(executable);
+    process
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    detach(&mut c);
-    c.spawn()
+    detach(&mut process);
+    process.spawn()
 }
 
-/// Spawn a keep-awake child for a supervisor, tied to the supervisor's lifetime so it cannot
-/// outlive it. On Windows a kill-on-close Job Object kills the child even if the supervisor is
-/// force-terminated (`wake stop` uses TerminateProcess, which runs no cleanup). On Unix the
-/// supervisor's SIGTERM/SIGINT handler tears the child down instead.
-pub fn spawn_supervised_child(cmd: &[String]) -> std::io::Result<Child> {
-    let child = spawn_detached(cmd)?;
-    #[cfg(windows)]
-    win::tie_child_to_job(&child);
-    Ok(child)
-}
-
-/// Relaunch our own executable elevated (UAC `runas`) with `args`, wait for it, and return its exit
-/// code. Used on Windows for `--even-lid`, where changing the power-plan lid action needs admin.
-#[cfg(windows)]
-pub fn run_elevated_self(args: &[&str]) -> Result<i32> {
-    let exe = std::env::current_exe()
-        .map_err(|e| AppError::fail(format!("can't determine executable path: {e}")))?;
-    win::shell_execute_runas(&exe, args)
+fn command_basename(command: &[String]) -> String {
+    command
+        .first()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| std::path::Path::new(value).file_name())
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[cfg(windows)]
-fn detach(c: &mut Command) {
+pub use win::{ElevatedChild, OwnerHandle};
+
+#[cfg(windows)]
+pub fn launch_elevated_self(command: &str) -> Result<ElevatedChild> {
+    let executable = std::env::current_exe()
+        .map_err(|error| AppError::fail(format!("can't determine executable path: {error}")))?;
+    win::launch_elevated(&executable, command)
+}
+
+#[cfg(windows)]
+pub fn run_elevated_self(command: &str) -> Result<u32> {
+    launch_elevated_self(command)?.wait()
+}
+
+#[cfg(windows)]
+fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt;
-    // CREATE_NO_WINDOW gives the child its own hidden console, decoupled from ours; it survives
-    // our exit by default. (DETACHED_PROCESS makes PowerShell exit immediately, so we avoid it.)
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    c.creation_flags(CREATE_NO_WINDOW);
-    // Stop the detached child from inheriting our std handles. If our stdout is a captured pipe
-    // (CI, scripts), an inherited copy in the long-lived child would keep that pipe open forever
-    // and hang the caller waiting on EOF, even though we exit promptly.
+    command.creation_flags(CREATE_NO_WINDOW);
     win::prevent_std_handle_inheritance();
 }
 
 #[cfg(windows)]
 mod win {
+    use super::{ProcessRef, process_matches};
     use crate::error::{AppError, Result};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
-    use std::process::Child;
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_CANCELLED, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-        SetHandleInformation,
+        SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
-    };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, INFINITE, WaitForSingleObject,
+        GetExitCodeProcess, GetProcessId, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
-        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+        SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
 
-    /// NUL-terminated UTF-16 buffer for a Win32 wide-string argument.
-    fn wide(s: &OsStr) -> Vec<u16> {
-        s.encode_wide().chain(std::iter::once(0)).collect()
+    pub struct ElevatedChild {
+        handle: HANDLE,
+        id: u32,
     }
 
-    /// Run `exe` elevated via the shell `runas` verb (triggers a UAC prompt), wait for it to exit,
-    /// and return its exit code. The child window is hidden.
-    pub fn shell_execute_runas(exe: &Path, args: &[&str]) -> Result<i32> {
-        // Quote each argument so spaces are preserved; the args we pass are our own literals/numbers.
-        let params: String = args
-            .iter()
-            .map(|a| format!("\"{a}\""))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let verb = wide(OsStr::new("runas"));
-        let file = wide(exe.as_os_str());
-        let params_w = wide(OsStr::new(&params));
+    impl ElevatedChild {
+        pub fn id(&self) -> u32 {
+            self.id
+        }
 
-        // SAFETY: FFI into shell32/kernel32. `info` is zeroed then fully initialized; the wide-string
-        // buffers outlive the `ShellExecuteExW` call. On success `hProcess` is an owned handle we wait
-        // on and then close.
+        pub fn try_wait(&mut self) -> Result<Option<u32>> {
+            match wait_handle(self.handle, 0)? {
+                Some(()) => exit_code(self.handle).map(Some),
+                None => Ok(None),
+            }
+        }
+
+        pub fn wait(mut self) -> Result<u32> {
+            let result = wait_handle(self.handle, INFINITE)?
+                .ok_or_else(|| AppError::fail("elevated helper wait timed out"))
+                .and_then(|()| exit_code(self.handle));
+            close(&mut self.handle);
+            result
+        }
+    }
+
+    impl Drop for ElevatedChild {
+        fn drop(&mut self) {
+            close(&mut self.handle);
+        }
+    }
+
+    pub struct OwnerHandle {
+        handle: HANDLE,
+    }
+
+    impl OwnerHandle {
+        pub fn open(owner: &ProcessRef) -> Result<Self> {
+            // SAFETY: requests a process handle for a numeric PID without inheriting it.
+            let handle =
+                unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, owner.pid) };
+            if handle.is_null() {
+                return Err(os_error("could not open supervisor process"));
+            }
+            if !process_matches(owner) {
+                // SAFETY: handle is owned and closed once on the rejected identity path.
+                unsafe { CloseHandle(handle) };
+                return Err(AppError::fail("supervisor identity changed"));
+            }
+            Ok(Self { handle })
+        }
+
+        pub fn alive(&self) -> Result<bool> {
+            Ok(wait_handle(self.handle, 0)?.is_none())
+        }
+
+        pub fn terminate(&self) -> Result<()> {
+            // SAFETY: handle was opened with PROCESS_TERMINATE and remains owned here.
+            if unsafe { TerminateProcess(self.handle, 1) } == 0 {
+                Err(os_error("could not terminate supervisor"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for OwnerHandle {
+        fn drop(&mut self) {
+            // SAFETY: closes the non-null owned process handle once.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    pub fn launch_elevated(executable: &Path, command: &str) -> Result<ElevatedChild> {
+        let verb = wide(OsStr::new("runas"));
+        let file = wide(executable.as_os_str());
+        let parameters = wide(OsStr::new(command));
+        // SAFETY: info is initialized with buffers that outlive ShellExecuteExW; the returned
+        // process handle is transferred to ElevatedChild.
         unsafe {
             let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
             info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
-            info.fMask = SEE_MASK_NOCLOSEPROCESS;
+            info.fMask = SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS;
             info.lpVerb = verb.as_ptr();
             info.lpFile = file.as_ptr();
-            info.lpParameters = params_w.as_ptr();
-            info.nShow = 0; // SW_HIDE
-
+            info.lpParameters = parameters.as_ptr();
+            info.nShow = 0;
             if ShellExecuteExW(&mut info) == 0 {
-                if GetLastError() == ERROR_CANCELLED {
-                    return Err(AppError::fail(
-                        "elevation was cancelled; --even-lid needs administrator rights to change the lid action",
-                    ));
-                }
-                return Err(AppError::fail("failed to launch the elevated helper"));
+                return if GetLastError() == ERROR_CANCELLED {
+                    Err(AppError::fail(
+                        "elevation was cancelled; --even-lid needs administrator rights",
+                    ))
+                } else {
+                    Err(os_error("failed to launch elevated helper"))
+                };
             }
             if info.hProcess.is_null() {
-                return Err(AppError::fail("elevated helper did not start"));
+                return Err(AppError::fail("elevated helper did not return a process"));
             }
-            WaitForSingleObject(info.hProcess, INFINITE);
-            let mut code: u32 = 0;
-            let got = GetExitCodeProcess(info.hProcess, &mut code);
-            CloseHandle(info.hProcess);
-            if got == 0 {
-                return Err(AppError::fail(
-                    "could not read the elevated helper's exit code",
-                ));
+            let id = GetProcessId(info.hProcess);
+            if id == 0 {
+                CloseHandle(info.hProcess);
+                return Err(os_error("could not read elevated helper process ID"));
             }
-            Ok(code as i32)
+            Ok(ElevatedChild {
+                handle: info.hProcess,
+                id,
+            })
         }
+    }
+
+    pub(super) fn decode_wait(status: u32) -> std::io::Result<Option<()>> {
+        match status {
+            WAIT_OBJECT_0 => Ok(Some(())),
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_FAILED => Err(std::io::Error::last_os_error()),
+            other => Err(std::io::Error::other(format!(
+                "unexpected process wait result {other}"
+            ))),
+        }
+    }
+
+    fn wait_handle(handle: HANDLE, timeout: u32) -> Result<Option<()>> {
+        // SAFETY: handle is a live owned or borrowed process handle for this synchronous wait.
+        decode_wait(unsafe { WaitForSingleObject(handle, timeout) }).map_err(AppError::from)
+    }
+
+    fn exit_code(handle: HANDLE) -> Result<u32> {
+        let mut code = 0;
+        // SAFETY: called only after the process handle was signaled; code is writable.
+        if unsafe { GetExitCodeProcess(handle, &mut code) } == 0 {
+            Err(os_error("could not read elevated helper exit code"))
+        } else {
+            Ok(code)
+        }
+    }
+
+    fn close(handle: &mut HANDLE) {
+        if !handle.is_null() {
+            // SAFETY: closes the owned handle once and immediately marks it null.
+            unsafe { CloseHandle(*handle) };
+            *handle = std::ptr::null_mut();
+        }
+    }
+
+    fn wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn os_error(action: &str) -> AppError {
+        AppError::fail(format!("{action}: {}", std::io::Error::last_os_error()))
     }
 
     pub fn prevent_std_handle_inheritance() {
-        for n in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-            // SAFETY: each constant names a process standard handle; invalid handles are rejected
-            // before SetHandleInformation.
+        for number in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: invalid standard handles are rejected before SetHandleInformation.
             unsafe {
-                let h = GetStdHandle(n);
-                if !h.is_null() && h as isize != -1 {
-                    SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+                let handle = GetStdHandle(number);
+                if !handle.is_null() && handle as isize != -1 {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
                 }
             }
-        }
-    }
-
-    /// Best-effort: put `child` in a kill-on-close Job Object and intentionally leak the job handle,
-    /// so the OS kills the child when this process exits for any reason. If anything fails we fall
-    /// back to the supervisor's normal-exit cleanup.
-    pub fn tie_child_to_job(child: &Child) {
-        // SAFETY: the created handle is owned here; `child` supplies a valid process handle. All
-        // failure paths close the job, while success deliberately retains it for process lifetime.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
-                return;
-            }
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let sized = SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&info).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            if sized == 0 || AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) == 0 {
-                CloseHandle(job);
-            }
-            // On success `job` is leaked on purpose: the handle must stay open for our lifetime so
-            // kill-on-close fires when we die. Closing it now would kill the child immediately.
         }
     }
 }
 
 #[cfg(unix)]
-fn detach(c: &mut Command) {
+fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // New process group so terminal SIGINT/SIGTSTP don't reach the detached child.
-    c.process_group(0);
+    command.process_group(0);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_wait_state_decodes_only_documented_results() {
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+        assert_eq!(win::decode_wait(WAIT_OBJECT_0).unwrap(), Some(()));
+        assert_eq!(win::decode_wait(WAIT_TIMEOUT).unwrap(), None);
+        assert!(win::decode_wait(WAIT_FAILED).is_err());
+        assert!(win::decode_wait(7).is_err());
+    }
 
     #[test]
     fn app_name_matching_is_exact_and_normalized() {

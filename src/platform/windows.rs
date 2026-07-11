@@ -1,9 +1,5 @@
-//! Windows power requests, battery status, and the temporary power-plan lid override.
-
-use super::KeepAwake;
 use crate::error::{AppError, Result};
 use crate::run::{BatteryStatus, Mode};
-use base64::Engine;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_SUCCESS, GetLastError, INVALID_HANDLE_VALUE, LocalFree,
 };
@@ -21,20 +17,12 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::core::GUID;
 
-const POWERSHELL_MISSING: &str =
-    "powershell not found on PATH; wake requires Windows PowerShell on Windows";
-#[allow(dead_code)] // part of the platform surface; the picker is gated to unix
-pub fn supports_interactive() -> bool {
-    false
-}
-
 pub fn supports_even_lid() -> bool {
     true
 }
 
 pub struct Inhibitor {
     handle: windows_sys::Win32::Foundation::HANDLE,
-    system: bool,
     display: bool,
 }
 
@@ -48,41 +36,35 @@ impl Inhibitor {
                 SimpleReasonString: reason.as_mut_ptr(),
             },
         };
-        // SAFETY: `context` and its NUL-terminated reason buffer remain valid for the call. The
-        // returned handle is owned here and closed on every failure path or by Drop.
+        // SAFETY: the context and NUL-terminated reason remain valid for this call.
         let handle = unsafe { PowerCreateRequest(&context) };
         if handle == INVALID_HANDLE_VALUE {
-            // SAFETY: this reads the calling thread's error code immediately after the failed call.
-            let code = unsafe { GetLastError() };
-            return Err(win_error("could not create power request", code));
+            // SAFETY: reads this thread's error immediately after the failed call.
+            return Err(last_error("could not create power request", unsafe {
+                GetLastError()
+            }));
         }
-
-        // SAFETY: `handle` is a valid owned power-request handle.
+        // SAFETY: handle is an owned power-request handle.
         if unsafe { PowerSetRequest(handle, PowerRequestSystemRequired) } == 0 {
-            // SAFETY: capture the error before closing the handle, which may overwrite it.
-            let code = unsafe { GetLastError() };
-            // SAFETY: the valid owned handle has no successful requests to clear.
+            // SAFETY: error is read before the owned handle is closed.
+            let error = last_error("could not prevent system sleep", unsafe { GetLastError() });
+            // SAFETY: closes the valid owned handle once.
             unsafe { CloseHandle(handle) };
-            return Err(win_error("could not prevent system sleep", code));
+            return Err(error);
         }
-
         let display = mode == Mode::DisplaySystem;
-        // SAFETY: the same valid handle can own one request of each distinct type.
+        // SAFETY: the handle may own one request of each distinct type.
         if display && unsafe { PowerSetRequest(handle, PowerRequestDisplayRequired) } == 0 {
-            // SAFETY: capture the error before cleanup, then clear exactly the successful request.
-            let code = unsafe { GetLastError() };
+            // SAFETY: error is captured before clearing and closing the valid handle.
+            let error = last_error("could not prevent display sleep", unsafe { GetLastError() });
+            // SAFETY: clears the one successful request and closes the handle once.
             unsafe {
                 PowerClearRequest(handle, PowerRequestSystemRequired);
                 CloseHandle(handle);
             }
-            return Err(win_error("could not prevent display sleep", code));
+            return Err(error);
         }
-
-        Ok(Self {
-            handle,
-            system: true,
-            display,
-        })
+        Ok(Self { handle, display })
     }
 
     pub fn note(&self) -> Option<&str> {
@@ -96,90 +78,245 @@ impl Inhibitor {
 
 impl Drop for Inhibitor {
     fn drop(&mut self) {
-        // SAFETY: each flag records one successful PowerSetRequest. Each is cleared once, then the
-        // owned valid handle is closed once.
+        // SAFETY: flags correspond to successful requests; the owned handle is closed once.
         unsafe {
             if self.display {
                 PowerClearRequest(self.handle, PowerRequestDisplayRequired);
             }
-            if self.system {
-                PowerClearRequest(self.handle, PowerRequestSystemRequired);
-            }
+            PowerClearRequest(self.handle, PowerRequestSystemRequired);
             CloseHandle(self.handle);
         }
     }
 }
 
-fn win_error(action: &str, code: u32) -> AppError {
-    AppError::fail(format!(
-        "{action}: {}",
-        std::io::Error::from_raw_os_error(code as i32)
-    ))
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LidSnapshot {
+    pub scheme_guid: String,
+    pub ac_action: u32,
+    pub dc_action: u32,
 }
 
-pub fn keep_awake_command(
-    no_display: bool,
-    timeout_sec: Option<i64>,
-    wait_pid: Option<u32>,
-) -> Result<KeepAwake> {
-    let powershell = resolve_powershell()?;
-    // ES_CONTINUOUS|ES_SYSTEM_REQUIRED(|ES_DISPLAY_REQUIRED) as decimal: a hex literal like
-    // 0x80000003 parses as a negative Int32 in PowerShell, so the [uint32] cast throws and the
-    // assertion silently no-ops. Decimal stays in uint32 range and actually blocks sleep.
-    let flags = if no_display {
-        "2147483649"
-    } else {
-        "2147483651"
-    };
-    let type_definition = r#"using System;
-using System.Runtime.InteropServices;
-namespace Wake {
-    public static class Native {
-        [DllImport("kernel32.dll")]
-        public static extern uint SetThreadExecutionState(uint esFlags);
+impl LidSnapshot {
+    pub fn new(scheme_guid: String, ac_action: u32, dc_action: u32) -> Result<Self> {
+        let scheme_guid = format_guid(&parse_guid(&scheme_guid)?);
+        if !(0..=3).contains(&ac_action) || !(0..=3).contains(&dc_action) {
+            return Err(AppError::fail("lid actions must be in 0..=3"));
+        }
+        Ok(Self {
+            scheme_guid,
+            ac_action,
+            dc_action,
+        })
+    }
+
+    fn scheme(&self) -> Result<GUID> {
+        parse_guid(&self.scheme_guid)
     }
 }
-"#;
-    let block = if let Some(pid) = wait_pid {
-        format!("Wait-Process -Id {pid} -ErrorAction SilentlyContinue")
-    } else if let Some(t) = timeout_sec {
-        format!("Start-Sleep -Seconds {t}")
-    } else {
-        "while ($true) { Start-Sleep -Seconds 3600 }".to_string()
+
+pub fn read_lid_snapshot() -> Result<LidSnapshot> {
+    let scheme = active_scheme()?;
+    let (ac_action, dc_action) = read_lid_values(&scheme)?;
+    LidSnapshot::new(format_guid(&scheme), ac_action, dc_action)
+}
+
+pub fn disable_lid(snapshot: &LidSnapshot) -> Result<()> {
+    let scheme = snapshot.scheme()?;
+    if !guid_eq(&active_scheme()?, &scheme) {
+        return Err(AppError::fail(
+            "active power scheme changed before the lid override",
+        ));
+    }
+    write_ac(&scheme, 0)?;
+    write_dc(&scheme, 0)?;
+    let active = active_scheme()?;
+    if !should_reapply(&scheme, Some(&active)) {
+        return Err(AppError::fail(
+            "active power scheme changed during the lid override",
+        ));
+    }
+    set_active(&scheme)?;
+    verify_lid_values(&scheme, 0, 0, "enable")
+}
+
+pub fn restore_lid(snapshot: &LidSnapshot) -> Result<()> {
+    let scheme = snapshot.scheme()?;
+    write_ac(&scheme, snapshot.ac_action)?;
+    write_dc(&scheme, snapshot.dc_action)?;
+    let active = active_scheme()?;
+    if should_reapply(&scheme, Some(&active)) {
+        set_active(&scheme)?;
+    }
+    verify_lid_values(&scheme, snapshot.ac_action, snapshot.dc_action, "restore")
+}
+
+pub fn lid_override_is_active(snapshot: &LidSnapshot) -> Result<bool> {
+    let scheme = snapshot.scheme()?;
+    Ok(guid_eq(&scheme, &active_scheme()?) && read_lid_values(&scheme)? == (0, 0))
+}
+
+pub fn lid_is_restored(snapshot: &LidSnapshot) -> Result<bool> {
+    Ok(read_lid_values(&snapshot.scheme()?)? == (snapshot.ac_action, snapshot.dc_action))
+}
+
+fn active_scheme() -> Result<GUID> {
+    let mut pointer = std::ptr::null_mut();
+    // SAFETY: receives an allocated GUID pointer that is copied and freed on every non-null path.
+    let code = unsafe { PowerGetActiveScheme(std::ptr::null_mut(), &mut pointer) };
+    if code != ERROR_SUCCESS {
+        if !pointer.is_null() {
+            // SAFETY: a non-null error result is still the allocation returned by the API.
+            unsafe { LocalFree(pointer.cast()) };
+        }
+        return Err(power_error("could not read active power scheme", code));
+    }
+    if pointer.is_null() {
+        return Err(AppError::fail(
+            "could not read active power scheme: null result",
+        ));
+    }
+    // SAFETY: successful PowerGetActiveScheme returned a non-null GUID allocation.
+    let scheme = unsafe { *pointer };
+    // SAFETY: pointer is the allocation returned by PowerGetActiveScheme and is freed once.
+    unsafe { LocalFree(pointer.cast()) };
+    Ok(scheme)
+}
+
+fn read_lid_values(scheme: &GUID) -> Result<(u32, u32)> {
+    let mut ac = 0;
+    let mut dc = 0;
+    // SAFETY: all GUID pointers and output pointers remain valid for each synchronous call.
+    let code = unsafe {
+        PowerReadACValueIndex(
+            std::ptr::null_mut(),
+            scheme,
+            &GUID_SYSTEM_BUTTON_SUBGROUP,
+            &GUID_LIDCLOSE_ACTION,
+            &mut ac,
+        )
     };
-    // INVARIANT: only interpolate values that render as a fixed numeric/known literal here
-    // (`flags` is a constant; `pid`/`t` are typed integers). A free-form `String` would not be
-    // escaped by the base64 step below and could alter the script.
-    let script = format!(
-        "Add-Type -TypeDefinition @'\n{type_definition}'@\n\
-         $r = [Wake.Native]::SetThreadExecutionState([uint32]{flags})\n\
-         if ($r -eq 0) {{ exit 1 }}\n{block}\n"
-    );
-    let utf16: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-    Ok(KeepAwake {
-        cmd: vec![
-            powershell,
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-EncodedCommand".into(),
-            encoded,
-        ],
-        note: None,
-    })
+    if code != ERROR_SUCCESS {
+        return Err(power_error("could not read AC lid action", code));
+    }
+    // SAFETY: all GUID pointers and the output pointer remain valid for the synchronous call.
+    let code = unsafe {
+        PowerReadDCValueIndex(
+            std::ptr::null_mut(),
+            scheme,
+            &GUID_SYSTEM_BUTTON_SUBGROUP,
+            &GUID_LIDCLOSE_ACTION,
+            &mut dc,
+        )
+    };
+    if code != ERROR_SUCCESS {
+        return Err(power_error("could not read DC lid action", code));
+    }
+    Ok((ac, dc))
+}
+
+fn write_ac(scheme: &GUID, value: u32) -> Result<()> {
+    // SAFETY: GUID pointers remain valid for the synchronous write.
+    let code = unsafe {
+        PowerWriteACValueIndex(
+            std::ptr::null_mut(),
+            scheme,
+            &GUID_SYSTEM_BUTTON_SUBGROUP,
+            &GUID_LIDCLOSE_ACTION,
+            value,
+        )
+    };
+    (code == ERROR_SUCCESS)
+        .then_some(())
+        .ok_or_else(|| power_error("could not write AC lid action", code))
+}
+
+fn write_dc(scheme: &GUID, value: u32) -> Result<()> {
+    // SAFETY: GUID pointers remain valid for the synchronous write.
+    let code = unsafe {
+        PowerWriteDCValueIndex(
+            std::ptr::null_mut(),
+            scheme,
+            &GUID_SYSTEM_BUTTON_SUBGROUP,
+            &GUID_LIDCLOSE_ACTION,
+            value,
+        )
+    };
+    (code == ERROR_SUCCESS)
+        .then_some(())
+        .ok_or_else(|| power_error("could not write DC lid action", code))
+}
+
+fn set_active(scheme: &GUID) -> Result<()> {
+    // SAFETY: scheme points to a valid GUID for the synchronous call.
+    let code = unsafe { PowerSetActiveScheme(std::ptr::null_mut(), scheme) };
+    (code == ERROR_SUCCESS)
+        .then_some(())
+        .ok_or_else(|| power_error("could not apply lid action", code))
+}
+
+fn verify_lid_values(scheme: &GUID, ac: u32, dc: u32, action: &str) -> Result<()> {
+    let actual = read_lid_values(scheme)?;
+    if actual == (ac, dc) {
+        Ok(())
+    } else {
+        Err(AppError::fail(format!(
+            "failed to {action} lid action: expected AC={ac} DC={dc}, found AC={} DC={}",
+            actual.0, actual.1
+        )))
+    }
+}
+
+fn parse_guid(value: &str) -> Result<GUID> {
+    if value.len() != 36
+        || value.bytes().enumerate().any(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte != b'-',
+            _ => !byte.is_ascii_hexdigit(),
+        })
+    {
+        return Err(AppError::fail(format!(
+            "invalid power scheme GUID: {value}"
+        )));
+    }
+    u128::from_str_radix(&value.replace('-', ""), 16)
+        .map(GUID::from_u128)
+        .map_err(|_| AppError::fail(format!("invalid power scheme GUID: {value}")))
+}
+
+fn format_guid(value: &GUID) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        value.data1,
+        value.data2,
+        value.data3,
+        value.data4[0],
+        value.data4[1],
+        value.data4[2],
+        value.data4[3],
+        value.data4[4],
+        value.data4[5],
+        value.data4[6],
+        value.data4[7]
+    )
+}
+
+fn guid_eq(left: &GUID, right: &GUID) -> bool {
+    left.data1 == right.data1
+        && left.data2 == right.data2
+        && left.data3 == right.data3
+        && left.data4 == right.data4
+}
+
+fn should_reapply(recorded: &GUID, active: Option<&GUID>) -> bool {
+    active.is_some_and(|active| guid_eq(recorded, active))
 }
 
 pub fn read_battery() -> Result<BatteryStatus> {
     let mut status = SYSTEM_POWER_STATUS::default();
-    // SAFETY: `status` is a valid writable struct for the duration of the call.
+    // SAFETY: status is a valid writable struct for the synchronous call.
     if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
-        return Err(AppError::fail(format!(
-            "could not read battery status: {}",
-            std::io::Error::last_os_error()
-        )));
+        // SAFETY: reads this thread's error immediately after the failed call.
+        let code = unsafe { GetLastError() };
+        return Err(last_error("could not read battery status", code));
     }
     battery_from_values(
         status.ACLineStatus,
@@ -202,106 +339,15 @@ fn battery_from_values(ac: u8, flags: u8, percent: u8) -> Result<BatteryStatus> 
     })
 }
 
-// Power requests cannot override the lid-close action, so the legacy --even-lid path changes the
-// active power plan through an elevated helper.
-
-/// Pack the AC and DC lid actions into the session's `prior_disable_sleep` (`i32`) field. Each value
-/// is 0..=3, so a nibble each is plenty.
-pub fn encode_lid(ac: u32, dc: u32) -> i32 {
-    ac as i32 | ((dc as i32) << 4)
+fn power_error(action: &str, code: u32) -> AppError {
+    AppError::fail(format!(
+        "{action} (Windows code {code}): {}",
+        std::io::Error::from_raw_os_error(code as i32)
+    ))
 }
 
-/// Inverse of [`encode_lid`].
-pub fn decode_lid(v: i32) -> (u32, u32) {
-    ((v & 0xF) as u32, ((v >> 4) & 0xF) as u32)
-}
-
-/// Read the active power plan's AC and DC lid-close actions. Unprivileged.
-pub fn read_lid_action() -> Result<(u32, u32)> {
-    // SAFETY: FFI into powrprof. `PowerGetActiveScheme` allocates a GUID we must `LocalFree`. The
-    // read calls only borrow `scheme`/our stack `out` for their duration.
-    unsafe {
-        let mut scheme: *mut GUID = std::ptr::null_mut();
-        if PowerGetActiveScheme(std::ptr::null_mut(), &mut scheme) != ERROR_SUCCESS {
-            return Err(AppError::fail("could not read the active power scheme"));
-        }
-        let result = (|| {
-            let mut ac: u32 = 0;
-            let mut dc: u32 = 0;
-            if PowerReadACValueIndex(
-                std::ptr::null_mut(),
-                scheme,
-                &GUID_SYSTEM_BUTTON_SUBGROUP,
-                &GUID_LIDCLOSE_ACTION,
-                &mut ac,
-            ) != ERROR_SUCCESS
-            {
-                return Err(AppError::fail("could not read the AC lid action"));
-            }
-            if PowerReadDCValueIndex(
-                std::ptr::null_mut(),
-                scheme,
-                &GUID_SYSTEM_BUTTON_SUBGROUP,
-                &GUID_LIDCLOSE_ACTION,
-                &mut dc,
-            ) != ERROR_SUCCESS
-            {
-                return Err(AppError::fail("could not read the DC lid action"));
-            }
-            Ok((ac, dc))
-        })();
-        LocalFree(scheme.cast());
-        result
-    }
-}
-
-/// Set the active power plan's AC and DC lid-close actions, then re-activate the scheme so the
-/// change takes effect. Requires administrator rights.
-pub fn write_lid_action(ac: u32, dc: u32) -> Result<()> {
-    // SAFETY: FFI into powrprof. `PowerGetActiveScheme` allocates a GUID we must `LocalFree`; the
-    // write/set calls only borrow `scheme` for their duration.
-    unsafe {
-        let mut scheme: *mut GUID = std::ptr::null_mut();
-        if PowerGetActiveScheme(std::ptr::null_mut(), &mut scheme) != ERROR_SUCCESS {
-            return Err(AppError::fail("could not read the active power scheme"));
-        }
-        let result = (|| {
-            // ERROR_ACCESS_DENIED is the common case (not elevated); any failure here means the
-            // write did not take, so report the same admin-rights guidance regardless of `rc`.
-            let denied = || AppError::fail("setting the lid action requires administrator rights");
-            if PowerWriteACValueIndex(
-                std::ptr::null_mut(),
-                scheme,
-                &GUID_SYSTEM_BUTTON_SUBGROUP,
-                &GUID_LIDCLOSE_ACTION,
-                ac,
-            ) != ERROR_SUCCESS
-            {
-                return Err(denied());
-            }
-            if PowerWriteDCValueIndex(
-                std::ptr::null_mut(),
-                scheme,
-                &GUID_SYSTEM_BUTTON_SUBGROUP,
-                &GUID_LIDCLOSE_ACTION,
-                dc,
-            ) != ERROR_SUCCESS
-            {
-                return Err(denied());
-            }
-            if PowerSetActiveScheme(std::ptr::null_mut(), scheme) != ERROR_SUCCESS {
-                return Err(denied());
-            }
-            Ok(())
-        })();
-        LocalFree(scheme.cast());
-        result
-    }
-}
-
-fn resolve_powershell() -> Result<String> {
-    super::resolve_on_path("powershell.exe", POWERSHELL_MISSING)
-        .or_else(|_| super::resolve_on_path("powershell", POWERSHELL_MISSING))
+fn last_error(action: &str, code: u32) -> AppError {
+    power_error(action, code)
 }
 
 #[cfg(test)]
@@ -337,11 +383,33 @@ mod tests {
     }
 
     #[test]
-    fn lid_encode_roundtrip_all_combos() {
-        for ac in 0..=3u32 {
-            for dc in 0..=3u32 {
-                assert_eq!(decode_lid(encode_lid(ac, dc)), (ac, dc));
-            }
+    fn canonical_guid_round_trips() {
+        let text = "381b4222-f694-41f0-9685-ff5bb260df2e";
+        let guid = parse_guid(text).unwrap();
+        assert_eq!(format_guid(&guid), text);
+        for invalid in [
+            "381b4222f69441f09685ff5bb260df2e",
+            "381b4222-f694-41f0-9685-ff5bb260df2z",
+            "{381b4222-f694-41f0-9685-ff5bb260df2e}",
+        ] {
+            assert!(parse_guid(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn reactivation_requires_the_recorded_scheme_to_still_be_active() {
+        let recorded = parse_guid("381b4222-f694-41f0-9685-ff5bb260df2e").unwrap();
+        let other = parse_guid("11111111-2222-3333-4444-555555555555").unwrap();
+        assert!(should_reapply(&recorded, Some(&recorded)));
+        assert!(!should_reapply(&recorded, Some(&other)));
+        assert!(!should_reapply(&recorded, None));
+    }
+
+    #[test]
+    fn lid_snapshot_is_canonical_and_validated() {
+        let snapshot =
+            LidSnapshot::new("381B4222-F694-41F0-9685-FF5BB260DF2E".into(), 1, 2).unwrap();
+        assert_eq!(snapshot.scheme_guid, "381b4222-f694-41f0-9685-ff5bb260df2e");
+        assert!(LidSnapshot::new(snapshot.scheme_guid.clone(), 4, 0).is_err());
     }
 }

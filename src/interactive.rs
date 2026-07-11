@@ -1,6 +1,3 @@
-//! Interactive picker (macOS/Linux). Raw-mode key handling via crossterm; ANSI rendering matches
-//! the reference. Each selectable action delegates to `commands` so all the safety machinery runs.
-
 use crate::commands;
 use crate::error::Result;
 use crate::session::{self, Session};
@@ -115,7 +112,6 @@ impl Picker {
                         self.cleanup();
                         return self.run_action(&it.action);
                     }
-                    // in-place actions (toggle detail)
                     if let Action::ToggleDetail = it.action {
                         self.show_detail = !self.show_detail;
                     }
@@ -186,8 +182,8 @@ impl Picker {
                 "  {}● active{}   {} {}",
                 fg_yellow(),
                 reset(),
-                s.trigger,
-                s.detail
+                s.spec.trigger.label(),
+                s.spec.trigger.detail()
             ));
             if let Some(end) = s.ends_at {
                 let rem = (end - Utc::now()).num_seconds().max(0);
@@ -379,14 +375,18 @@ fn prev(items: &[Item], cur: usize) -> usize {
 
 fn append_detail(sb: &mut String, s: &Session) {
     let now = Utc::now();
-    let started = s.started_at.unwrap_or(now);
+    let started = s.started_at;
     let elapsed = (now - started).num_seconds();
     let remaining = match s.ends_at {
         None => "-".to_string(),
         Some(e) => commands::pretty_duration((e - now).num_seconds().max(0)),
     };
-    sb.push_str(&format!("    mode      : {}\n", s.mode));
-    sb.push_str(&format!("    trigger   : {} ({})\n", s.trigger, s.detail));
+    sb.push_str(&format!("    mode      : {}\n", s.spec.mode.label()));
+    sb.push_str(&format!(
+        "    trigger   : {} ({})\n",
+        s.spec.trigger.label(),
+        s.spec.trigger.detail()
+    ));
     sb.push_str(&format!(
         "    started   : {} ({} ago)\n",
         started.with_timezone(&Local).format("%H:%M:%S"),
@@ -428,7 +428,7 @@ fn read_stdin_line() -> Option<String> {
     }
 }
 
-// ANSI helpers (computed lazily so NO_COLOR/TERM are honored at runtime).
+// Compute styles at use time so runtime environment changes are honored.
 fn alt_on() -> String {
     format!("{ESC}[?1049h")
 }

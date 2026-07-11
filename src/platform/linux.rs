@@ -1,7 +1,5 @@
-//! Linux: `systemd-inhibit` for sleep locks (degrading gracefully when polkit denies lid-switch),
-//! sysfs `/sys/class/power_supply` for battery.
+//! Linux systemd inhibition and sysfs battery status.
 
-use super::KeepAwake;
 use crate::error::{AppError, Result};
 use crate::run::{BatteryStatus, Mode};
 use std::path::Path;
@@ -71,39 +69,6 @@ impl Drop for Inhibitor {
     }
 }
 
-pub fn keep_awake_command(
-    no_display: bool,
-    timeout_sec: Option<i64>,
-    wait_pid: Option<u32>,
-) -> Result<KeepAwake> {
-    let systemd_inhibit = super::resolve_on_path(
-        "systemd-inhibit",
-        "systemd-inhibit not found on PATH; wake requires systemd on Linux",
-    )?;
-    let (requested, what) = choose_inhibitor_what(no_display, &systemd_inhibit)?;
-    let note = start_note_for(requested, &what);
-    let mut cmd = vec![
-        systemd_inhibit,
-        format!("--what={what}"),
-        "--who=wake".into(),
-        "--why=wake CLI".into(),
-    ];
-    if let Some(p) = wait_pid {
-        cmd.push("tail".into());
-        cmd.push(format!("--pid={p}"));
-        cmd.push("-f".into());
-        cmd.push("/dev/null".into());
-    } else {
-        cmd.push("sleep".into());
-        cmd.push(
-            timeout_sec
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "infinity".into()),
-        );
-    }
-    Ok(KeepAwake { cmd, note })
-}
-
 pub fn read_battery() -> Result<BatteryStatus> {
     let base = Path::new(POWER_SUPPLY);
     if !base.is_dir() {
@@ -150,30 +115,6 @@ pub fn read_battery() -> Result<BatteryStatus> {
         neutral_state,
     })
 }
-
-// even-lid unsupported on Linux (systemd handles lid inhibition when privileged)
-fn unsupported<T>() -> Result<T> {
-    Err(AppError::fail(
-        "--even-lid is not supported on this platform",
-    ))
-}
-pub fn read_disable_sleep() -> Result<i32> {
-    unsupported()
-}
-pub fn authenticate_sudo() -> Result<bool> {
-    unsupported()
-}
-pub fn set_disable_sleep_foreground(_value: i32) -> Result<()> {
-    unsupported()
-}
-pub fn set_disable_sleep_non_interactive(_value: i32) -> Result<bool> {
-    unsupported()
-}
-pub fn refresh_sudo_non_interactive() -> Result<bool> {
-    unsupported()
-}
-
-// ---- helpers ----
 
 fn choose_inhibitor_what(
     no_display: bool,

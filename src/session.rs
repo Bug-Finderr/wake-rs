@@ -1,7 +1,7 @@
 //! Durable session and lid-restoration state.
 
 use crate::error::{AppError, Result};
-use crate::run::ProcessRef;
+use crate::run::{ProcessRef, RunSpec};
 use crate::sysutil;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -51,6 +51,10 @@ pub fn lid_restore_file() -> PathBuf {
     state_dir().join("lid-restore.json")
 }
 
+pub fn lid_watchdog_file() -> PathBuf {
+    state_dir().join("lid-watchdog.json")
+}
+
 fn home() -> PathBuf {
     #[cfg(windows)]
     let var = std::env::var_os("USERPROFILE");
@@ -61,20 +65,27 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Session {
-    pub pid: u32,
-    pub mode: String,
-    pub trigger: String,
-    pub detail: String,
-    pub started_at: Option<DateTime<Utc>>,
+    pub owner: ProcessRef,
+    pub spec: RunSpec,
+    pub started_at: DateTime<Utc>,
     pub ends_at: Option<DateTime<Utc>>,
-    pub process_start: u64,
-    pub process_command: String,
     pub note: Option<String>,
-    pub even_lid: bool,
-    pub prior_disable_sleep: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WatchdogState {
+    pub owner: ProcessRef,
+    pub watchdog: ProcessRef,
+}
+
+impl WatchdogState {
+    fn is_valid(&self) -> bool {
+        self.owner.is_valid() && self.watchdog.is_valid() && self.owner != self.watchdog
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -127,32 +138,17 @@ fn is_guid(value: &str) -> bool {
 
 impl Session {
     fn is_valid(&self) -> bool {
-        self.pid > 0
-            && self.process_start > 0
-            && !self.mode.trim().is_empty()
-            && !self.trigger.trim().is_empty()
-            && !self.process_command.trim().is_empty()
-            && self.started_at.is_some()
-            && valid_prior_lid_state(self.prior_disable_sleep)
-    }
-
-    pub fn capture_process_identity(&mut self) -> Result<()> {
-        let process = sysutil::capture_process(self.pid)?;
-        self.process_start = process.start;
-        self.process_command = process.command;
-        Ok(())
+        self.owner.is_valid()
+            && self.spec.validate().is_ok()
+            && self.ends_at == self.spec.trigger.session_ends_at(self.started_at)
     }
 
     pub fn matches_live_process(&self) -> bool {
-        sysutil::live_process(self.pid).as_ref() == Some(&self.identity())
+        sysutil::process_matches(&self.owner)
     }
 
     pub fn identity(&self) -> ProcessRef {
-        ProcessRef {
-            pid: self.pid,
-            start: self.process_start,
-            command: self.process_command.clone(),
-        }
+        self.owner.clone()
     }
 }
 
@@ -160,14 +156,6 @@ impl Session {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StopRequest {
     session: ProcessRef,
-}
-
-fn valid_prior_lid_state(value: i32) -> bool {
-    matches!(value, 0 | 1)
-        || cfg!(windows) && {
-            let (ac, dc) = (value & 0xF, (value >> 4) & 0xF);
-            value == ac | (dc << 4) && (0..=3).contains(&ac) && (0..=3).contains(&dc)
-        }
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -333,6 +321,7 @@ fn read_lid_restore_at(path: &Path) -> Result<Option<LidRestore>> {
     Ok(marker)
 }
 
+#[cfg(any(test, windows, target_os = "macos"))]
 fn write_lid_restore_at(path: &Path, marker: &LidRestore) -> Result<()> {
     marker.validate()?;
     if let Some(saved) = read_lid_restore_at(path)?
@@ -346,6 +335,45 @@ fn write_lid_restore_at(path: &Path, marker: &LidRestore) -> Result<()> {
     write_json(path, marker)
 }
 
+fn read_watchdog_at(path: &Path) -> Result<Option<WatchdogState>> {
+    let state: Option<WatchdogState> = read_json(path)?;
+    match state {
+        Some(state) if !state.is_valid() => Err(AppError::fail(format!(
+            "invalid lid watchdog state at {}",
+            path.display()
+        ))),
+        state => Ok(state),
+    }
+}
+
+#[cfg(any(test, windows, target_os = "macos"))]
+fn write_watchdog_at(path: &Path, state: &WatchdogState) -> Result<()> {
+    if !state.is_valid() {
+        return Err(AppError::fail("invalid lid watchdog state"));
+    }
+    if let Some(saved) = read_watchdog_at(path)?
+        && saved != *state
+    {
+        return Err(AppError::fail(format!(
+            "unresolved lid watchdog state already exists at {}",
+            path.display()
+        )));
+    }
+    write_json(path, state)
+}
+
+fn remove_watchdog_if_owner_at(path: &Path, owner: &ProcessRef) -> Result<bool> {
+    let Some(state) = read_watchdog_at(path)? else {
+        return Ok(false);
+    };
+    if &state.owner != owner {
+        return Ok(false);
+    }
+    remove_state_file_at(path)?;
+    Ok(true)
+}
+
+#[cfg(any(test, windows, target_os = "macos"))]
 fn clear_lid_restore_at(path: &Path, expected: &LidRestore) -> Result<()> {
     match read_lid_restore_at(path)? {
         Some(actual) if &actual == expected => {
@@ -372,13 +400,33 @@ pub fn read_lid_restore() -> Result<Option<LidRestore>> {
 }
 
 #[cfg_attr(windows, allow(dead_code))]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn write_lid_restore(marker: &LidRestore) -> Result<()> {
     write_lid_restore_at(&lid_restore_file(), marker)
 }
 
 #[cfg_attr(windows, allow(dead_code))]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn clear_lid_restore(expected: &LidRestore) -> Result<()> {
     clear_lid_restore_at(&lid_restore_file(), expected)
+}
+
+pub fn read_watchdog() -> Result<Option<WatchdogState>> {
+    read_watchdog_at(&lid_watchdog_file())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn write_watchdog(state: &WatchdogState) -> Result<()> {
+    write_watchdog_at(&lid_watchdog_file(), state)
+}
+
+pub fn remove_watchdog_if_owner(owner: &ProcessRef) -> Result<bool> {
+    remove_watchdog_if_owner_at(&lid_watchdog_file(), owner)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn remove_watchdog_file() -> Result<()> {
+    remove_state_file_at(&lid_watchdog_file())
 }
 
 pub fn read_saved_for_recovery() -> Result<Option<Session>> {
@@ -507,17 +555,22 @@ mod tests {
 
     fn sample_session() -> Session {
         Session {
-            pid: 4321,
-            mode: "display+system".into(),
-            trigger: "timed".into(),
-            detail: "1h".into(),
-            started_at: Some("2024-01-02T03:04:05Z".parse().unwrap()),
+            owner: ProcessRef {
+                pid: 4321,
+                start: 1_700_000_000,
+                command: "/usr/bin/wake".into(),
+            },
+            spec: crate::run::RunSpec {
+                mode: crate::run::Mode::DisplaySystem,
+                trigger: crate::run::Trigger::Timed {
+                    seconds: 3600,
+                    input: "1h".into(),
+                },
+                even_lid: false,
+            },
+            started_at: "2024-01-02T03:04:05Z".parse().unwrap(),
             ends_at: Some("2024-01-02T04:04:05Z".parse().unwrap()),
-            process_start: 1_700_000_000,
-            process_command: "/usr/bin/caffeinate".into(),
             note: None,
-            even_lid: false,
-            prior_disable_sleep: 0,
         }
     }
 
@@ -530,14 +583,10 @@ mod tests {
         write_session_at(&path, &expected).unwrap();
         let saved = read_session_at(&path).unwrap().unwrap();
 
-        assert_eq!(saved.pid, expected.pid);
-        assert_eq!(saved.mode, expected.mode);
-        assert_eq!(saved.trigger, expected.trigger);
-        assert_eq!(saved.detail, expected.detail);
+        assert_eq!(saved.owner, expected.owner);
+        assert_eq!(saved.spec, expected.spec);
         assert_eq!(saved.started_at, expected.started_at);
         assert_eq!(saved.ends_at, expected.ends_at);
-        assert_eq!(saved.process_start, expected.process_start);
-        assert_eq!(saved.process_command, expected.process_command);
         assert!(!path.with_extension("json.tmp").exists());
     }
 
@@ -567,14 +616,10 @@ mod tests {
     fn semantic_session_validation_table() {
         let dir = TestDir::new("session-invalid");
         let path = dir.join("session.json");
-        let mut cases: [Session; 7] = std::array::from_fn(|_| sample_session());
-        cases[0].pid = 0;
-        cases[1].process_start = 0;
-        cases[2].mode.clear();
-        cases[3].trigger = " ".into();
-        cases[4].process_command.clear();
-        cases[5].started_at = None;
-        cases[6].prior_disable_sleep = if cfg!(windows) { 0x44 } else { 2 };
+        let mut cases: [Session; 3] = std::array::from_fn(|_| sample_session());
+        cases[0].owner.pid = 0;
+        cases[1].owner.start = 0;
+        cases[2].owner.command.clear();
 
         for saved in cases {
             write_json(&path, &saved).unwrap();
@@ -599,6 +644,65 @@ mod tests {
             write_lid_restore_at(&path, &marker).unwrap();
             assert_eq!(read_lid_restore_at(&path).unwrap(), Some(marker));
         }
+    }
+
+    #[test]
+    fn watchdog_state_round_trips_and_removes_only_exact_owner() {
+        let dir = TestDir::new("watchdog-round-trip");
+        let path = dir.join("lid-watchdog.json");
+        let state = WatchdogState {
+            owner: sample_session().owner,
+            watchdog: ProcessRef {
+                pid: 9876,
+                start: 1_700_000_100,
+                command: "/usr/bin/wake".into(),
+            },
+        };
+
+        write_watchdog_at(&path, &state).unwrap();
+        assert_eq!(read_watchdog_at(&path).unwrap(), Some(state.clone()));
+        assert!(
+            !remove_watchdog_if_owner_at(
+                &path,
+                &ProcessRef {
+                    pid: 1,
+                    ..state.owner.clone()
+                }
+            )
+            .unwrap()
+        );
+        assert!(path.exists());
+        assert!(remove_watchdog_if_owner_at(&path, &state.owner).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn malformed_watchdog_state_is_retained() {
+        let dir = TestDir::new("watchdog-malformed");
+        let path = dir.join("lid-watchdog.json");
+        fs::write(&path, br#"{"owner":{}}"#).unwrap();
+
+        assert!(read_watchdog_at(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn watchdog_state_does_not_replace_another_owner() {
+        let dir = TestDir::new("watchdog-owner");
+        let path = dir.join("lid-watchdog.json");
+        let mut first = WatchdogState {
+            owner: sample_session().owner,
+            watchdog: ProcessRef {
+                pid: 9876,
+                start: 1_700_000_100,
+                command: "/usr/bin/wake".into(),
+            },
+        };
+        write_watchdog_at(&path, &first).unwrap();
+        first.owner.pid += 1;
+
+        assert!(write_watchdog_at(&path, &first).is_err());
+        assert_ne!(read_watchdog_at(&path).unwrap(), Some(first));
     }
 
     #[test]
@@ -675,7 +779,7 @@ mod tests {
         let path = dir.join("stop.json");
         let expected = sample_session();
         let mut other = sample_session();
-        other.process_start += 1;
+        other.owner.start += 1;
 
         write_stop_at(&path, &other).unwrap();
         write_stop_at(&path, &expected).unwrap();
@@ -724,7 +828,7 @@ mod tests {
         let path = dir.join("session.json");
         let expected = sample_session();
         let mut changed = sample_session();
-        changed.pid += 1;
+        changed.owner.pid += 1;
 
         write_session_at(&path, &changed).unwrap();
         assert!(!remove_session_if_matches_at(&path, &expected).unwrap());

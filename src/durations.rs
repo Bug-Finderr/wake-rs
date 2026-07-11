@@ -4,7 +4,7 @@ use crate::error::AppError;
 
 const MAX_SECONDS: i64 = 30 * 24 * 60 * 60;
 
-/// Parse a duration string into seconds, mirroring the reference `Durations.parse`.
+/// Parse a duration string into seconds.
 pub fn parse(raw: &str) -> Result<i64, AppError> {
     if raw.trim().is_empty() {
         return Err(AppError::usage("empty duration"));

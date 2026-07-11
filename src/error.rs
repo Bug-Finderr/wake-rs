@@ -1,4 +1,4 @@
-//! Error type carrying the process exit code, mirroring the reference's UsageError vs other split.
+//! Application errors with CLI exit codes.
 
 use std::fmt;
 

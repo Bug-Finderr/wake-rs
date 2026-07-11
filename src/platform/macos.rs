@@ -1,6 +1,3 @@
-//! macOS: `caffeinate` for sleep assertions, `pmset` for battery + SleepDisabled, `sudo` for --even-lid.
-
-use super::KeepAwake;
 use crate::error::{AppError, Result};
 use crate::run::{BatteryStatus, Mode};
 use std::process::{Child, Command, Stdio};
@@ -8,7 +5,7 @@ use std::process::{Child, Command, Stdio};
 const CAFFEINATE: &str = "/usr/bin/caffeinate";
 const PMSET: &str = "/usr/bin/pmset";
 const SUDO: &str = "/usr/bin/sudo";
-const LID_CLOSE_NOTE: &str = "note: closing the lid still sleeps the mac unless you use --even-lid";
+
 pub fn supports_interactive() -> bool {
     true
 }
@@ -39,7 +36,7 @@ impl Inhibitor {
     }
 
     pub fn note(&self) -> Option<&str> {
-        Some(LID_CLOSE_NOTE)
+        Some("note: closing the lid still sleeps the Mac unless you use --even-lid")
     }
 
     pub fn alive(&mut self) -> bool {
@@ -54,27 +51,41 @@ impl Drop for Inhibitor {
     }
 }
 
-pub fn keep_awake_command(
-    no_display: bool,
-    timeout_sec: Option<i64>,
-    wait_pid: Option<u32>,
-) -> Result<KeepAwake> {
-    let mut cmd = vec![CAFFEINATE.to_string(), "-i".into()];
-    if !no_display {
-        cmd.push("-d".into());
-    }
-    if let Some(t) = timeout_sec {
-        cmd.push("-t".into());
-        cmd.push(t.to_string());
-    }
-    if let Some(p) = wait_pid {
-        cmd.push("-w".into());
-        cmd.push(p.to_string());
-    }
-    Ok(KeepAwake {
-        cmd,
-        note: Some(LID_CLOSE_NOTE.to_string()),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LidSnapshot {
+    pub sleep_disabled: i32,
+}
+
+pub fn read_lid_snapshot() -> Result<LidSnapshot> {
+    Ok(LidSnapshot {
+        sleep_disabled: read_disable_sleep()?,
     })
+}
+
+pub fn authenticate_privilege() -> Result<()> {
+    if Command::new(SUDO).arg("-v").status()?.success() {
+        Ok(())
+    } else {
+        Err(AppError::fail(
+            "sudo authentication failed; --even-lid was not enabled",
+        ))
+    }
+}
+
+pub fn disable_lid(_snapshot: &LidSnapshot) -> Result<()> {
+    write_disable_sleep(1)
+}
+
+pub fn restore_lid(snapshot: &LidSnapshot) -> Result<()> {
+    write_disable_sleep(snapshot.sleep_disabled)
+}
+
+pub fn lid_override_is_active(_snapshot: &LidSnapshot) -> Result<bool> {
+    Ok(read_disable_sleep()? == 1)
+}
+
+pub fn lid_is_restored(snapshot: &LidSnapshot) -> Result<bool> {
+    Ok(read_disable_sleep()? == snapshot.sleep_disabled)
 }
 
 pub fn read_battery() -> Result<BatteryStatus> {
@@ -100,103 +111,76 @@ fn battery_from_pmset(output: &str) -> Result<BatteryStatus> {
     })
 }
 
-pub fn read_disable_sleep() -> Result<i32> {
-    let out = capture(PMSET, &["-g"])?;
-    for line in out.lines() {
+fn read_disable_sleep() -> Result<i32> {
+    for line in capture(PMSET, &["-g"])?.lines() {
         let mut parts = line.split_whitespace();
-        if let Some(first) = parts.next()
-            && first.eq_ignore_ascii_case("SleepDisabled")
-            && let (Some(num), None) = (parts.next(), parts.clone().next())
+        if parts
+            .next()
+            .is_some_and(|key| key.eq_ignore_ascii_case("SleepDisabled"))
         {
-            return parse_disable_sleep_value(num);
+            return match (parts.next(), parts.next()) {
+                (Some("0"), None) => Ok(0),
+                (Some("1"), None) => Ok(1),
+                _ => Err(AppError::fail(
+                    "cannot parse SleepDisabled value from pmset",
+                )),
+            };
         }
     }
-    Ok(0)
+    Err(AppError::fail("pmset did not report SleepDisabled"))
 }
 
-pub fn authenticate_sudo() -> Result<bool> {
-    Ok(run_foreground(&[SUDO, "-v"])? == 0)
-}
-
-pub fn set_disable_sleep_foreground(value: i32) -> Result<()> {
-    let v = disable_sleep_value(value)?;
-    if run_foreground(&[SUDO, PMSET, "-a", "disablesleep", &v])? != 0 {
-        return Err(AppError::fail("sudo pmset -a disablesleep failed"));
+fn write_disable_sleep(value: i32) -> Result<()> {
+    if !matches!(value, 0 | 1) {
+        return Err(AppError::fail("SleepDisabled must be 0 or 1"));
     }
-    Ok(())
+    let status = Command::new(PMSET)
+        .args(["-a", "disablesleep", &value.to_string()])
+        .status()?;
+    if !status.success() {
+        return Err(AppError::fail(format!(
+            "pmset disablesleep exited with status {}",
+            status.code().unwrap_or(-1)
+        )));
+    }
+    if read_disable_sleep()? == value {
+        Ok(())
+    } else {
+        Err(AppError::fail(format!(
+            "failed to set SleepDisabled to {value}"
+        )))
+    }
 }
 
-pub fn set_disable_sleep_non_interactive(value: i32) -> Result<bool> {
-    let v = disable_sleep_value(value)?;
-    Ok(run_quiet(&[SUDO, "-n", PMSET, "-a", "disablesleep", &v])? == 0)
-}
-
-pub fn refresh_sudo_non_interactive() -> Result<bool> {
-    Ok(run_quiet(&[SUDO, "-n", "-v"])? == 0)
-}
-
-// ---- helpers ----
-
-fn first_percent(out: &str) -> Option<i32> {
-    let bytes = out.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
+fn first_percent(output: &str) -> Option<i32> {
+    let bytes = output.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_digit() {
+            let start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
             }
-            if i < bytes.len() && bytes[i] == b'%' {
-                return out[start..i].parse().ok();
+            if bytes.get(index) == Some(&b'%') {
+                return output[start..index].parse().ok();
             }
         } else {
-            i += 1;
+            index += 1;
         }
     }
     None
 }
 
-fn disable_sleep_value(value: i32) -> Result<String> {
-    match value {
-        0 | 1 => Ok(value.to_string()),
-        _ => Err(AppError::fail("disablesleep value must be 0 or 1")),
-    }
-}
-
-fn parse_disable_sleep_value(raw: &str) -> Result<i32> {
-    match raw.parse::<i32>() {
-        Ok(v @ (0 | 1)) => Ok(v),
-        _ => Err(AppError::fail(
-            "cannot parse SleepDisabled value from pmset",
-        )),
-    }
-}
-
 fn capture(program: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(program)
+    let output = Command::new(program)
         .args(args)
         .stderr(Stdio::null())
         .output()?;
-    if !out.status.success() {
+    if !output.status.success() {
         return Err(AppError::fail(format!(
             "{program} exited with status {}",
-            out.status.code().unwrap_or(-1)
+            output.status.code().unwrap_or(-1)
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn run_foreground(cmd: &[&str]) -> Result<i32> {
-    let status = Command::new(cmd[0]).args(&cmd[1..]).status()?;
-    Ok(status.code().unwrap_or(-1))
-}
-
-fn run_quiet(cmd: &[&str]) -> Result<i32> {
-    let status = Command::new(cmd[0])
-        .args(&cmd[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    Ok(status.code().unwrap_or(-1))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

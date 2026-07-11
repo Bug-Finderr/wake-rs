@@ -1,8 +1,7 @@
-//! wake - keep your machine awake from the CLI. Rust port of wake-cli (binary name: `wake`).
-
 mod commands;
 mod durations;
 mod error;
+mod lid;
 mod platform;
 mod run;
 mod session;
@@ -30,6 +29,18 @@ fn main() {
 fn dispatch(args: &[String]) -> Result<(), AppError> {
     if let Some(first) = args.first() {
         match first.as_str() {
+            "__supervise__" => return supervisor::run(&args[1..]),
+            #[cfg(any(windows, target_os = "macos"))]
+            "__lid_watchdog__" => return lid::run_watchdog(),
+            #[cfg(any(windows, target_os = "macos"))]
+            "__lid_restore__" => return lid::run_restore(),
+            _ => {}
+        }
+    }
+
+    commands::recover_stale_lid_session_foreground()?;
+    if let Some(first) = args.first() {
+        match first.as_str() {
             "-h" | "--help" | "help" => {
                 print_help();
                 return Ok(());
@@ -41,18 +52,9 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
             "status" => return commands::status(),
             "stop" => return commands::stop(),
             "forever" | "indefinite" => return commands::start_forever(args),
-            "__supervise__" => return supervisor::run(&args[1..]),
-            #[cfg(windows)]
-            "__supervise_charge__" => return supervisor::run_charge(args),
-            #[cfg(not(windows))]
-            "__supervise_lid__" => return supervisor::run_lid(args),
-            #[cfg(windows)]
-            "__set_lid__" => return set_lid(&args[1..]),
             _ => return commands::start(args),
         }
     }
-
-    commands::recover_stale_lid_session_foreground()?;
 
     #[cfg(unix)]
     {
@@ -61,24 +63,6 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
         }
     }
     commands::start(&[])
-}
-
-/// Hidden, Windows-only helper meant to run elevated: set the power-plan lid action to `<ac> <dc>`.
-/// Success is a silent exit 0; failure prints to stderr (via `main`) and exits non-zero.
-#[cfg(windows)]
-fn set_lid(args: &[String]) -> Result<(), AppError> {
-    fn parse(raw: &str) -> Result<u32, AppError> {
-        match raw.trim().parse::<u32>() {
-            Ok(v @ 0..=3) => Ok(v),
-            _ => Err(AppError::fail(
-                "__set_lid__ expects two lid actions in 0..=3",
-            )),
-        }
-    }
-    let (Some(ac), Some(dc)) = (args.first(), args.get(1)) else {
-        return Err(AppError::fail("__set_lid__ expects <ac> <dc>"));
-    };
-    platform::write_lid_action(parse(ac)?, parse(dc)?)
 }
 
 pub(crate) fn print_help() {

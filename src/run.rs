@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct RunSpec {
     pub mode: Mode,
     pub trigger: Trigger,
+    pub even_lid: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -17,7 +18,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg(target_os = "linux")]
     pub fn no_display(self) -> bool {
         self == Self::SystemOnly
     }
@@ -123,7 +124,7 @@ pub struct ProcessRef {
 }
 
 impl ProcessRef {
-    fn is_valid(&self) -> bool {
+    pub(crate) fn is_valid(&self) -> bool {
         self.pid > 0 && self.start > 0 && !self.command.trim().is_empty()
     }
 }
@@ -284,6 +285,7 @@ mod tests {
                 name: "Editor".into(),
                 process: process(),
             },
+            even_lid: true,
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert_eq!(serde_json::from_str::<RunSpec>(&json).unwrap(), spec);
@@ -325,6 +327,7 @@ mod tests {
                 RunSpec {
                     mode: Mode::SystemOnly,
                     trigger,
+                    even_lid: false,
                 }
                 .validate()
                 .is_ok()
@@ -362,6 +365,7 @@ mod tests {
                 RunSpec {
                     mode: Mode::DisplaySystem,
                     trigger,
+                    even_lid: false,
                 }
                 .validate()
                 .is_err()

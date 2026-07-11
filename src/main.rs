@@ -4,6 +4,7 @@ mod commands;
 mod durations;
 mod error;
 mod platform;
+mod run;
 mod session;
 mod supervisor;
 mod sysutil;
@@ -40,7 +41,10 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
             "status" => return commands::status(),
             "stop" => return commands::stop(),
             "forever" | "indefinite" => return commands::start_forever(args),
+            "__supervise__" => return supervisor::run(&args[1..]),
+            #[cfg(windows)]
             "__supervise_charge__" => return supervisor::run_charge(args),
+            #[cfg(not(windows))]
             "__supervise_lid__" => return supervisor::run_lid(args),
             #[cfg(windows)]
             "__set_lid__" => return set_lid(&args[1..]),
@@ -83,7 +87,7 @@ pub(crate) fn print_help() {
 
 platforms:
   macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;
-  Windows uses PowerShell + SetThreadExecutionState
+  Windows uses native power requests
   note: closing the lid still sleeps the mac unless you use --even-lid
 
 interactive:

@@ -2,12 +2,11 @@
 
 use super::KeepAwake;
 use crate::error::{AppError, Result};
-use crate::supervisor::BatteryStatus;
-use std::process::{Command, Stdio};
+use crate::run::{BatteryStatus, Mode};
+use std::process::{Child, Command, Stdio};
 
 const CAFFEINATE: &str = "/usr/bin/caffeinate";
 const PMSET: &str = "/usr/bin/pmset";
-const PGREP: &str = "/usr/bin/pgrep";
 const SUDO: &str = "/usr/bin/sudo";
 const LID_CLOSE_NOTE: &str = "note: closing the lid still sleeps the mac unless you use --even-lid";
 const EXPECTED: &[&str] = &["caffeinate", "wake"];
@@ -28,15 +27,52 @@ pub fn static_start_note() -> Option<String> {
     Some(LID_CLOSE_NOTE.to_string())
 }
 
+pub struct Inhibitor {
+    child: Child,
+}
+
+impl Inhibitor {
+    pub fn start(mode: Mode) -> Result<Self> {
+        let mut command = Command::new(CAFFEINATE);
+        command.arg("-i");
+        if mode == Mode::DisplaySystem {
+            command.arg("-d");
+        }
+        let child = command
+            .args(["-w", &std::process::id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| AppError::fail(format!("could not start caffeinate: {error}")))?;
+        Ok(Self { child })
+    }
+
+    pub fn note(&self) -> Option<&str> {
+        Some(LID_CLOSE_NOTE)
+    }
+
+    pub fn alive(&mut self) -> bool {
+        self.child.try_wait().is_ok_and(|status| status.is_none())
+    }
+}
+
+impl Drop for Inhibitor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 pub fn keep_awake_command(
     no_display: bool,
     timeout_sec: Option<i64>,
     wait_pid: Option<u32>,
 ) -> Result<KeepAwake> {
-    let mut cmd = vec![
-        CAFFEINATE.to_string(),
-        format!("-{}", if no_display { 'i' } else { 'd' }),
-    ];
+    let mut cmd = vec![CAFFEINATE.to_string(), "-i".into()];
+    if !no_display {
+        cmd.push("-d".into());
+    }
     if let Some(t) = timeout_sec {
         cmd.push("-t".into());
         cmd.push(t.to_string());
@@ -52,28 +88,26 @@ pub fn keep_awake_command(
 }
 
 pub fn read_battery() -> Result<BatteryStatus> {
-    let out = capture(PMSET, &["-g", "batt"])?;
-    let percent = first_percent(&out)
+    battery_from_pmset(&capture(PMSET, &["-g", "batt"])?)
+}
+
+fn battery_from_pmset(output: &str) -> Result<BatteryStatus> {
+    let percent = first_percent(output)
         .ok_or_else(|| AppError::fail("cannot parse battery percentage from pmset"))?;
-    let lower = out.to_lowercase();
-    let discharging = lower.contains("discharging") || lower.contains("battery power");
-    let charging = lower.contains("; charging;") || lower.contains("ac power");
+    let state = output
+        .lines()
+        .find(|line| line.contains('%'))
+        .and_then(|line| line.split(';').nth(1))
+        .map(|state| state.trim().to_lowercase())
+        .ok_or_else(|| AppError::fail("cannot parse battery state from pmset"))?;
+    let charging = matches!(state.as_str(), "charging" | "finishing charge");
+    let discharging = state == "discharging";
     Ok(BatteryStatus {
         percent,
         charging,
         discharging,
-        neutral_state: None,
+        neutral_state: (!charging && !discharging).then_some(state),
     })
-}
-
-pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
-    let exact = super::first_allowed_pid(&super::pgrep(&[PGREP, "-i", "-x", name]));
-    if exact.is_some() {
-        return Ok(exact);
-    }
-    Ok(super::first_allowed_pid(&super::pgrep(&[
-        PGREP, "-i", "-f", name,
-    ])))
 }
 
 pub fn read_disable_sleep() -> Result<i32> {

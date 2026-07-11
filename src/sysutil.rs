@@ -2,6 +2,7 @@
 //! detached spawning, and locating our own executable.
 
 use crate::error::{AppError, Result};
+use crate::run::ProcessRef;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ fn refreshed(pid: u32) -> System {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
-        ProcessRefreshKind::everything(),
+        ProcessRefreshKind::everything().without_tasks(),
     );
     sys
 }
@@ -32,7 +33,7 @@ fn process_exists(pid: u32) -> bool {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
-        ProcessRefreshKind::nothing(),
+        ProcessRefreshKind::nothing().without_tasks(),
     );
     sys.process(Pid::from_u32(pid)).is_some()
 }
@@ -73,9 +74,89 @@ pub fn live_identity(pid: u32) -> Option<Identity> {
     identity_of(&sys, pid)
 }
 
-/// Capture identity, erroring (like the reference) if the process or its start time is unreadable.
 pub fn capture_identity(pid: u32) -> Result<Identity> {
     live_identity(pid).ok_or_else(|| AppError::fail(format!("process {pid} is not running")))
+}
+
+pub fn capture_process(pid: u32) -> Result<ProcessRef> {
+    let identity = capture_identity(pid)?;
+    Ok(ProcessRef {
+        pid,
+        start: identity.start,
+        command: identity.command,
+    })
+}
+
+pub fn process_matches(reference: &ProcessRef) -> bool {
+    live_identity(reference.pid)
+        .is_some_and(|identity| reference.matches(reference.pid, identity.start, &identity.command))
+}
+
+pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
+    if name.trim().is_empty() {
+        return Err(AppError::usage("app/process name cannot be blank"));
+    }
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything().without_tasks(),
+    );
+    let current = current_pid();
+    let parent = parent_pid();
+    let mut matches = system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let pid = pid.as_u32();
+            if pid == current || Some(pid) == parent {
+                return None;
+            }
+            let command = process
+                .exe()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| process.name().to_string_lossy().into_owned());
+            let rank = app_match_rank(name, &process.name().to_string_lossy(), &command)?;
+            let wake = std::path::Path::new(&command)
+                .file_stem()
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("wake"));
+            (!wake).then_some((rank, pid, process.start_time(), command))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(rank, pid, ..)| (*rank, *pid));
+    Ok(matches
+        .into_iter()
+        .next()
+        .map(|(_, pid, start, command)| ProcessRef {
+            pid,
+            start,
+            command,
+        }))
+}
+
+fn app_match_rank(needle: &str, process_name: &str, executable: &str) -> Option<u8> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    let wanted = needle.strip_suffix(".exe").unwrap_or(&needle);
+    let name = process_name.trim().to_lowercase();
+    let simple = name.strip_suffix(".exe").unwrap_or(&name);
+    let executable = executable.trim().to_lowercase();
+    let executable = executable
+        .find(".exe")
+        .map_or(executable.as_str(), |end| &executable[..end + 4]);
+    let executable = std::path::Path::new(executable)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if simple == wanted {
+        Some(0)
+    } else if simple.contains(wanted) || executable.contains(wanted) {
+        Some(1)
+    } else {
+        None
+    }
 }
 
 pub fn current_pid() -> u32 {
@@ -90,37 +171,53 @@ pub fn parent_pid() -> Option<u32> {
         .map(|p| p.as_u32())
 }
 
-/// SIGTERM then SIGKILL (Unix) / TerminateProcess (Windows), matching the reference's grace window.
 pub fn terminate(pid: u32) {
-    {
-        let sys = refreshed(pid);
-        match sys.process(Pid::from_u32(pid)) {
-            Some(p) => {
-                if p.kill_with(Signal::Term).is_none() {
-                    p.kill();
-                }
-            }
-            None => return,
-        }
+    if let Ok(process) = capture_process(pid) {
+        terminate_exact(&process);
     }
-    if wait_gone(pid, Duration::from_secs(5)) {
-        return;
-    }
-    if let Some(p) = refreshed(pid).process(Pid::from_u32(pid)) {
-        p.kill();
-    }
-    wait_gone(pid, Duration::from_secs(1));
 }
 
-fn wait_gone(pid: u32, within: Duration) -> bool {
+pub fn terminate_exact(reference: &ProcessRef) -> bool {
+    if !process_matches(reference) {
+        return false;
+    }
+    {
+        let system = refreshed(reference.pid);
+        let Some(process) = system.process(Pid::from_u32(reference.pid)) else {
+            return false;
+        };
+        let Some(identity) = identity_of(&system, reference.pid) else {
+            return false;
+        };
+        if !reference.matches(reference.pid, identity.start, &identity.command) {
+            return false;
+        }
+        if process.kill_with(Signal::Term).is_none() {
+            process.kill();
+        }
+    }
+    if wait_identity_gone(reference, Duration::from_secs(5)) {
+        return true;
+    }
+    let system = refreshed(reference.pid);
+    if let Some(identity) = identity_of(&system, reference.pid)
+        && reference.matches(reference.pid, identity.start, &identity.command)
+        && let Some(process) = system.process(Pid::from_u32(reference.pid))
+    {
+        process.kill();
+    }
+    wait_identity_gone(reference, Duration::from_secs(1))
+}
+
+fn wait_identity_gone(reference: &ProcessRef, within: Duration) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
-        if !is_alive(pid) {
+        if !process_matches(reference) {
             return true;
         }
         sleep(Duration::from_millis(100));
     }
-    !is_alive(pid)
+    !process_matches(reference)
 }
 
 /// True if the child is still alive after a short settle delay.
@@ -129,16 +226,14 @@ pub fn verify_child_alive(pid: u32) -> bool {
     is_alive(pid)
 }
 
-/// Reference parity: if the keep-awake child died immediately, report and exit 1.
-pub fn require_child_alive(pid: u32, cmd: &[String]) {
+pub fn require_child_alive(pid: u32, cmd: &[String]) -> Result<()> {
     if verify_child_alive(pid) {
-        return;
+        return Ok(());
     }
-    eprintln!(
-        "wake: keep-awake process exited immediately ({}); see platform requirements",
+    Err(AppError::fail(format!(
+        "keep-awake process exited immediately ({}); see platform requirements",
         command_basename(cmd)
-    );
-    std::process::exit(1);
+    )))
 }
 
 fn command_basename(cmd: &[String]) -> String {
@@ -298,6 +393,8 @@ mod win {
 
     pub fn prevent_std_handle_inheritance() {
         for n in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: each constant names a process standard handle; invalid handles are rejected
+            // before SetHandleInformation.
             unsafe {
                 let h = GetStdHandle(n);
                 if !h.is_null() && h as isize != -1 {
@@ -311,6 +408,8 @@ mod win {
     /// so the OS kills the child when this process exits for any reason. If anything fails we fall
     /// back to the supervisor's normal-exit cleanup.
     pub fn tie_child_to_job(child: &Child) {
+        // SAFETY: the created handle is owned here; `child` supplies a valid process handle. All
+        // failure paths close the job, while success deliberately retains it for process lifetime.
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
@@ -338,4 +437,22 @@ fn detach(c: &mut Command) {
     use std::os::unix::process::CommandExt;
     // New process group so terminal SIGINT/SIGTSTP don't reach the detached child.
     c.process_group(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_name_matching_prefers_exact_and_rejects_blank() {
+        assert_eq!(app_match_rank("Code", "Code.exe", "C:/Code.exe"), Some(0));
+        assert_eq!(app_match_rank("code.exe", "Code", "C:/Code.exe"), Some(0));
+        assert_eq!(
+            app_match_rank("visual", "Code", "Visual Studio Code"),
+            Some(1)
+        );
+        assert_eq!(app_match_rank("report", "Code", "C:/Code.exe report"), None);
+        assert_eq!(app_match_rank("other", "Code", "C:/Code.exe"), None);
+        assert_eq!(app_match_rank(" ", "Code", "C:/Code.exe"), None);
+    }
 }

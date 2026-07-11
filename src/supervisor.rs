@@ -1,10 +1,10 @@
-//! Detached supervisors: `until-charge` (all platforms) and `even-lid` (macOS), plus the battery
-//! status / charge-plan model they share with the foreground command.
+//! Detached run loop and the temporary even-lid supervisors.
 
 #[cfg(not(windows))]
 use crate::commands;
 use crate::error::{AppError, Result};
 use crate::platform;
+use crate::run::{BatteryStatus, ChargeDirection, ChargePlan, RunSpec, Trigger, plan_charge};
 use crate::session::{self, Session};
 use crate::sysutil;
 use chrono::Utc;
@@ -13,79 +13,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(30);
-const LID_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const BATTERY_INTERVAL: Duration = Duration::from_secs(30);
+const RUN_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(not(windows))]
 const SUDO_HEARTBEAT: Duration = Duration::from_secs(180);
-
-#[derive(Clone)]
-pub struct BatteryStatus {
-    pub percent: i32,
-    pub charging: bool,
-    pub discharging: bool,
-    pub neutral_state: Option<String>,
-}
-
-pub struct ChargePlan {
-    pub already_met: bool,
-    pub charging_up: bool,
-}
-
-impl ChargePlan {
-    fn already_met() -> Self {
-        ChargePlan {
-            already_met: true,
-            charging_up: false,
-        }
-    }
-    fn waiting(charging_up: bool) -> Self {
-        ChargePlan {
-            already_met: false,
-            charging_up,
-        }
-    }
-}
 
 pub fn read_battery_status() -> Result<BatteryStatus> {
     platform::read_battery()
 }
 
-pub fn plan_charge(target: i32, status: &BatteryStatus) -> Result<ChargePlan> {
-    if status.discharging {
-        if status.percent == target {
-            return Ok(ChargePlan::already_met());
-        }
-        if status.percent < target {
-            return Err(AppError::usage(format!(
-                "--until-charge {target} is unreachable while battery is discharging at {}%; \
-                 connect power or choose a target at or below the current charge",
-                status.percent
-            )));
-        }
-        return Ok(ChargePlan::waiting(false));
-    }
-    if status.charging {
-        if status.percent >= target {
-            return Ok(ChargePlan::already_met());
-        }
-        return Ok(ChargePlan::waiting(true));
-    }
-    if status.percent == target {
-        return Ok(ChargePlan::already_met());
-    }
-    if let Some(state) = &status.neutral_state {
-        return Err(AppError::usage(format!(
-            "--until-charge {target} is unreachable while battery is {state} at {}%",
-            status.percent
-        )));
-    }
-    Err(AppError::usage(
-        "cannot determine battery charging direction",
-    ))
-}
-
-/// Cross-platform stop flag: on Unix, SIGTERM/SIGINT set it (so `wake stop` lets us tear down
-/// cleanly instead of dying instantly); on Windows it is never set (stop is a forcible kill).
 fn install_stop_flag() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
@@ -96,38 +32,110 @@ fn install_stop_flag() -> Arc<AtomicBool> {
     flag
 }
 
+pub fn run(args: &[String]) -> Result<()> {
+    let [json] = args else {
+        return Err(AppError::fail("supervisor expects one run specification"));
+    };
+    let spec: RunSpec = serde_json::from_str(json)
+        .map_err(|error| AppError::fail(format!("invalid supervisor specification: {error}")))?;
+    spec.validate()?;
+    supervise(spec)
+}
+
+fn supervise(spec: RunSpec) -> Result<()> {
+    let mut inhibitor = platform::Inhibitor::start(spec.mode)?;
+    if !inhibitor.alive() {
+        return Err(AppError::fail("sleep inhibitor exited during startup"));
+    }
+    let now = Utc::now();
+    let mut session = Session {
+        pid: sysutil::current_pid(),
+        mode: spec.mode.label().into(),
+        trigger: spec.trigger.label().into(),
+        detail: spec.trigger.detail(),
+        started_at: Some(now),
+        ends_at: spec.trigger.ends_at(),
+        note: inhibitor.note().map(str::to_string),
+        ..Default::default()
+    };
+    session.capture_process_identity()?;
+    session::write(&session)?;
+
+    let result = supervise_loop(&spec, &session, &mut inhibitor);
+    drop(inhibitor);
+    let remove = session::remove_if_matches(&session).map(|_| ());
+    let clear = session::clear_stop(&session).map(|_| ());
+    result.and(remove).and(clear)
+}
+
+fn supervise_loop(
+    spec: &RunSpec,
+    session: &Session,
+    inhibitor: &mut platform::Inhibitor,
+) -> Result<()> {
+    let signal = install_stop_flag();
+    let mut next_battery = Instant::now() + BATTERY_INTERVAL;
+    loop {
+        sleep(RUN_INTERVAL);
+        if signal.load(Ordering::Relaxed) || session::stop_requested(session)? {
+            return Ok(());
+        }
+        if !inhibitor.alive() {
+            return Err(AppError::fail("sleep inhibitor exited unexpectedly"));
+        }
+        if spec.trigger.ends_at().is_some_and(|end| Utc::now() >= end) {
+            return Ok(());
+        }
+        if spec
+            .trigger
+            .process()
+            .is_some_and(|process| !sysutil::process_matches(process))
+        {
+            return Ok(());
+        }
+        if Instant::now() >= next_battery {
+            next_battery = Instant::now() + BATTERY_INTERVAL;
+            if let Trigger::Charge {
+                target, direction, ..
+            } = &spec.trigger
+                && charge_reached(*target, *direction)
+            {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn charge_reached(target: i32, direction: ChargeDirection) -> bool {
+    read_battery_status().is_ok_and(|status| match direction {
+        ChargeDirection::Up => status.percent >= target,
+        ChargeDirection::Down => status.percent <= target,
+    })
+}
+
+#[cfg(windows)]
 pub fn run_charge(args: &[String]) -> Result<()> {
-    if args.len() < 4 {
-        return Err(AppError::fail("supervisor: bad args"));
+    if args.len() < 5 || args[4].is_empty() {
+        return Err(AppError::fail("legacy lid supervisor: bad args"));
     }
     let target: i32 = args[1]
         .parse()
-        .map_err(|_| AppError::fail("supervisor: bad target"))?;
+        .map_err(|_| AppError::fail("legacy lid supervisor: bad target"))?;
     let no_display = args[2] == "true";
     let mode = args[3].clone();
-    // arg[4] (Windows even-lid only): encoded prior lid action to restore on teardown.
-    #[cfg(windows)]
-    let prior_lid: Option<i32> = args
-        .get(4)
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse().ok());
+    let prior_lid: i32 = args[4]
+        .parse()
+        .map_err(|_| AppError::fail("legacy lid supervisor: bad lid state"))?;
 
-    let (initial, plan) =
-        match read_battery_status().and_then(|s| plan_charge(target, &s).map(|p| (s, p))) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("wake supervisor: {e}");
-                return Ok(());
-            }
-        };
-    if plan.already_met {
-        return Ok(());
-    }
-    let charging_up = plan.charging_up;
+    let initial = read_battery_status()?;
+    let direction = match plan_charge(target, &initial)? {
+        ChargePlan::Reached => return Ok(()),
+        ChargePlan::Wait(direction) => direction,
+    };
 
     let ka = platform::keep_awake_command(no_display, None, None)?;
     let mut child = sysutil::spawn_supervised_child(&ka.cmd)?;
-    sysutil::require_child_alive(child.id(), &ka.cmd);
+    sysutil::require_child_alive(child.id(), &ka.cmd)?;
 
     let mut s = Session {
         pid: sysutil::current_pid(),
@@ -136,20 +144,16 @@ pub fn run_charge(args: &[String]) -> Result<()> {
         detail: format!(
             "{target}% (was {}%, {})",
             initial.percent,
-            if charging_up {
-                "charging up"
-            } else {
-                "discharging down"
+            match direction {
+                ChargeDirection::Up => "charging up",
+                ChargeDirection::Down => "discharging down",
             }
         ),
         started_at: Some(Utc::now()),
+        even_lid: true,
+        prior_disable_sleep: prior_lid,
         ..Default::default()
     };
-    #[cfg(windows)]
-    if let Some(prior) = prior_lid {
-        s.even_lid = true;
-        s.prior_disable_sleep = prior;
-    }
     if let Err(e) = s
         .capture_process_identity()
         .and_then(|_| session::write(&s))
@@ -161,39 +165,27 @@ pub fn run_charge(args: &[String]) -> Result<()> {
     let stop = install_stop_flag();
     let mut last_check = Instant::now();
     loop {
-        sleep(LID_POLL_INTERVAL);
+        sleep(RUN_INTERVAL);
         if stop.load(Ordering::Relaxed) {
             break;
         }
         if !sysutil::is_alive(child.id()) {
             break;
         }
-        if last_check.elapsed() >= POLL_INTERVAL {
+        if last_check.elapsed() >= BATTERY_INTERVAL {
             last_check = Instant::now();
-            if let Ok(status) = read_battery_status() {
-                let reached = if charging_up {
-                    status.percent >= target
-                } else {
-                    status.percent <= target
-                };
-                if reached {
-                    break;
-                }
+            if charge_reached(target, direction) {
+                break;
             }
         }
     }
     let _ = child.kill();
     let _ = child.wait();
-    #[cfg(windows)]
-    if let Some(prior) = prior_lid {
-        restore_lid_on_windows(prior);
-    }
+    restore_lid_on_windows(prior_lid);
     session::remove_state_file()?;
     Ok(())
 }
 
-/// Restore the prior lid action when a Windows even-lid charge supervisor tears down (target reached
-/// or stop). Re-elevates via the `__set_lid__` helper; best-effort, never blocks teardown.
 #[cfg(windows)]
 fn restore_lid_on_windows(prior: i32) {
     let (ac, dc) = platform::decode_lid(prior);
@@ -201,13 +193,6 @@ fn restore_lid_on_windows(prior: i32) {
         return;
     }
     let _ = sysutil::run_elevated_self(&["__set_lid__", &ac.to_string(), &dc.to_string()]);
-}
-
-/// Windows never spawns the lid supervisor (even-lid is overlaid on the normal session via the
-/// power-plan lid action), so this is an inert stub there.
-#[cfg(windows)]
-pub fn run_lid(_args: &[String]) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -233,39 +218,41 @@ pub fn run_lid(args: &[String]) -> Result<()> {
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok());
 
-    let mut charging_up: Option<bool> = None;
+    let mut charge_direction = None;
     if let Some(target) = charge_target {
         let initial = read_battery_status()?;
-        let plan = plan_charge(target, &initial)?;
-        if plan.already_met {
-            return Ok(());
+        match plan_charge(target, &initial)? {
+            ChargePlan::Reached => return Ok(()),
+            ChargePlan::Wait(direction) => charge_direction = Some(direction),
         }
-        charging_up = Some(plan.charging_up);
     }
 
     let ka = platform::keep_awake_command(no_display, timeout_sec, wait_pid)?;
     let mut child = sysutil::spawn_supervised_child(&ka.cmd)?;
-    sysutil::require_child_alive(child.id(), &ka.cmd);
+    sysutil::require_child_alive(child.id(), &ka.cmd)?;
 
-    let mut s = Session::default();
-    s.pid = sysutil::current_pid();
-    s.mode = if no_display {
-        "system-only".into()
-    } else {
-        "display+system".into()
+    let now = Utc::now();
+    let mut s = Session {
+        pid: sysutil::current_pid(),
+        mode: if no_display {
+            "system-only".into()
+        } else {
+            "display+system".into()
+        },
+        trigger,
+        detail,
+        started_at: Some(now),
+        ends_at: timeout_sec.map(|t| now + chrono::Duration::seconds(t)),
+        even_lid: true,
+        prior_disable_sleep,
+        ..Default::default()
     };
-    s.trigger = trigger;
-    s.detail = detail;
-    s.started_at = Some(Utc::now());
-    s.ends_at = timeout_sec.map(|t| Utc::now() + chrono::Duration::seconds(t));
-    s.even_lid = true;
-    s.prior_disable_sleep = prior_disable_sleep;
     if let Err(e) = s
         .capture_process_identity()
         .and_then(|_| session::write(&s))
     {
         let _ = child.kill();
-        lid_cleanup(child.id(), prior_disable_sleep);
+        lid_cleanup(prior_disable_sleep);
         return Err(e);
     }
 
@@ -274,7 +261,7 @@ pub fn run_lid(args: &[String]) -> Result<()> {
     let mut next_sudo = start + SUDO_HEARTBEAT;
     let mut last_check = Instant::now();
     loop {
-        sleep(LID_POLL_INTERVAL);
+        sleep(RUN_INTERVAL);
         if stop.load(Ordering::Relaxed) || !sysutil::is_alive(child.id()) {
             break;
         }
@@ -288,12 +275,10 @@ pub fn run_lid(args: &[String]) -> Result<()> {
         {
             break;
         }
-        // Gate the battery poll to POLL_INTERVAL: forking pmset every second would run it ~86k
-        // times/day. Liveness/timeout/wait_pid stay at 1s; the sudo heartbeat keeps its own cadence.
-        if last_check.elapsed() >= POLL_INTERVAL {
+        if last_check.elapsed() >= BATTERY_INTERVAL {
             last_check = Instant::now();
             if let Some(target) = charge_target
-                && charge_reached(target, charging_up)
+                && charge_direction.is_some_and(|direction| charge_reached(target, direction))
             {
                 break;
             }
@@ -305,13 +290,12 @@ pub fn run_lid(args: &[String]) -> Result<()> {
     }
     let _ = child.kill();
     let _ = child.wait();
-    lid_cleanup(child.id(), prior_disable_sleep);
+    lid_cleanup(prior_disable_sleep);
     Ok(())
 }
 
-/// Restore SleepDisabled and remove state, matching the reference lid teardown.
 #[cfg(not(windows))]
-fn lid_cleanup(child_pid: u32, prior_disable_sleep: i32) {
+fn lid_cleanup(prior_disable_sleep: i32) {
     if let Ok(current) = platform::read_disable_sleep()
         && current != prior_disable_sleep
     {
@@ -320,29 +304,12 @@ fn lid_cleanup(child_pid: u32, prior_disable_sleep: i32) {
     let restored = platform::read_disable_sleep()
         .map(|c| c == prior_disable_sleep)
         .unwrap_or(false);
-    sysutil::terminate(child_pid);
     if restored {
         if let Err(error) = commands::finish_mac_lid_restore(prior_disable_sleep) {
             eprintln!("wake supervisor: {error}");
         }
     } else {
         commands::print_sleep_restore_rescue(prior_disable_sleep);
-    }
-}
-
-#[cfg(not(windows))]
-fn charge_reached(target: i32, charging_up: Option<bool>) -> bool {
-    match charging_up {
-        None => false,
-        Some(up) => read_battery_status()
-            .map(|s| {
-                if up {
-                    s.percent >= target
-                } else {
-                    s.percent <= target
-                }
-            })
-            .unwrap_or(false),
     }
 }
 
@@ -369,77 +336,5 @@ fn parse_disable_sleep(raw: &str) -> Result<i32> {
     match raw.trim().parse::<i32>() {
         Ok(v @ (0 | 1)) => Ok(v),
         _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn status(
-        percent: i32,
-        charging: bool,
-        discharging: bool,
-        neutral: Option<&str>,
-    ) -> BatteryStatus {
-        BatteryStatus {
-            percent,
-            charging,
-            discharging,
-            neutral_state: neutral.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn discharging_at_target_is_already_met() {
-        let p = plan_charge(80, &status(80, false, true, None)).unwrap();
-        assert!(p.already_met);
-    }
-
-    #[test]
-    fn discharging_below_target_errors() {
-        assert!(plan_charge(80, &status(70, false, true, None)).is_err());
-    }
-
-    #[test]
-    fn discharging_above_target_waits_not_charging_up() {
-        let p = plan_charge(80, &status(90, false, true, None)).unwrap();
-        assert!(!p.already_met);
-        assert!(!p.charging_up);
-    }
-
-    #[test]
-    fn charging_at_or_above_target_is_already_met() {
-        let p = plan_charge(80, &status(80, true, false, None)).unwrap();
-        assert!(p.already_met);
-    }
-
-    #[test]
-    fn charging_below_target_waits_charging_up() {
-        let p = plan_charge(80, &status(60, true, false, None)).unwrap();
-        assert!(!p.already_met);
-        assert!(p.charging_up);
-    }
-
-    #[test]
-    fn neutral_at_target_is_already_met() {
-        let p = plan_charge(80, &status(80, false, false, None)).unwrap();
-        assert!(p.already_met);
-    }
-
-    #[test]
-    fn neutral_off_target_with_state_errors() {
-        assert!(
-            plan_charge(
-                80,
-                &status(70, false, false, Some("not charging or discharging"))
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn neutral_off_target_indeterminate_errors() {
-        assert!(plan_charge(80, &status(70, false, false, None)).is_err());
     }
 }

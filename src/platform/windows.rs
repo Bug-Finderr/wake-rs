@@ -1,15 +1,23 @@
-//! Windows: PowerShell `SetThreadExecutionState` for sleep blocking, `Win32_Battery` for charge,
-//! `tasklist` for app lookup, and the power-plan lid-close action for `--even-lid`.
+//! Windows power requests, battery status, and the temporary power-plan lid override.
 
 use super::KeepAwake;
 use crate::error::{AppError, Result};
-use crate::supervisor::BatteryStatus;
+use crate::run::{BatteryStatus, Mode};
 use base64::Engine;
-use std::process::{Command, Stdio};
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_SUCCESS, GetLastError, INVALID_HANDLE_VALUE, LocalFree,
+};
 use windows_sys::Win32::System::Power::{
-    PowerGetActiveScheme, PowerReadACValueIndex, PowerReadDCValueIndex, PowerSetActiveScheme,
-    PowerWriteACValueIndex, PowerWriteDCValueIndex,
+    GetSystemPowerStatus, PowerClearRequest, PowerCreateRequest, PowerGetActiveScheme,
+    PowerReadACValueIndex, PowerReadDCValueIndex, PowerRequestDisplayRequired,
+    PowerRequestSystemRequired, PowerSetActiveScheme, PowerSetRequest, PowerWriteACValueIndex,
+    PowerWriteDCValueIndex, SYSTEM_POWER_STATUS,
+};
+use windows_sys::Win32::System::SystemServices::{
+    GUID_LIDCLOSE_ACTION, GUID_SYSTEM_BUTTON_SUBGROUP, POWER_REQUEST_CONTEXT_VERSION,
+};
+use windows_sys::Win32::System::Threading::{
+    POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0,
 };
 use windows_sys::core::GUID;
 
@@ -32,6 +40,91 @@ pub fn supports_even_lid() -> bool {
 
 pub fn static_start_note() -> Option<String> {
     None
+}
+
+pub struct Inhibitor {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    system: bool,
+    display: bool,
+}
+
+impl Inhibitor {
+    pub fn start(mode: Mode) -> Result<Self> {
+        let mut reason = "wake CLI\0".encode_utf16().collect::<Vec<_>>();
+        let context = REASON_CONTEXT {
+            Version: POWER_REQUEST_CONTEXT_VERSION,
+            Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+            Reason: REASON_CONTEXT_0 {
+                SimpleReasonString: reason.as_mut_ptr(),
+            },
+        };
+        // SAFETY: `context` and its NUL-terminated reason buffer remain valid for the call. The
+        // returned handle is owned here and closed on every failure path or by Drop.
+        let handle = unsafe { PowerCreateRequest(&context) };
+        if handle == INVALID_HANDLE_VALUE {
+            // SAFETY: this reads the calling thread's error code immediately after the failed call.
+            let code = unsafe { GetLastError() };
+            return Err(win_error("could not create power request", code));
+        }
+
+        // SAFETY: `handle` is a valid owned power-request handle.
+        if unsafe { PowerSetRequest(handle, PowerRequestSystemRequired) } == 0 {
+            // SAFETY: capture the error before closing the handle, which may overwrite it.
+            let code = unsafe { GetLastError() };
+            // SAFETY: the valid owned handle has no successful requests to clear.
+            unsafe { CloseHandle(handle) };
+            return Err(win_error("could not prevent system sleep", code));
+        }
+
+        let display = mode == Mode::DisplaySystem;
+        // SAFETY: the same valid handle can own one request of each distinct type.
+        if display && unsafe { PowerSetRequest(handle, PowerRequestDisplayRequired) } == 0 {
+            // SAFETY: capture the error before cleanup, then clear exactly the successful request.
+            let code = unsafe { GetLastError() };
+            unsafe {
+                PowerClearRequest(handle, PowerRequestSystemRequired);
+                CloseHandle(handle);
+            }
+            return Err(win_error("could not prevent display sleep", code));
+        }
+
+        Ok(Self {
+            handle,
+            system: true,
+            display,
+        })
+    }
+
+    pub fn note(&self) -> Option<&str> {
+        None
+    }
+
+    pub fn alive(&mut self) -> bool {
+        self.handle != INVALID_HANDLE_VALUE && !self.handle.is_null()
+    }
+}
+
+impl Drop for Inhibitor {
+    fn drop(&mut self) {
+        // SAFETY: each flag records one successful PowerSetRequest. Each is cleared once, then the
+        // owned valid handle is closed once.
+        unsafe {
+            if self.display {
+                PowerClearRequest(self.handle, PowerRequestDisplayRequired);
+            }
+            if self.system {
+                PowerClearRequest(self.handle, PowerRequestSystemRequired);
+            }
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+fn win_error(action: &str, code: u32) -> AppError {
+    AppError::fail(format!(
+        "{action}: {}",
+        std::io::Error::from_raw_os_error(code as i32)
+    ))
 }
 
 pub fn keep_awake_command(
@@ -90,61 +183,37 @@ namespace Wake {
 }
 
 pub fn read_battery() -> Result<BatteryStatus> {
-    let powershell = resolve_powershell()?;
-    let script = "Get-CimInstance Win32_Battery \
-                  | Select-Object -Property EstimatedChargeRemaining,BatteryStatus \
-                  | ConvertTo-Csv -NoTypeInformation";
-    let out = run_capture(
-        &powershell,
-        &["-NoProfile", "-NonInteractive", "-Command", script],
-    )?;
-    summarize_batteries(&parse_csv(&out)?)
+    let mut status = SYSTEM_POWER_STATUS::default();
+    // SAFETY: `status` is a valid writable struct for the duration of the call.
+    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+        return Err(AppError::fail(format!(
+            "could not read battery status: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    battery_from_values(
+        status.ACLineStatus,
+        status.BatteryFlag,
+        status.BatteryLifePercent,
+    )
 }
 
-pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
-    if name.contains('"') {
-        return Err(AppError::usage(
-            "app/process name cannot contain double quotes",
-        ));
+fn battery_from_values(ac: u8, flags: u8, percent: u8) -> Result<BatteryStatus> {
+    if flags == u8::MAX || flags & 128 != 0 || percent == u8::MAX {
+        return Err(AppError::fail("no usable battery found"));
     }
-    for image in image_name_candidates(name) {
-        let filter = format!("IMAGENAME eq {image}");
-        let out = run_capture("tasklist", &["/FO", "CSV", "/NH", "/FI", filter.as_str()])?;
-        let pids: Vec<u32> = parse_csv(&out)?
-            .iter()
-            .filter(|row| row.len() >= 2)
-            .filter_map(|row| row[1].trim().parse::<u32>().ok())
-            .collect();
-        if let Some(allowed) = super::first_allowed_pid(&pids) {
-            return Ok(Some(allowed));
-        }
-    }
-    Ok(None)
+    let charging = flags & 8 != 0;
+    let discharging = !charging && ac == 0;
+    Ok(BatteryStatus {
+        percent: i32::from(percent.min(100)),
+        charging,
+        discharging,
+        neutral_state: (!charging && !discharging).then(|| "not charging or discharging".into()),
+    })
 }
 
-// ---- even-lid: power-plan lid-close action ----
-//
-// `SetThreadExecutionState` (used for idle inhibition above) cannot stop the lid-close switch from
-// sleeping the machine; only the active power plan's lid action can. We read the prior AC/DC lid
-// action, set both to "Do nothing" (0) while a session is active, and restore them on stop/recover.
-// Reading is unprivileged; changing the value requires administrator rights, so the actual write is
-// run through an elevated helper (`__set_lid__`).
-
-// Power subgroup/setting GUIDs (verified on the machine):
-//   SUB_BUTTONS = {4f971e89-eebd-4455-a8de-9e59040e7347}
-//   LIDACTION   = {5ca83367-6e45-459f-a27b-476b1d01c936}  (0=do nothing, 1=sleep, 2=hibernate, 3=shut down)
-const SUB_BUTTONS: GUID = GUID {
-    data1: 0x4f97_1e89,
-    data2: 0xeebd,
-    data3: 0x4455,
-    data4: [0xa8, 0xde, 0x9e, 0x59, 0x04, 0x0e, 0x73, 0x47],
-};
-const LIDACTION: GUID = GUID {
-    data1: 0x5ca8_3367,
-    data2: 0x6e45,
-    data3: 0x459f,
-    data4: [0xa2, 0x7b, 0x47, 0x6b, 0x1d, 0x01, 0xc9, 0x36],
-};
+// Power requests cannot override the lid-close action, so the legacy --even-lid path changes the
+// active power plan through an elevated helper.
 
 /// Pack the AC and DC lid actions into the session's `prior_disable_sleep` (`i32`) field. Each value
 /// is 0..=3, so a nibble each is plenty.
@@ -172,8 +241,8 @@ pub fn read_lid_action() -> Result<(u32, u32)> {
             if PowerReadACValueIndex(
                 std::ptr::null_mut(),
                 scheme,
-                &SUB_BUTTONS,
-                &LIDACTION,
+                &GUID_SYSTEM_BUTTON_SUBGROUP,
+                &GUID_LIDCLOSE_ACTION,
                 &mut ac,
             ) != ERROR_SUCCESS
             {
@@ -182,8 +251,8 @@ pub fn read_lid_action() -> Result<(u32, u32)> {
             if PowerReadDCValueIndex(
                 std::ptr::null_mut(),
                 scheme,
-                &SUB_BUTTONS,
-                &LIDACTION,
+                &GUID_SYSTEM_BUTTON_SUBGROUP,
+                &GUID_LIDCLOSE_ACTION,
                 &mut dc,
             ) != ERROR_SUCCESS
             {
@@ -210,13 +279,23 @@ pub fn write_lid_action(ac: u32, dc: u32) -> Result<()> {
             // ERROR_ACCESS_DENIED is the common case (not elevated); any failure here means the
             // write did not take, so report the same admin-rights guidance regardless of `rc`.
             let denied = || AppError::fail("setting the lid action requires administrator rights");
-            if PowerWriteACValueIndex(std::ptr::null_mut(), scheme, &SUB_BUTTONS, &LIDACTION, ac)
-                != ERROR_SUCCESS
+            if PowerWriteACValueIndex(
+                std::ptr::null_mut(),
+                scheme,
+                &GUID_SYSTEM_BUTTON_SUBGROUP,
+                &GUID_LIDCLOSE_ACTION,
+                ac,
+            ) != ERROR_SUCCESS
             {
                 return Err(denied());
             }
-            if PowerWriteDCValueIndex(std::ptr::null_mut(), scheme, &SUB_BUTTONS, &LIDACTION, dc)
-                != ERROR_SUCCESS
+            if PowerWriteDCValueIndex(
+                std::ptr::null_mut(),
+                scheme,
+                &GUID_SYSTEM_BUTTON_SUBGROUP,
+                &GUID_LIDCLOSE_ACTION,
+                dc,
+            ) != ERROR_SUCCESS
             {
                 return Err(denied());
             }
@@ -230,135 +309,9 @@ pub fn write_lid_action(ac: u32, dc: u32) -> Result<()> {
     }
 }
 
-// ---- helpers ----
-
 fn resolve_powershell() -> Result<String> {
     super::resolve_on_path("powershell.exe", POWERSHELL_MISSING)
         .or_else(|_| super::resolve_on_path("powershell", POWERSHELL_MISSING))
-}
-
-fn image_name_candidates(name: &str) -> Vec<String> {
-    let trimmed = name.trim();
-    if trimmed.to_lowercase().ends_with(".exe") {
-        vec![trimmed.to_string()]
-    } else {
-        vec![format!("{trimmed}.exe"), trimmed.to_string()]
-    }
-}
-
-fn run_capture(program: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(program)
-        .args(args)
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| AppError::fail(format!("{program}: {e}")))?;
-    if !out.status.success() {
-        return Err(AppError::fail(format!(
-            "{program} exited with status {}",
-            out.status.code().unwrap_or(-1)
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn summarize_batteries(rows: &[Vec<String>]) -> Result<BatteryStatus> {
-    let mut count = 0;
-    let mut percent_sum = 0;
-    let mut any_charging = false;
-    let mut any_discharging = false;
-
-    for row in rows {
-        if row.len() < 2 || row[0].eq_ignore_ascii_case("EstimatedChargeRemaining") {
-            continue;
-        }
-        let (Ok(percent), Ok(status)) =
-            (row[0].trim().parse::<i32>(), row[1].trim().parse::<i32>())
-        else {
-            continue;
-        };
-        // Win32_Battery.BatteryStatus: 1/4/5 discharging variants, 6-9 charging variants.
-        if (6..=9).contains(&status) {
-            any_charging = true;
-        }
-        if status == 1 || status == 4 || status == 5 {
-            any_discharging = true;
-        }
-        percent_sum += percent.clamp(0, 100);
-        count += 1;
-    }
-
-    if count == 0 {
-        return Err(AppError::fail("no usable battery found"));
-    }
-    let charging = any_charging;
-    let discharging = !charging && any_discharging;
-    let neutral_state =
-        (!charging && !discharging).then(|| "not charging or discharging".to_string());
-    let percent = ((percent_sum as f64) / (count as f64)).round() as i32;
-    Ok(BatteryStatus {
-        percent,
-        charging,
-        discharging,
-        neutral_state,
-    })
-}
-
-/// Minimal RFC-4180-ish CSV parser matching the reference: quotes, `""` escapes, CR/LF rows.
-fn parse_csv(input: &str) -> Result<Vec<Vec<String>>> {
-    let mut rows = Vec::new();
-    let mut row: Vec<String> = Vec::new();
-    let mut field = String::new();
-    let mut in_quotes = false;
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-        if in_quotes {
-            if c == '"' {
-                if i + 1 < chars.len() && chars[i + 1] == '"' {
-                    field.push('"');
-                    i += 1;
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                field.push(c);
-            }
-        } else if c == '"' {
-            in_quotes = true;
-        } else if c == ',' {
-            row.push(std::mem::take(&mut field));
-        } else if c == '\r' || c == '\n' {
-            row.push(std::mem::take(&mut field));
-            if !is_blank_row(&row) {
-                rows.push(std::mem::take(&mut row));
-            } else {
-                row.clear();
-            }
-            if c == '\r' && i + 1 < chars.len() && chars[i + 1] == '\n' {
-                i += 1;
-            }
-        } else {
-            field.push(c);
-        }
-        i += 1;
-    }
-
-    if in_quotes {
-        return Err(AppError::fail("unterminated CSV quote"));
-    }
-    if !chars.is_empty() || !field.is_empty() || !row.is_empty() {
-        row.push(field);
-        if !is_blank_row(&row) {
-            rows.push(row);
-        }
-    }
-    Ok(rows)
-}
-
-fn is_blank_row(row: &[String]) -> bool {
-    row.iter().all(|f| f.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -366,53 +319,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn csv_basic() {
-        let rows = parse_csv("\"a\",\"b\"\r\n\"1\",\"2\"\r\n").unwrap();
-        assert_eq!(rows, vec![vec!["a", "b"], vec!["1", "2"]]);
-    }
-
-    #[test]
-    fn csv_escaped_quotes_and_blank_rows() {
-        let rows = parse_csv("\"x\"\"y\",z\n\n\"p\",\"q\"").unwrap();
-        assert_eq!(rows, vec![vec!["x\"y", "z"], vec!["p", "q"]]);
-    }
-
-    #[test]
-    fn csv_unterminated_quote_errs() {
-        assert!(parse_csv("\"oops").is_err());
-    }
-
-    #[test]
-    fn battery_no_rows_errors() {
-        assert!(summarize_batteries(&[]).is_err());
-    }
-
-    #[test]
-    fn battery_averages_and_classifies() {
-        let rows = vec![
-            vec!["EstimatedChargeRemaining".into(), "BatteryStatus".into()],
-            vec!["80".into(), "1".into()], // discharging
-            vec!["60".into(), "2".into()], // neither
+    fn power_status_classification_table() {
+        let cases = [
+            (0, 0, 75, (false, true, None)),
+            (1, 8, 50, (true, false, None)),
+            (
+                1,
+                0,
+                100,
+                (false, false, Some("not charging or discharging")),
+            ),
         ];
-        let b = summarize_batteries(&rows).unwrap();
-        assert_eq!(b.percent, 70);
-        assert!(!b.charging);
-        assert!(b.discharging); // any_discharging && !charging
-    }
-
-    #[test]
-    fn battery_charging_wins() {
-        let rows = vec![vec!["50".into(), "6".into()]];
-        let b = summarize_batteries(&rows).unwrap();
-        assert!(b.charging);
-        assert!(!b.discharging);
-        assert!(b.neutral_state.is_none());
-    }
-
-    #[test]
-    fn image_candidates() {
-        assert_eq!(image_name_candidates("foo"), vec!["foo.exe", "foo"]);
-        assert_eq!(image_name_candidates("Foo.EXE"), vec!["Foo.EXE"]);
+        for (ac, flags, percent, expected) in cases {
+            let status = battery_from_values(ac, flags, percent).unwrap();
+            assert_eq!(
+                (
+                    status.charging,
+                    status.discharging,
+                    status.neutral_state.as_deref()
+                ),
+                expected
+            );
+        }
+        assert!(battery_from_values(1, 128, 255).is_err());
     }
 
     #[test]

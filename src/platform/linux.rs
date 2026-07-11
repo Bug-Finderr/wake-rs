@@ -3,9 +3,9 @@
 
 use super::KeepAwake;
 use crate::error::{AppError, Result};
-use crate::supervisor::BatteryStatus;
+use crate::run::{BatteryStatus, Mode};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
 const EXPECTED: &[&str] = &["systemd-inhibit", "sleep", "tail", "wake"];
@@ -27,6 +27,57 @@ pub fn supports_even_lid() -> bool {
 
 pub fn static_start_note() -> Option<String> {
     None
+}
+
+pub struct Inhibitor {
+    child: Child,
+    note: Option<String>,
+}
+
+impl Inhibitor {
+    pub fn start(mode: Mode) -> Result<Self> {
+        let program = super::resolve_on_path(
+            "systemd-inhibit",
+            "systemd-inhibit not found on PATH; wake requires systemd on Linux",
+        )?;
+        let tail = super::resolve_on_path("tail", "tail not found on PATH")?;
+        let (requested, what) = choose_inhibitor_what(mode.no_display(), &program)?;
+        let child = Command::new(program)
+            .args([
+                format!("--what={what}"),
+                "--who=wake".into(),
+                "--why=wake CLI".into(),
+                "--mode=block".into(),
+                tail,
+                format!("--pid={}", std::process::id()),
+                "-f".into(),
+                "/dev/null".into(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| AppError::fail(format!("could not start systemd-inhibit: {error}")))?;
+        Ok(Self {
+            child,
+            note: start_note_for(requested, &what),
+        })
+    }
+
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+
+    pub fn alive(&mut self) -> bool {
+        self.child.try_wait().is_ok_and(|status| status.is_none())
+    }
+}
+
+impl Drop for Inhibitor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 pub fn keep_awake_command(
@@ -62,28 +113,6 @@ pub fn keep_awake_command(
     Ok(KeepAwake { cmd, note })
 }
 
-pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
-    let pattern = case_insensitive_ere(name);
-    let exact = super::first_allowed_pid(&super::pgrep(&["pgrep", "-x", &pattern]));
-    if exact.is_some() {
-        return Ok(exact);
-    }
-    if name.chars().count() > 15 {
-        let short: String = name.chars().take(15).collect();
-        let exact = super::first_allowed_pid(&super::pgrep(&[
-            "pgrep",
-            "-x",
-            &case_insensitive_ere(&short),
-        ]));
-        if exact.is_some() {
-            return Ok(exact);
-        }
-    }
-    Ok(super::first_allowed_pid(&super::pgrep(&[
-        "pgrep", "-f", &pattern,
-    ])))
-}
-
 pub fn read_battery() -> Result<BatteryStatus> {
     let base = Path::new(POWER_SUPPLY);
     if !base.is_dir() {
@@ -105,9 +134,7 @@ pub fn read_battery() -> Result<BatteryStatus> {
 
     let mut charging = false;
     let mut any_discharging = false;
-    let mut now_sum: u64 = 0;
-    let mut full_sum: u64 = 0;
-    let mut capacity_sum: i64 = 0;
+    let mut percentages = Vec::with_capacity(batteries.len());
     for b in &batteries {
         match b.status.to_lowercase().as_str() {
             "charging" => charging = true,
@@ -115,20 +142,14 @@ pub fn read_battery() -> Result<BatteryStatus> {
             _ => {}
         }
         if let Some((now, full)) = b.measurement {
-            now_sum += now;
-            full_sum += full;
-        }
-        if let Some(c) = b.capacity {
-            capacity_sum += c as i64;
+            percentages.push(100.0 * now as f64 / full as f64);
+        } else if let Some(capacity) = b.capacity {
+            percentages.push(f64::from(capacity));
         }
     }
     let discharging = !charging && any_discharging;
-    let percent = if full_sum > 0 {
-        ((100.0 * now_sum as f64) / full_sum as f64).round() as i32
-    } else {
-        (capacity_sum as f64 / batteries.len() as f64).round() as i32
-    }
-    .clamp(0, 100);
+    let percent = (percentages.iter().sum::<f64>() / percentages.len() as f64).round() as i32;
+    let percent = percent.clamp(0, 100);
     let neutral_state =
         (!charging && !discharging).then(|| "not charging or discharging".to_string());
     Ok(BatteryStatus {
@@ -251,34 +272,4 @@ fn read_measurement(dir: &Path, now_name: &str, full_name: &str) -> Option<(u64,
         return None;
     }
     Some((now as u64, full as u64))
-}
-
-fn case_insensitive_ere(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() * 4);
-    for c in name.chars() {
-        if c.is_ascii_lowercase() {
-            out.push('[');
-            out.push(c);
-            out.push(c.to_ascii_uppercase());
-            out.push(']');
-        } else if c.is_ascii_uppercase() {
-            out.push('[');
-            out.push(c.to_ascii_lowercase());
-            out.push(c);
-            out.push(']');
-        } else if is_ere_metacharacter(c) {
-            out.push('\\');
-            out.push(c);
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-fn is_ere_metacharacter(c: char) -> bool {
-    matches!(
-        c,
-        '.' | '[' | ']' | '\\' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | '|' | '(' | ')'
-    )
 }

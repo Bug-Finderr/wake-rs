@@ -2,6 +2,7 @@
 
 use crate::error::{AppError, Result};
 use crate::platform;
+use crate::run::ProcessRef;
 use crate::sysutil;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -42,6 +43,10 @@ pub fn state_file() -> PathBuf {
     state_dir().join("session.json")
 }
 
+pub fn stop_file() -> PathBuf {
+    state_dir().join("stop.json")
+}
+
 #[cfg_attr(windows, allow(dead_code))]
 pub fn lid_restore_file() -> PathBuf {
     state_dir().join("lid-restore.json")
@@ -57,7 +62,7 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Session {
     pub pid: u32,
@@ -68,6 +73,7 @@ pub struct Session {
     pub ends_at: Option<DateTime<Utc>>,
     pub process_start: u64,
     pub process_command: String,
+    pub note: Option<String>,
     pub even_lid: bool,
     pub prior_disable_sleep: i32,
 }
@@ -148,6 +154,20 @@ impl Session {
             }
         }
     }
+
+    pub fn identity(&self) -> ProcessRef {
+        ProcessRef {
+            pid: self.pid,
+            start: self.process_start,
+            command: self.process_command.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct StopRequest {
+    session: ProcessRef,
 }
 
 fn valid_prior_lid_state(value: i32) -> bool {
@@ -261,6 +281,45 @@ fn write_session_at(path: &Path, session: &Session) -> Result<()> {
     write_json(path, session)
 }
 
+fn write_stop_at(path: &Path, session: &Session) -> Result<()> {
+    let request = StopRequest {
+        session: session.identity(),
+    };
+    if let Some(existing) = read_json::<StopRequest>(path)?
+        && existing != request
+    {
+        return Err(AppError::fail(format!(
+            "stop request changed at {}; refusing to replace it",
+            path.display()
+        )));
+    }
+    write_json(path, &request)
+}
+
+fn stop_requested_at(path: &Path, session: &Session) -> Result<bool> {
+    let request: Option<StopRequest> = read_json(path)?;
+    Ok(request.is_some_and(|request| request.session == session.identity()))
+}
+
+fn clear_stop_at(path: &Path, session: &Session) -> Result<bool> {
+    if !stop_requested_at(path, session)? {
+        return Ok(false);
+    }
+    remove_state_file_at(path)?;
+    Ok(true)
+}
+
+fn remove_session_if_matches_at(path: &Path, expected: &Session) -> Result<bool> {
+    let Some(actual) = read_session_at(path)? else {
+        return Ok(false);
+    };
+    if actual.identity() != expected.identity() {
+        return Ok(false);
+    }
+    remove_state_file_at(path)?;
+    Ok(true)
+}
+
 fn read_lid_restore_at(path: &Path) -> Result<Option<LidRestore>> {
     let marker: Option<LidRestore> = read_json(path)?;
     if let Some(marker) = &marker {
@@ -342,6 +401,22 @@ fn state_io_err(path: &Path, e: std::io::Error) -> AppError {
 
 pub fn write(s: &Session) -> Result<()> {
     write_session_at(&state_file(), s)
+}
+
+pub fn request_stop(session: &Session) -> Result<()> {
+    write_stop_at(&stop_file(), session)
+}
+
+pub fn stop_requested(session: &Session) -> Result<bool> {
+    stop_requested_at(&stop_file(), session)
+}
+
+pub fn clear_stop(session: &Session) -> Result<bool> {
+    clear_stop_at(&stop_file(), session)
+}
+
+pub fn remove_if_matches(session: &Session) -> Result<bool> {
+    remove_session_if_matches_at(&state_file(), session)
 }
 
 fn remove_state_file_at(path: &Path) -> Result<()> {
@@ -431,6 +506,7 @@ mod tests {
             ends_at: Some("2024-01-02T04:04:05Z".parse().unwrap()),
             process_start: 1_700_000_000,
             process_command: "/usr/bin/caffeinate".into(),
+            note: None,
             even_lid: false,
             prior_disable_sleep: 0,
         }
@@ -584,5 +660,59 @@ mod tests {
 
         assert!(!session.exists());
         assert!(marker.exists());
+    }
+
+    #[test]
+    fn stop_request_requires_exact_session_identity() {
+        let dir = TestDir::new("stop-exact");
+        let path = dir.join("stop.json");
+        let expected = sample_session();
+        let mut other = sample_session();
+        other.process_start += 1;
+
+        write_stop_at(&path, &expected).unwrap();
+        assert!(stop_requested_at(&path, &expected).unwrap());
+        assert!(!stop_requested_at(&path, &other).unwrap());
+        assert!(path.exists());
+
+        assert!(!clear_stop_at(&path, &other).unwrap());
+        assert!(path.exists());
+        assert!(clear_stop_at(&path, &expected).unwrap());
+        assert!(!path.exists());
+
+        write_stop_at(&path, &other).unwrap();
+        assert!(write_stop_at(&path, &expected).is_err());
+        assert!(stop_requested_at(&path, &other).unwrap());
+    }
+
+    #[test]
+    fn malformed_stop_request_errors_and_is_retained() {
+        let dir = TestDir::new("stop-malformed");
+        let path = dir.join("stop.json");
+        fs::write(&path, br#"{"session":{"pid":"bad"}}"#).unwrap();
+
+        assert!(stop_requested_at(&path, &sample_session()).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn conditional_session_removal_retains_changed_and_malformed_state() {
+        let dir = TestDir::new("conditional-remove");
+        let path = dir.join("session.json");
+        let expected = sample_session();
+        let mut changed = sample_session();
+        changed.pid += 1;
+
+        write_session_at(&path, &changed).unwrap();
+        assert!(!remove_session_if_matches_at(&path, &expected).unwrap());
+        assert!(path.exists());
+
+        fs::write(&path, b"not json").unwrap();
+        assert!(remove_session_if_matches_at(&path, &expected).is_err());
+        assert!(path.exists());
+
+        write_session_at(&path, &expected).unwrap();
+        assert!(remove_session_if_matches_at(&path, &expected).unwrap());
+        assert!(!path.exists());
     }
 }

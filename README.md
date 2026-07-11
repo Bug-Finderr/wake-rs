@@ -1,76 +1,57 @@
 # wake
 
-Keep your machine awake from the CLI on macOS, Linux, and Windows. No daemon. The binary is `wake`.
+Keep macOS, Linux, and Windows awake from one command. `wake` installs as a single binary with no service to configure.
 
-Rust port of [AbhinavGupta-de/wake-cli](https://github.com/AbhinavGupta-de/wake-cli) (originally
-Java/GraalVM). Design notes: [architecture.md](architecture.md).
+This is a Rust port of [AbhinavGupta-de/wake-cli](https://github.com/AbhinavGupta-de/wake-cli). See [architecture.md](architecture.md) for the internal lifecycle.
 
 ## Install
 
 ```sh
-cargo build --release      # -> target/release/wake[.exe]
+cargo build --release --locked
 ```
 
-Or download a binary from [Releases](../../releases): one self-contained executable,
-no installer. Put it on your `PATH` as `wake` (`wake.exe` on Windows).
-
-- **Linux**: `install -Dm755 wake-linux-x64 ~/.local/bin/wake`
-- **macOS**: `install -m755 wake-macos-arm64 /usr/local/bin/wake`
-- **Windows** (PowerShell, then reopen the terminal):
-
-  ```powershell
-  $dir = "$env:LOCALAPPDATA\Programs\wake"; mkdir -Force $dir
-  Move-Item wake.exe "$dir\wake.exe"
-  [Environment]::SetEnvironmentVariable("Path",
-    [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
-  ```
+The binary is written to `target/release/wake` or `target/release/wake.exe`. Prebuilt binaries are also available from [Releases](../../releases). Put the binary on your `PATH` as `wake`.
 
 ## Usage
 
 ```sh
-wake                     # picker (macOS/Linux); indefinite (Windows)
+wake                     # picker on macOS/Linux; indefinite on Windows
 wake forever             # indefinite
 wake 1h | 30m | 1h30m    # timed
-wake --until 23:00       # until a clock time
-wake --until-charge 80   # until battery hits N% (1-100)
-wake --while-pid 1234    # while a pid is alive
-wake --while-app Slack   # while a process is alive
-wake --no-display        # block system sleep, allow display sleep
-wake --even-lid          # stay awake with the lid closed (macOS: sudo; Windows: sets lid-close action)
-wake status | stop | help | version
+wake --until 23:00       # until a local clock time
+wake --until-charge 80   # until battery reaches 80%
+wake --while-pid 1234    # while an exact process is alive
+wake --while-app Slack   # while a named process is alive
+wake --no-display        # allow display sleep
+wake --even-lid          # keep running with the lid closed
+wake status | stop
 ```
 
-State lives at `~/.local/state/wake/session.json` (`%LOCALAPPDATA%\wake` on Windows, `$XDG_STATE_HOME` if set on Linux; override the dir with `WAKE_STATE_DIR`). Lid restoration uses a separate `lid-restore.json` marker.
+`--even-lid` is available on macOS and Windows. Closed-lid use can increase heat and battery drain.
 
-| Platform | Mechanism |
-|---|---|
-| macOS | `caffeinate` + `pmset`; `--even-lid` via `sudo pmset -a disablesleep` |
-| Linux | `systemd-inhibit` (systemd ≥ 190), degrading when polkit denies lid locks; sysfs battery |
-| Windows | PowerShell `SetThreadExecutionState`; `Win32_Battery`; `tasklist` (no picker); `--even-lid` sets the power-plan lid-close action to Do Nothing (UAC only if the direct write is denied) |
-
-## wake-rs vs wake-cli
-
-Same commands, flags, and output. What differs:
-
-| | wake-cli | wake-rs |
+| Platform | Sleep inhibition | Even-lid behavior |
 |---|---|---|
-| Language / build | Java 21, GraalVM `native-image`, Maven | Rust 2024, `cargo` |
-| Binary size | multi-MB | ~350 KB |
-| File locking | `java.nio` `FileLock` | native `std::fs` locks (Rust 1.89+) |
-| Interactive picker | raw mode via `stty` | `crossterm` |
-| Tests | CI smoke | unit + Windows/Linux smoke + macOS compile check |
+| macOS | `caffeinate` | A sudo-backed watchdog controls `pmset disablesleep` and restores the prior value. |
+| Linux | `systemd-inhibit` | Unsupported. |
+| Windows | Native power requests | An elevated watchdog snapshots a power plan's AC/DC lid actions, applies the override, then restores the recorded values. |
 
-## Tests
+Each session runs through a detached supervisor. State is stored under `~/.local/state/wake`, `$XDG_STATE_HOME/wake`, or `%LOCALAPPDATA%\wake`. Set `WAKE_STATE_DIR` to override the directory.
+
+## Development
 
 ```sh
-cargo test                       # unit
-pwsh tests/smoke_windows.ps1     # Windows e2e (mirrors upstream CI)
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --release --locked
+cargo build --release --locked
 ```
+
+After the release build, run `bash tests/smoke_linux.sh target/release/wake` on Linux or `pwsh tests/smoke_windows.ps1 target/release/wake.exe` on Windows. CI runs unit and smoke coverage on all three platforms.
 
 ## Contributing
 
-External contributions are not accepted; pull requests are closed automatically. Open an issue instead.
+External pull requests are closed automatically. Open an issue instead.
 
 ## License
 
-[MIT](LICENSE). Port of the MIT-licensed [wake-cli](https://github.com/AbhinavGupta-de/wake-cli).
+[MIT](LICENSE), including the upstream [wake-cli](https://github.com/AbhinavGupta-de/wake-cli) attribution.

@@ -1,105 +1,38 @@
 # Architecture
 
-`wake` is a single binary with no daemon. It drives the OS's native sleep-inhibition tool, records a
-session in a state file, and reconciles that state on every invocation.
+`wake` is one binary with no installed service. A foreground command validates the request and starts a detached supervisor for the active session. The supervisor owns the platform sleep inhibitor until the trigger completes or `wake stop` requests shutdown.
 
-## Modules
+## Lifecycle
 
-```mermaid
-graph TD
-  main["main.rs<br/>dispatch · errors · help"] --> commands
-  main --> supervisor
-  main --> interactive["interactive.rs<br/>(unix picker)"]
-  commands["commands.rs<br/>start/status/stop · even-lid recovery"] --> session
-  commands --> platform
-  commands --> sysutil
-  commands --> durations
-  supervisor["supervisor.rs<br/>charge + lid loops"] --> platform
-  supervisor --> sysutil
-  supervisor --> session
-  session["session.rs<br/>state file · lock · identity"] --> sysutil
-  session --> platform
-  sysutil["sysutil.rs<br/>spawn · liveness · terminate · Job Object"] --> ext1(["sysinfo"])
-  platform -. cfg .-> windows["windows.rs"]
-  platform -. cfg .-> macos["macos.rs"]
-  platform -. cfg .-> linux["linux.rs"]
-```
+1. `main.rs` routes hidden helper commands, then reconciles stale lid state before normal command dispatch.
+2. `commands.rs` acquires the state lock, rejects an existing live session, resolves the trigger, and builds a `RunSpec`.
+3. For `--even-lid`, `lid.rs` records the original platform setting in `lid-restore.json` before any mutation.
+4. The foreground process starts `__supervise__` with the serialized run specification. The supervisor starts the inhibitor, verifies it remains alive, and writes `session.json` with its exact process identity.
+5. An even-lid session also starts a privileged `__lid_watchdog__`. The supervisor does not proceed until the watchdog publishes matching ready state.
+6. The supervisor polls the stop marker, inhibitor, trigger, tracked process, and optional watchdog. Duration triggers use monotonic elapsed time; clock deadlines use wall time.
+7. Ordinary teardown drops the inhibitor and removes matching state. Even-lid teardown is owned by the watchdog, which restores and verifies the recorded setting before removing the session and restoration marker.
 
-`platform` is a trait-free abstraction: each OS module exposes the same free functions, selected at
-compile time by `cfg` and re-exported from `platform/mod.rs`. Even-lid is real on macOS (sudo +
-SleepDisabled) and on Windows (the power-plan lid action via powrprof); Linux leaves it unsupported.
+`wake stop` writes an identity-bound `stop.json`, waits for graceful exit, then terminates only the recorded process identity if needed. A reused PID is never treated as the same session.
 
-## Command dispatch
+## Durable State
 
-```mermaid
-flowchart TD
-  A["wake &lt;args&gt;"] --> B{first arg}
-  B -->|help / version| H[print and exit]
-  B -->|status / stop| L[lock to recover stale state to read session]
-  B -->|forever / duration / flags| ST[start]
-  B -->|__supervise_charge__ / __supervise_lid__| SUP[detached supervisor loop]
-  B -->|none| C{TTY and interactive?}
-  C -->|yes - macOS/Linux| P[picker]
-  C -->|no / Windows| ST
-```
+All JSON is strict and written through atomic replacement. `wake.lock` serializes foreground state changes.
 
-## Session lifecycle
+| File | Purpose |
+|---|---|
+| `session.json` | Supervisor identity, run specification, start time, deadline, and platform note. |
+| `stop.json` | Stop request bound to one session identity. |
+| `lid-restore.json` | Authoritative pre-mutation setting retained until verified restoration. |
+| `lid-watchdog.json` | Matching supervisor and watchdog identities. |
 
-A session is the OS sleep-inhibitor process plus a `session.json` record. The record stores the
-pid **and** a process-identity fingerprint (start time and executable); every read verifies the pid
-is still that same live process before trusting it, so a recycled pid never looks like a live session.
-Writes are atomic JSON replacements. `--even-lid` uses a separate `lid-restore.json` marker that is
-kept until the recorded platform setting is verified as restored.
+Every foreground invocation attempts safe recovery. A valid live watchdog is preserved. Stale ordinary state is removed. Unresolved lid state is restored through `__lid_restore__`; malformed or conflicting live state fails closed instead of being overwritten.
 
-```mermaid
-sequenceDiagram
-  participant U as user
-  participant W as wake
-  participant K as keep-awake child
-  participant F as state file
-  U->>W: wake 1h
-  W->>W: acquire lock, reconcile stale state
-  W->>K: spawn detached (caffeinate / PowerShell / systemd-inhibit)
-  W->>W: verify child alive (~300ms)
-  W->>F: write {pid, identity, ends_at}
-  W-->>U: session active
-  Note over K: blocks sleep until timeout / pid gone / stop
-```
+## Platform Boundary
 
-## Supervisors
+`platform/mod.rs` selects one trait-free implementation at compile time:
 
-`--until-charge` (all OSes) and `--even-lid` (macOS) need a process that outlives the foreground
-command, so `wake` spawns a detached copy of itself (`__supervise_*`). The supervisor owns the
-keep-awake child and polls until its condition is met. The recorded session pid is the supervisor.
+- macOS owns a `caffeinate` child and uses `pmset` for battery and lid state.
+- Linux owns a `systemd-inhibit` child and reads batteries from sysfs. It has no even-lid mode.
+- Windows owns a `PowerCreateRequest` handle and reads battery state natively. Its watchdog checks that the recorded power scheme is still active before reapplying changes. A concurrent scheme change between that check and the API call remains possible.
 
-```mermaid
-sequenceDiagram
-  participant W as wake (foreground)
-  participant S as supervisor (detached self)
-  participant K as keep-awake child
-  W->>S: spawn __supervise_charge__
-  S->>K: spawn child
-  S->>S: write session (pid = supervisor)
-  W-->>W: read session, print, exit
-  loop poll
-    S->>S: battery / pid / clock / charge
-  end
-  Note over S,K: teardown kills K and (lid) restores SleepDisabled
-```
-
-Teardown removes the keep-awake child and, for `--even-lid`, restores macOS `SleepDisabled`:
-
-- **Windows**: the child runs in a kill-on-close Job Object, so it dies with the supervisor.
-- **Unix**: a SIGTERM/SIGINT handler runs the cleanup path; `stop` also re-verifies `SleepDisabled`.
-
-## Key decisions
-
-- **No `dyn`/trait objects** for platforms: `cfg`-selected free functions; only the target OS compiles.
-- **Process identity over bare pid**: guards against pid reuse without a daemon.
-- **Native `std::fs` file locking** (Rust 1.89+) instead of a crate.
-- **Shell out to platform tools**, exactly as the original, passing values as argv (never a shell
-  string) so app/pid names can't inject commands. The one generated script (Windows PowerShell) embeds
-  only validated numerics and a base64-encoded body.
-- Minimal `unsafe`, all Windows-only via `windows-sys`: `sysutil.rs` for the Job Object, clearing
-  handle inheritance, and `ShellExecuteExW` elevation; `platform/windows.rs` for the powrprof
-  lid-action read/write (`read_lid_action`/`write_lid_action`).
+`sysutil.rs` centralizes process identity, exact termination, detached spawning, Windows elevation, and handle ownership. `session.rs` owns serialization and locking. `run.rs` owns validated trigger semantics. `supervisor.rs` contains the single condition loop.

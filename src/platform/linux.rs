@@ -1,5 +1,3 @@
-//! Linux systemd inhibition and sysfs battery status.
-
 use crate::error::{AppError, Result};
 use crate::run::{BatteryStatus, Mode};
 use std::path::Path;

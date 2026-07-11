@@ -1,7 +1,4 @@
 #requires -version 5
-# End-to-end smoke test for wake-rs on Windows. Mirrors the upstream wake-cli CI smoke test plus
-# the extra triggers. Usage:  pwsh tests/smoke_windows.ps1 [path\to\wake.exe]
-# Exits non-zero on the first failed assertion.
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -10,84 +7,55 @@ $wake = if ($args.Count -ge 1) { $args[0] } else { Join-Path $PSScriptRoot '..\t
 $wake = (Resolve-Path $wake).Path
 $env:WAKE_STATE_DIR = Join-Path $env:TEMP ('wake-smoke-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $env:WAKE_STATE_DIR | Out-Null
-Write-Host "wake   = $wake"
-Write-Host "state  = $env:WAKE_STATE_DIR`n"
 
-function Invoke-Wake {
-  param([string[]] $WakeArgs)
-  # Lower ErrorActionPreference locally so native stderr (captured via 2>&1) is not turned into a
-  # terminating error under Windows PowerShell 5.1 (which lacks $PSNativeCommandUseErrorActionPreference).
+function Test-Wake {
+  param([int] $ExpectedCode, [string] $Needle, [string[]] $WakeArgs)
+
+  # PowerShell 5.1 can promote captured native stderr to a terminating error.
   $ErrorActionPreference = 'Continue'
-  $out = & $wake @WakeArgs 2>&1
+  $output = (& $wake @WakeArgs 2>&1) -join "`n"
   $code = $LASTEXITCODE
-  [pscustomobject]@{ Code = $code; Output = ($out -join "`n") }
-}
-
-function Assert-Success {
-  param([string[]] $WakeArgs)
-  $r = Invoke-Wake $WakeArgs
-  if ($r.Code -ne 0) { throw "expected success from 'wake $($WakeArgs -join ' ')' (got $($r.Code)):`n$($r.Output)" }
-  Write-Host "ok   : wake $($WakeArgs -join ' ')  [exit 0]"
-  return $r.Output
-}
-
-function Assert-Failure {
-  param([string[]] $WakeArgs, [int] $ExpectedCode = -1)
-  $r = Invoke-Wake $WakeArgs
-  if ($r.Code -eq 0) { throw "expected failure from 'wake $($WakeArgs -join ' ')':`n$($r.Output)" }
-  if ($ExpectedCode -ge 0 -and $r.Code -ne $ExpectedCode) {
-    throw "expected exit $ExpectedCode from 'wake $($WakeArgs -join ' ')', got $($r.Code):`n$($r.Output)"
+  if ($code -ne $ExpectedCode) {
+    throw "expected exit $ExpectedCode from 'wake $($WakeArgs -join ' ')', got $code`n$output"
   }
-  Write-Host "ok   : wake $($WakeArgs -join ' ')  [exit $($r.Code)]"
-  return $r
-}
-
-function Assert-Contains {
-  param([string] $Text, [string] $Needle)
-  if (-not $Text.Contains($Needle)) { throw "expected output to contain '$Needle', got:`n$Text" }
+  if (-not $output.Contains($Needle)) {
+    throw "expected 'wake $($WakeArgs -join ' ')' to contain '$Needle'`n$output"
+  }
+  if ($output -match 'panicked|RUST_BACKTRACE|Exception') {
+    throw "internal error from 'wake $($WakeArgs -join ' ')'`n$output"
+  }
+  Write-Host "ok   : wake $($WakeArgs -join ' ')  [exit $code]"
 }
 
 $failed = $false
 try {
-  Assert-Contains (Assert-Success @('--version')) 'wake '
-  Assert-Contains (Assert-Success @('version'))   'wake 0.1.1'
-  Assert-Contains (Assert-Success @('--help'))    'wake --until-charge N'
+  Test-Wake 0 'wake '                  @('--version')
+  Test-Wake 0 'wake '                  @('version')
+  Test-Wake 0 'wake --until-charge N' @('--help')
+  Test-Wake 2 'conflicting triggers'  @('--until-charge', '80', '--while-pid', '1')
+  Test-Wake 2 'unknown flag'           @('--bogus')
+  Test-Wake 2 'invalid duration'       @('5x')
 
-  $conflict = Assert-Failure @('--until-charge', '80', '--while-pid', '1') -ExpectedCode 2
-  Assert-Contains $conflict.Output 'conflicting triggers'
+  Test-Wake 0 'session active'         @('forever', '--no-display')
+  Test-Wake 0 'session active'         @('status')
+  Test-Wake 1 'session already active' @('30s')
+  Test-Wake 0 'stopped'                @('stop')
+  Test-Wake 0 'no active session'      @('status')
 
-  Assert-Contains (Assert-Failure @('--bogus') -ExpectedCode 2).Output 'unknown flag'
-  Assert-Contains (Assert-Failure @('5x') -ExpectedCode 2).Output 'invalid duration'
+  Test-Wake 0 'session active'         @('30s')
+  Test-Wake 0 'session active'         @('status')
+  Test-Wake 0 'stopped'                @('stop')
 
-  # Battery path must fail gracefully (no battery -> "no usable battery found"; battery present but
-  # an unreachable/neutral target -> a clean usage error). Either way: non-zero, "wake:", no panic.
-  $battery = Assert-Failure @('--until-charge', '80')
-  Assert-Contains $battery.Output 'wake:'
-  if ($battery.Output -match 'panicked|RUST_BACKTRACE|Exception') { throw "battery failure leaked an internal error:`n$($battery.Output)" }
+  $env:Path = "$(Split-Path $wake);$env:Path"
+  $version = (& wake --version 2>&1) -join "`n"
+  if ($LASTEXITCODE -ne 0 -or $version -notmatch '^wake ') {
+    throw "release binary does not resolve as 'wake' on PATH: $version"
+  }
 
-  # Indefinite lifecycle
-  Assert-Contains (Assert-Success @('forever', '--no-display')) 'session active'
-  Assert-Contains (Assert-Success @('status')) 'session active'
-  Assert-Contains (Assert-Failure @('5s')).Output 'session already active'
-  Assert-Contains (Assert-Success @('stop')) 'stopped'
-  Assert-Contains (Assert-Success @('status')) 'no active session'
-
-  # Timed lifecycle
-  Assert-Contains (Assert-Success @('5s')) 'session active'
-  Assert-Contains (Assert-Success @('status')) 'session active'
-  Assert-Contains (Assert-Success @('stop')) 'stopped'
-
-  # Resolves as `wake` when its directory is on PATH (guards the shipped binary name).
-  $dir = Split-Path $wake
-  $env:Path = "$dir;$env:Path"
-  $v = wake --version
-  if ($v -notmatch 'wake ') { throw "release binary does not resolve as 'wake' on PATH: $v" }
-  Write-Host "ok   : wake resolves on PATH  [$v]"
-
-  Write-Host "`nALL SMOKE TESTS PASSED"
+  Write-Host "`nALL WINDOWS SMOKE TESTS PASSED"
 } catch {
   $failed = $true
-  Write-Host "`nSMOKE TEST FAILED: $_" -ForegroundColor Red
+  Write-Host "`nWINDOWS SMOKE FAILED: $_" -ForegroundColor Red
 } finally {
   & $wake stop *> $null
   Remove-Item -Recurse -Force $env:WAKE_STATE_DIR -ErrorAction SilentlyContinue

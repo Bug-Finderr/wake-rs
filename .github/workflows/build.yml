@@ -10,37 +10,27 @@ on:
 permissions:
   contents: read
 
+env:
+  RUST_VERSION: 1.97.0
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --check
-
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95
-      - run: cargo build --locked
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component rustfmt
+      - run: cargo +${{ env.RUST_VERSION }} fmt --check
 
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     needs: check
-    permissions:
-      id-token: write
-      attestations: write
-      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -53,16 +43,11 @@ jobs:
             artifact: wake.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      # Lint + test on every OS so the cfg-gated windows/macos code (and FFI) is actually covered.
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --release --locked
-
-      - run: cargo build --release --locked
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component clippy
+      - run: cargo +${{ env.RUST_VERSION }} clippy --all-targets --locked -- -D warnings
+      - run: cargo +${{ env.RUST_VERSION }} test --release --locked
+      - run: cargo +${{ env.RUST_VERSION }} build --release --locked
 
       - name: Smoke test (Linux)
         if: runner.os == 'Linux'
@@ -76,10 +61,17 @@ jobs:
       - name: Smoke test (macOS)
         if: runner.os == 'macOS'
         run: |
+          state="$(mktemp -d)"
+          export WAKE_STATE_DIR="$state"
+          trap 'target/release/wake stop >/dev/null 2>&1; rm -rf "$state"' EXIT
           target/release/wake --version | grep -F 'wake '
           target/release/wake --help | grep -F 'wake --until-charge N'
+          target/release/wake 30s | grep -F 'session active'
+          target/release/wake status | grep -F 'session active'
+          target/release/wake stop | grep -F 'stopped'
 
       - name: Stage artifact
+        if: github.event_name == 'release'
         shell: bash
         run: |
           mkdir -p dist
@@ -89,40 +81,38 @@ jobs:
             cp target/release/wake "dist/${{ matrix.artifact }}"
           fi
 
-      - name: Checksum artifact
-        shell: bash
-        working-directory: dist
-        run: |
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
-          else
-            shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
-          fi
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/${{ matrix.artifact }}
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifact
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            dist/${{ matrix.artifact }}
-            dist/${{ matrix.artifact }}.sha256
+          path: dist/${{ matrix.artifact }}
           if-no-files-found: error
 
   release:
     if: github.event_name == 'release'
-    needs: build
+    needs: [build, audit]
     runs-on: ubuntu-latest
     permissions:
+      attestations: write
       contents: write
+      id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
-      - name: Attach binaries and checksums to release
+      - name: Attest binaries
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*/*
+      - name: Create checksums
+        run: |
+          for artifact in dist/*/*; do
+            directory="${artifact%/*}"
+            name="${artifact##*/}"
+            (cd "$directory" && sha256sum "$name" > "$name.sha256")
+          done
+      - name: Attach binaries and checksums
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

@@ -1,5 +1,3 @@
-//! Compile-time selected platform operations.
-
 #[cfg(target_os = "linux")]
 use crate::error::{AppError, Result};
 #[cfg(target_os = "linux")]

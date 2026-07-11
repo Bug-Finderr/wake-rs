@@ -1,10 +1,7 @@
-//! Duration parsing: `90s`, `5m`, `1h30m`, `2h45m30s`, `1d`, or plain seconds. Max 30 days.
-
 use crate::error::AppError;
 
 const MAX_SECONDS: i64 = 30 * 24 * 60 * 60;
 
-/// Parse a duration string into seconds.
 pub fn parse(raw: &str) -> Result<i64, AppError> {
     if raw.trim().is_empty() {
         return Err(AppError::usage("empty duration"));
@@ -19,10 +16,9 @@ pub fn parse(raw: &str) -> Result<i64, AppError> {
         return cap(v, raw);
     }
 
-    // Tokenize into (value, unit) pairs; units must appear in d,h,m,s order, each at most once.
     let bytes = s.as_bytes();
     let mut idx = 0;
-    let mut acc = [0i64; 4]; // d, h, m, s
+    let mut acc = [0i64; 4];
     let mut last_order: i32 = -1;
     let invalid = || AppError::usage(format!("invalid duration: '{raw}' (try 1h30m, 90s, etc.)"));
 
@@ -32,7 +28,7 @@ pub fn parse(raw: &str) -> Result<i64, AppError> {
             idx += 1;
         }
         if idx == start || idx == bytes.len() {
-            return Err(invalid()); // missing digits, or digits with no trailing unit
+            return Err(invalid());
         }
         let order = match bytes[idx] {
             b'd' => 0,
@@ -42,7 +38,7 @@ pub fn parse(raw: &str) -> Result<i64, AppError> {
             _ => return Err(invalid()),
         };
         if order <= last_order {
-            return Err(invalid()); // out of order or repeated unit
+            return Err(invalid());
         }
         last_order = order;
         acc[order as usize] = s[start..idx].parse::<i64>().map_err(|_| too_large(raw))?;

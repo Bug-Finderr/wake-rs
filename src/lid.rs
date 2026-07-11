@@ -133,6 +133,7 @@ fn decide_recovery(
                 ..
             },
         ) => Keep,
+        (LiveLid, NoWatchdog) => Keep,
         (
             Missing | Malformed | Stale,
             Valid {
@@ -228,6 +229,7 @@ pub fn prepare_start(spec: &RunSpec) -> Result<Option<Prepared>> {
     ));
     #[cfg(target_os = "macos")]
     {
+        platform::trusted_helper_executable()?;
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             return Err(AppError::fail(
                 "--even-lid needs an interactive terminal for sudo authentication",
@@ -725,18 +727,12 @@ fn validate_watchdog_start(
     Ok(())
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 pub fn run_restore(args: &[String]) -> Result<()> {
-    #[cfg(windows)]
     let [state_dir] = args else {
         return Err(AppError::fail("lid restore expects a state directory"));
     };
-    #[cfg(windows)]
     session::set_helper_state_dir(decode_helper_state_dir(state_dir)?)?;
-    #[cfg(target_os = "macos")]
-    if !args.is_empty() {
-        return Err(AppError::fail("lid restore expects no arguments"));
-    }
     let marker = session::read_lid_restore()?
         .ok_or_else(|| AppError::fail("no lid restoration marker found"))?;
     let snapshot = snapshot_from_marker(&marker)?;
@@ -946,7 +942,7 @@ fn snapshot_from_marker(marker: &LidRestore) -> Result<platform::LidSnapshot> {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 fn restore_and_clear(marker: &LidRestore, snapshot: &platform::LidSnapshot) -> Result<()> {
     platform::restore_lid(snapshot)?;
     session::clear_lid_restore(marker)
@@ -967,27 +963,11 @@ fn restore_elevated() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn restore_elevated() -> Result<()> {
-    let run = || -> Result<bool> {
-        let command = mac_helper_command(&["__lid_restore__"])?;
-        Ok(std::process::Command::new(&command[0])
-            .args(&command[1..])
-            .status()?
-            .success())
-    };
-    if run()? {
-        return Ok(());
-    }
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(AppError::fail(
-            "lid recovery needs an interactive terminal for sudo authentication",
-        ));
-    }
-    platform::authenticate_privilege()?;
-    if run()? {
-        Ok(())
-    } else {
-        Err(AppError::fail("elevated lid restoration failed"))
-    }
+    let marker = session::read_lid_restore()?
+        .ok_or_else(|| AppError::fail("no lid restoration marker found"))?;
+    let snapshot = snapshot_from_marker(&marker)?;
+    platform::restore_lid_elevated(&snapshot)?;
+    session::clear_lid_restore(&marker)
 }
 
 #[cfg(target_os = "macos")]
@@ -1000,7 +980,7 @@ fn mac_helper_command(args: &[&str]) -> Result<Vec<String>> {
             "WAKE_STATE_DIR={}",
             session::absolute_state_dir()?.display()
         ),
-        sysutil::self_exe()?,
+        platform::trusted_helper_executable()?,
     ];
     command.extend(args.iter().map(|arg| (*arg).into()));
     Ok(command)
@@ -1324,7 +1304,7 @@ mod tests {
                 },
                 Reject,
             ),
-            (true, LiveLid, NoWatchdog, QuiesceRestore),
+            (true, LiveLid, NoWatchdog, Keep),
             (
                 true,
                 Malformed,

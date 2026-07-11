@@ -32,7 +32,7 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
             "__supervise__" => return supervisor::run(&args[1..]),
             #[cfg(any(windows, target_os = "macos"))]
             "__lid_watchdog__" => return lid::run_watchdog(&args[1..]),
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(windows)]
             "__lid_restore__" => return lid::run_restore(&args[1..]),
             _ => {}
         }

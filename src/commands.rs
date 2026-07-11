@@ -141,7 +141,7 @@ fn resolve_trigger(parsed: ParsedTrigger) -> Result<ResolvedTrigger> {
                 .map_err(|_| AppError::usage(format!("invalid pid: '{raw}'")))?;
             Trigger::Pid {
                 process: sysutil::capture_process(pid)
-                    .map_err(|_| AppError::usage(format!("pid {pid} is not running")))?,
+                    .map_err(|error| AppError::usage(error.message().to_owned()))?,
             }
         }
         ParsedTrigger::App(name) => Trigger::App {
@@ -532,6 +532,7 @@ fn parse_int(value: &str, name: &str) -> Result<i32> {
 }
 
 pub fn recover_stale_lid_session_unlocked() -> Result<()> {
+    session::ensure_no_legacy_state()?;
     lid::recover_unlocked()
 }
 

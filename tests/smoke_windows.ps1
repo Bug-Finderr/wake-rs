@@ -37,6 +37,22 @@ try {
   Test-Wake 2 'unknown flag'           @('--bogus')
   Test-Wake 2 'invalid duration'       @('5x')
 
+  $ErrorActionPreference = 'Continue'
+  $batteryOutput = (& $wake --until-charge 80 2>&1) -join "`n"
+  $batteryCode = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  $batteryExpected = switch ($batteryCode) {
+    0 { $batteryOutput.Contains('wake: session active') -or $batteryOutput.Contains('wake: battery already at') }
+    1 { $batteryOutput.Contains('wake: no usable battery found') -or $batteryOutput.Contains('wake: could not read battery status') }
+    2 { $batteryOutput.Contains('wake: --until-charge 80 is unreachable') -or $batteryOutput.Contains('wake: cannot determine battery charging direction') }
+    default { $false }
+  }
+  if (-not $batteryExpected -or $batteryOutput -match 'panicked|RUST_BACKTRACE|Exception') {
+    throw "unexpected battery result from 'wake --until-charge 80', exit $batteryCode`n$batteryOutput"
+  }
+  if ($batteryCode -eq 0) { & $wake stop *> $null }
+  Write-Host "ok   : wake --until-charge 80  [exit $batteryCode, graceful]"
+
   Test-Wake 0 'session active'         @('forever', '--no-display')
   Test-Wake 0 'session active'         @('status')
   Test-Wake 1 'session already active' @('30s')

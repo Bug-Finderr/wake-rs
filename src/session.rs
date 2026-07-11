@@ -64,6 +64,26 @@ pub fn state_file() -> PathBuf {
     state_dir().join("session.json")
 }
 
+fn legacy_state_file() -> PathBuf {
+    state_dir().join("session.properties")
+}
+
+pub fn ensure_no_legacy_state() -> Result<()> {
+    let path = legacy_state_file();
+    ensure_no_legacy_state_at(&path)
+}
+
+fn ensure_no_legacy_state_at(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(state_io_err(path, error)),
+        Ok(_) => Err(AppError::fail(format!(
+            "legacy wake session state found at {}; stop it with the wake binary that created it, then remove the file before retrying",
+            path.display()
+        ))),
+    }
+}
+
 pub fn stop_file() -> PathBuf {
     state_dir().join("stop.json")
 }
@@ -1050,6 +1070,18 @@ mod tests {
             assert!(process_lease_path(&dir.0, token).is_err());
             assert!(claim_process_lease_at(&dir.0, token, 42).is_err());
         }
+    }
+
+    #[test]
+    fn legacy_state_must_be_resolved_before_new_lifecycle_state() {
+        let dir = TestDir::new("legacy-state");
+        let path = dir.0.join("session.properties");
+
+        ensure_no_legacy_state_at(&path).unwrap();
+        fs::write(&path, b"pid=42\n").unwrap();
+        let error = ensure_no_legacy_state_at(&path).unwrap_err();
+
+        assert!(error.message().contains("legacy wake session state"));
     }
 
     #[test]

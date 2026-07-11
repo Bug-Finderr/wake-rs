@@ -35,7 +35,11 @@ wake status | stop
 | Linux | `systemd-inhibit` | Unsupported. |
 | Windows | Native power requests | An elevated watchdog snapshots a power plan's AC/DC lid actions, applies the override, then restores the recorded values. |
 
+On macOS, `--even-lid` re-launches `wake` through `sudo`, so the executable and every parent directory must be root-owned, free of extended ACLs, and not writable without root. Install a protected copy, for example with `sudo install -o root -g wheel -m 0755 target/release/wake /usr/local/bin/wake`. Ordinary inhibition does not require this.
+
 Each session runs through a detached supervisor. State is stored under `~/.local/state/wake`, `$XDG_STATE_HOME/wake`, or `%LOCALAPPDATA%\wake`. Set `WAKE_STATE_DIR` to override the directory.
+
+Builds that used `session.properties` are not migrated silently. Stop an active session with the binary that created it, then remove the legacy file before starting this build.
 
 ## Development
 

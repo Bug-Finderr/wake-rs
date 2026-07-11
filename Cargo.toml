@@ -21,6 +21,9 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
 signal-hook = "0.3.18"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.186"
+
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",

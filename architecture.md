@@ -14,6 +14,8 @@
 
 `wake stop` writes a lease-bound `stop.json` and waits up to five seconds for graceful exit. It reports an unresponsive supervisor instead of sending a signal to a PID that may have been reused. PID/app triggers are observational, best-effort checks and are never terminated by `wake`.
 
+PID/app triggers pair the PID with its native creation identifier: Linux start ticks, macOS start microseconds, or Windows creation `FILETIME`. The identifier is sampled around process metadata capture so PID reuse cannot silently rebind a trigger to another process.
+
 ## Durable State
 
 All JSON is strict and written through atomic replacement. `wake.lock` serializes foreground state changes. Privileged helpers receive the resolved state directory explicitly rather than inferring the elevated user's home.
@@ -26,7 +28,7 @@ All JSON is strict and written through atomic replacement. `wake.lock` serialize
 | `lid-watchdog.json` | Matching supervisor and watchdog leases plus startup readiness. |
 | `process-*.lock` | OS-released lifetime lease for one wake-owned process. |
 
-Every session command attempts safe recovery. A valid live watchdog is preserved. Stale ordinary state is removed. Unresolved lid state is restored through `__lid_restore__`; malformed or conflicting live state fails closed instead of being overwritten.
+Every session command attempts safe recovery. A valid live watchdog is preserved. Stale ordinary state is removed. Unresolved lid state is restored through the Windows `__lid_restore__` helper or a fixed macOS `sudo pmset` argument vector; malformed or conflicting live state fails closed instead of being overwritten.
 
 ## Platform Boundary
 
@@ -35,5 +37,9 @@ Every session command attempts safe recovery. A valid live watchdog is preserved
 - macOS owns a `caffeinate` child and uses `pmset` for battery and lid state.
 - Linux owns a `systemd-inhibit` child and reads batteries from sysfs. It has no even-lid mode.
 - Windows owns a `PowerCreateRequest` handle and reads battery state natively. Its watchdog checks that the recorded power scheme is still active before reapplying changes. A concurrent scheme change between that check and the API call remains possible.
+
+The macOS watchdog executes `wake` as root, so even-lid startup resolves the canonical executable and rejects any executable or ancestor not owned by root, carrying an extended ACL, or writable by the invoking user, group, or others. This prevents a user-writable `current_exe` path from being replaced between the unprivileged process and `sudo` execution.
+
+The JSON lifecycle does not guess through the older `session.properties` format. Foreground commands fail closed while that file exists so an active legacy inhibitor cannot become invisible beside a new session.
 
 `sysutil.rs` centralizes external process observation, detached spawning, Windows elevation, and handle ownership. `session.rs` owns serialization, state locking, and process leases. `run.rs` owns validated trigger semantics. `supervisor.rs` contains the single condition loop.

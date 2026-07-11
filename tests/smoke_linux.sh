@@ -46,6 +46,39 @@ run 2 "invalid duration"        -- 5x
 run 0 "no active session"       -- status
 run 0 "no active session"       -- stop
 
+battery_output="$("$wake" --until-charge 80 2>&1)"
+battery_code=$?
+case "$battery_code:$battery_output" in
+  0:*"wake: session active"*|\
+    0:*"wake: battery already at"*"target 80% reached"*|\
+    1:*"wake: no usable battery found"*|\
+    2:*"wake: --until-charge 80 is unreachable"*|\
+    2:*"wake: cannot determine battery charging direction"*) battery_expected=1 ;;
+  *) battery_expected=0 ;;
+esac
+if [ "$battery_expected" -eq 1 ] &&
+  [[ "$battery_output" != *panicked* ]] &&
+  [[ "$battery_output" != *RUST_BACKTRACE* ]]; then
+  [ "$battery_code" -ne 0 ] || "$wake" stop >/dev/null 2>&1
+  printf 'ok   : wake --until-charge 80  [exit %s, graceful]\n' "$battery_code"
+else
+  printf 'FAIL : wake --until-charge 80  [unexpected result, exit %s]\n%s\n' "$battery_code" "$battery_output"
+  fail=1
+fi
+
+(
+  printf 'wake-before\n' > /proc/self/comm
+  sleep 1
+  printf 'wake-after\n' > /proc/self/comm
+  sleep 4
+) &
+renamed_pid=$!
+run 0 "session active"          -- --while-pid "$renamed_pid"
+sleep 2
+run 0 "session active"          -- status
+run 0 "stopped"                 -- stop
+wait "$renamed_pid"
+
 run 0 "session active"          -- forever
 run 0 "session active"          -- status
 run 1 "session already active"  -- 30s

@@ -121,6 +121,16 @@ fn is_guid(value: &str) -> bool {
 }
 
 impl Session {
+    fn is_valid(&self) -> bool {
+        self.pid > 0
+            && self.process_start > 0
+            && !self.mode.trim().is_empty()
+            && !self.trigger.trim().is_empty()
+            && !self.process_command.trim().is_empty()
+            && self.started_at.is_some()
+            && valid_prior_lid_state(self.prior_disable_sleep)
+    }
+
     pub fn capture_process_identity(&mut self) -> Result<()> {
         let id = sysutil::capture_identity(self.pid)?;
         self.process_start = id.start;
@@ -138,6 +148,14 @@ impl Session {
             }
         }
     }
+}
+
+fn valid_prior_lid_state(value: i32) -> bool {
+    matches!(value, 0 | 1)
+        || cfg!(windows) && {
+            let (ac, dc) = (value & 0xF, (value >> 4) & 0xF);
+            value == ac | (dc << 4) && (0..=3).contains(&ac) && (0..=3).contains(&dc)
+        }
 }
 
 fn is_expected_command(command: &str, command_line: &str) -> bool {
@@ -229,7 +247,14 @@ fn sync_parent(_dir: &Path) -> std::io::Result<()> {
 }
 
 fn read_session_at(path: &Path) -> Result<Option<Session>> {
-    read_json(path)
+    let saved: Option<Session> = read_json(path)?;
+    match saved {
+        Some(saved) if !saved.is_valid() => Err(AppError::fail(format!(
+            "invalid session at {}",
+            path.display()
+        ))),
+        saved => Ok(saved),
+    }
 }
 
 fn write_session_at(path: &Path, session: &Session) -> Result<()> {
@@ -303,7 +328,7 @@ pub fn read_if_alive() -> Result<Option<Session>> {
     if session.matches_live_process() {
         Ok(Some(session))
     } else {
-        delete_state_file();
+        remove_state_file()?;
         Ok(None)
     }
 }
@@ -334,10 +359,6 @@ fn remove_state_file_at(path: &Path) -> Result<()> {
 
 pub fn remove_state_file() -> Result<()> {
     remove_state_file_at(&state_file())
-}
-
-pub fn delete_state_file() {
-    let _ = remove_state_file();
 }
 
 pub struct LockGuard {
@@ -457,6 +478,25 @@ mod tests {
 
         assert!(error.message().contains("invalid JSON"));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn semantic_session_validation_table() {
+        let dir = TestDir::new("session-invalid");
+        let path = dir.join("session.json");
+        let mut cases: [Session; 7] = std::array::from_fn(|_| sample_session());
+        cases[0].pid = 0;
+        cases[1].process_start = 0;
+        cases[2].mode.clear();
+        cases[3].trigger = " ".into();
+        cases[4].process_command.clear();
+        cases[5].started_at = None;
+        cases[6].prior_disable_sleep = if cfg!(windows) { 0x44 } else { 2 };
+
+        for saved in cases {
+            write_json(&path, &saved).unwrap();
+            assert!(read_session_at(&path).is_err());
+        }
     }
 
     #[test]

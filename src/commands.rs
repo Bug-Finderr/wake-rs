@@ -15,8 +15,6 @@ pub fn is_console() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-// ---- start ----
-
 struct Parsed {
     timeout_sec: Option<i64>,
     charge_target: Option<i32>,
@@ -236,7 +234,7 @@ pub fn start(args: &[String]) -> Result<()> {
         && let Err(e) = enable_even_lid_windows()
     {
         let _ = child.kill();
-        session::delete_state_file();
+        let _ = session::remove_state_file();
         return Err(e);
     }
 
@@ -295,8 +293,6 @@ fn wait_for_state_file() {
     }
 }
 
-// ---- status / stop ----
-
 pub fn status() -> Result<()> {
     let _lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
@@ -344,7 +340,7 @@ pub fn stop() -> Result<()> {
     recover_stale_lid_session_unlocked()?;
     let Some(s) = session::read_if_alive()? else {
         println!("wake: no active session");
-        session::delete_state_file();
+        session::remove_state_file()?;
         return Ok(());
     };
     sysutil::terminate(s.pid);
@@ -354,12 +350,10 @@ pub fn stop() -> Result<()> {
         #[cfg(not(windows))]
         verify_disable_sleep_restored_after_stop(&s)?;
     }
-    session::delete_state_file();
+    session::remove_state_file()?;
     println!("wake: stopped (pid {}, {})", s.pid, s.trigger);
     Ok(())
 }
-
-// ---- start confirmation + formatting ----
 
 fn print_start_confirmation(s: &Session, note: Option<&str>) {
     let started = s.started_at.map(hms).unwrap_or_else(|| "-".into());
@@ -438,8 +432,6 @@ fn parse_int(s: &str, name: &str) -> Result<i32> {
 fn even_lid_unsupported_message() -> String {
     "--even-lid is unsupported on Linux; lid-switch inhibition is handled through systemd when privileged".into()
 }
-
-// ---- even-lid: power-plan lid action (Windows) ----
 
 /// Set the lid-close action to (ac, dc). Tries a direct write first (it succeeds unprivileged for
 /// admin accounts); only if the OS denies it does it retry via the elevated `__set_lid__` helper (UAC).
@@ -526,14 +518,12 @@ fn start_charge_supervisor_windows(
         && let Err(e) = enable_even_lid_windows()
     {
         sysutil::terminate(s.pid);
-        session::delete_state_file();
+        let _ = session::remove_state_file();
         return Err(e);
     }
     print_start_confirmation(&s, None);
     Ok(())
 }
-
-// ---- even-lid: sudo + SleepDisabled (macOS) ----
 
 #[cfg(not(windows))]
 fn ensure_sudo_for_even_lid() -> Result<()> {
@@ -588,7 +578,7 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
         }
         Err(e) => {
             if restore_disable_sleep_best_effort(prior) {
-                if let Err(cleanup) = finish_mac_lid_restore(prior, true) {
+                if let Err(cleanup) = finish_mac_lid_restore(prior) {
                     eprintln!("wake: {cleanup}");
                 }
             }
@@ -675,12 +665,12 @@ fn wait_for_supervisor_session(supervisor_pid: u32, even_lid: bool) -> Result<Op
 fn verify_disable_sleep_restored_after_stop(s: &Session) -> Result<()> {
     for _ in 0..20 {
         if platform::read_disable_sleep()? == s.prior_disable_sleep {
-            return finish_mac_lid_restore(s.prior_disable_sleep, true);
+            return finish_mac_lid_restore(s.prior_disable_sleep);
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     if platform::read_disable_sleep()? == s.prior_disable_sleep {
-        return finish_mac_lid_restore(s.prior_disable_sleep, true);
+        return finish_mac_lid_restore(s.prior_disable_sleep);
     }
     restore_disable_sleep_with_prompt_if_possible(
         s.prior_disable_sleep,
@@ -698,26 +688,21 @@ fn verify_disable_sleep_restored_after_stop(s: &Session) -> Result<()> {
         "wake: restored SleepDisabled to {} after lid supervisor exit",
         s.prior_disable_sleep
     );
-    finish_mac_lid_restore(s.prior_disable_sleep, true)
+    finish_mac_lid_restore(s.prior_disable_sleep)
 }
 
 #[cfg(not(windows))]
-pub(crate) fn finish_mac_lid_restore(prior: i32, remove_session: bool) -> Result<()> {
+pub(crate) fn finish_mac_lid_restore(prior: i32) -> Result<()> {
     let expected = session::LidRestore::Macos {
         sleep_disabled: prior,
     };
-    match marker_clear_action(session::read_lid_restore()?.as_ref(), &expected)? {
-        MarkerClearAction::AlreadyCleared => {
-            if remove_session {
-                session::remove_state_file()?;
-            }
-            Ok(())
+    match session::read_lid_restore()? {
+        None => session::remove_state_file(),
+        Some(saved) if saved == expected => {
+            session::remove_state_file()?;
+            session::clear_lid_restore(&expected)
         }
-        MarkerClearAction::Clear => {
-            finish_restored_state(remove_session, session::remove_state_file, || {
-                session::clear_lid_restore(&expected)
-            })
-        }
+        Some(_) => Err(AppError::fail("lid restoration marker does not match")),
     }
 }
 
@@ -766,80 +751,22 @@ fn restore_disable_sleep_best_effort(prior: i32) -> bool {
 #[cfg(not(windows))]
 pub fn print_sleep_restore_rescue(value: i32) {
     eprintln!("wake: could not restore sleep; run: sudo pmset -a disablesleep {value}");
-    print_sleep_state_path();
-}
-
-#[cfg(not(windows))]
-fn print_sleep_state_path() {
     eprintln!(
         "wake: recovery state: {}",
         session::lid_restore_file().display()
     );
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MarkerClearAction {
-    AlreadyCleared,
-    Clear,
-}
-
 #[cfg_attr(windows, allow(dead_code))]
-fn marker_clear_action(
-    saved: Option<&session::LidRestore>,
-    expected: &session::LidRestore,
-) -> Result<MarkerClearAction> {
-    match saved {
-        None => Ok(MarkerClearAction::AlreadyCleared),
-        Some(saved) if saved == expected => Ok(MarkerClearAction::Clear),
-        Some(_) => Err(AppError::fail("lid restoration marker does not match")),
+fn live_marker_matches(saved: &Session, marker: Option<&session::LidRestore>) -> bool {
+    match (saved.even_lid, marker) {
+        (false, None) => true,
+        (true, Some(session::LidRestore::Macos { sleep_disabled })) => {
+            *sleep_disabled == saved.prior_disable_sleep
+        }
+        _ => false,
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(windows, allow(dead_code))]
-enum RecoverySession {
-    Missing,
-    Live,
-    StalePlain,
-    StaleLid,
-    Malformed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecoveryAction {
-    None,
-    RemoveSession,
-    RestoreAndRemoveSession,
-    RestoreAndRetainSession,
-    MissingMarker,
-    ReportMalformed,
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-fn recovery_action(has_marker: bool, saved: RecoverySession) -> RecoveryAction {
-    match (has_marker, saved) {
-        (_, RecoverySession::Live) | (false, RecoverySession::Missing) => RecoveryAction::None,
-        (true, RecoverySession::Malformed) => RecoveryAction::RestoreAndRetainSession,
-        (true, _) => RecoveryAction::RestoreAndRemoveSession,
-        (false, RecoverySession::StalePlain) => RecoveryAction::RemoveSession,
-        (false, RecoverySession::StaleLid) => RecoveryAction::MissingMarker,
-        (false, RecoverySession::Malformed) => RecoveryAction::ReportMalformed,
-    }
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-fn finish_restored_state(
-    remove_session: bool,
-    remove: impl FnOnce() -> Result<()>,
-    clear: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    if remove_session {
-        remove()?;
-    }
-    clear()
-}
-
-// ---- crash recovery ----
 
 pub fn recover_stale_lid_session_foreground() -> Result<()> {
     let _lock = session::acquire_lock()?;
@@ -876,48 +803,39 @@ fn recover_stale_lid_session_windows() -> Result<()> {
 #[cfg(not(windows))]
 fn recover_stale_lid_session_unix() -> Result<()> {
     let marker = session::read_lid_restore()?;
-    let prior = match marker.as_ref() {
-        Some(session::LidRestore::Macos { sleep_disabled }) => Some(*sleep_disabled),
-        Some(session::LidRestore::Windows { .. }) => {
-            return Err(AppError::fail(format!(
-                "Windows lid restoration marker found on this platform at {}",
-                session::lid_restore_file().display()
-            )));
-        }
-        None => None,
-    };
     let saved = session::read_saved_for_recovery();
-    let state = match &saved {
-        Ok(None) => RecoverySession::Missing,
-        Ok(Some(saved)) if saved.matches_live_process() => RecoverySession::Live,
-        Ok(Some(saved)) if saved.even_lid => RecoverySession::StaleLid,
-        Ok(Some(_)) => RecoverySession::StalePlain,
-        Err(_) => RecoverySession::Malformed,
-    };
+    if let Ok(Some(saved)) = &saved
+        && saved.matches_live_process()
+    {
+        return if live_marker_matches(saved, marker.as_ref()) {
+            Ok(())
+        } else {
+            Err(AppError::fail("live session and lid marker do not match"))
+        };
+    }
 
-    match recovery_action(prior.is_some(), state) {
-        RecoveryAction::None => Ok(()),
-        RecoveryAction::RemoveSession => session::remove_state_file(),
-        RecoveryAction::MissingMarker => Err(AppError::fail(format!(
-            "stale --even-lid session has no restoration marker at {}",
-            session::lid_restore_file().display()
-        ))),
-        RecoveryAction::ReportMalformed => saved.map(|_| ()),
-        RecoveryAction::RestoreAndRemoveSession => {
-            let prior = prior.expect("recovery action requires marker");
+    match (marker, saved) {
+        (
+            Some(
+                marker @ session::LidRestore::Macos {
+                    sleep_disabled: prior,
+                },
+            ),
+            _,
+        ) => {
             recover_mac_lid_marker(prior)?;
-            finish_mac_lid_restore(prior, true)
+            session::remove_state_file()?;
+            session::clear_lid_restore(&marker)
         }
-        RecoveryAction::RestoreAndRetainSession => {
-            let prior = prior.expect("recovery action requires marker");
-            recover_mac_lid_marker(prior)?;
-            finish_mac_lid_restore(prior, false)?;
-            eprintln!(
-                "wake: restored sleep settings; retained malformed session state at {}",
-                session::state_file().display()
-            );
-            saved.map(|_| ())
-        }
+        (Some(session::LidRestore::Windows { .. }), _) => Err(AppError::fail(
+            "Windows lid restoration marker found on this platform",
+        )),
+        (None, Err(error)) => Err(error),
+        (None, Ok(None)) => Ok(()),
+        (None, Ok(Some(saved))) if !saved.even_lid => session::remove_state_file(),
+        (None, Ok(Some(_))) => Err(AppError::fail(
+            "stale --even-lid session has no restoration marker",
+        )),
     }
 }
 
@@ -929,28 +847,17 @@ fn recover_mac_lid_marker(prior: i32) -> Result<()> {
         ));
     }
     let current = platform::read_disable_sleep()?;
-    if current != prior {
-        restore_disable_sleep_with_prompt_if_possible(
-            prior,
-            "crashed lid session needs sudo recovery, but no interactive terminal is available",
-        )?;
-        let after = platform::read_disable_sleep()?;
-        if after != prior {
-            print_sleep_restore_rescue(prior);
-            return Err(AppError::fail(format!(
-                "failed to recover crashed lid session; SleepDisabled is {after}"
-            )));
-        }
-        if prior == 0 {
-            eprintln!("wake: recovered a crashed lid session; restored normal sleep");
-        } else {
-            eprintln!("wake: recovered a crashed lid session; restored prior SleepDisabled value");
-        }
+    if current == prior {
+        return Ok(());
     }
+    restore_disable_sleep_with_prompt_if_possible(
+        prior,
+        "crashed lid session needs sudo recovery, but no interactive terminal is available",
+    )?;
+    eprintln!("wake: recovered a crashed lid session");
     Ok(())
 }
 
-/// Crash recovery for a stale Windows even-lid session: re-elevate and restore the prior lid action.
 #[cfg(windows)]
 fn recover_crashed_even_lid_windows(saved: &Session) -> Result<()> {
     let (ac, dc) = platform::decode_lid(saved.prior_disable_sleep);
@@ -973,68 +880,25 @@ fn recover_crashed_even_lid_windows(saved: &Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
 
-    fn marker(prior: i32) -> session::LidRestore {
-        session::LidRestore::Macos {
-            sleep_disabled: prior,
+    #[test]
+    fn live_session_marker_consistency_table() {
+        let matching = session::LidRestore::Macos { sleep_disabled: 1 };
+        let wrong = session::LidRestore::Macos { sleep_disabled: 0 };
+        let cases = [
+            (false, None, true),
+            (false, Some(&matching), false),
+            (true, None, false),
+            (true, Some(&matching), true),
+            (true, Some(&wrong), false),
+        ];
+        for (even_lid, marker, expected) in cases {
+            let saved = Session {
+                even_lid,
+                prior_disable_sleep: 1,
+                ..Default::default()
+            };
+            assert_eq!(live_marker_matches(&saved, marker), expected);
         }
-    }
-
-    #[test]
-    fn missing_marker_is_an_idempotent_completed_clear() {
-        assert_eq!(
-            marker_clear_action(None, &marker(0)).unwrap(),
-            MarkerClearAction::AlreadyCleared
-        );
-    }
-
-    #[test]
-    fn mismatched_marker_is_not_treated_as_completed() {
-        assert!(marker_clear_action(Some(&marker(1)), &marker(0)).is_err());
-    }
-
-    #[test]
-    fn marker_drives_recovery_without_a_session() {
-        assert_eq!(
-            recovery_action(true, RecoverySession::Missing),
-            RecoveryAction::RestoreAndRemoveSession
-        );
-    }
-
-    #[test]
-    fn marker_restores_but_retains_a_malformed_session() {
-        assert_eq!(
-            recovery_action(true, RecoverySession::Malformed),
-            RecoveryAction::RestoreAndRetainSession
-        );
-    }
-
-    #[test]
-    fn stale_lid_session_without_marker_is_not_guessed() {
-        assert_eq!(
-            recovery_action(false, RecoverySession::StaleLid),
-            RecoveryAction::MissingMarker
-        );
-    }
-
-    #[test]
-    fn restored_state_removes_session_before_marker() {
-        let events = RefCell::new(Vec::new());
-
-        finish_restored_state(
-            true,
-            || {
-                events.borrow_mut().push("session");
-                Ok(())
-            },
-            || {
-                events.borrow_mut().push("marker");
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(*events.borrow(), ["session", "marker"]);
     }
 }

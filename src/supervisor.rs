@@ -96,8 +96,6 @@ fn install_stop_flag() -> Arc<AtomicBool> {
     flag
 }
 
-// ---- until-charge supervisor ----
-
 pub fn run_charge(args: &[String]) -> Result<()> {
     if args.len() < 4 {
         return Err(AppError::fail("supervisor: bad args"));
@@ -190,7 +188,7 @@ pub fn run_charge(args: &[String]) -> Result<()> {
     if let Some(prior) = prior_lid {
         restore_lid_on_windows(prior);
     }
-    session::delete_state_file();
+    session::remove_state_file()?;
     Ok(())
 }
 
@@ -204,8 +202,6 @@ fn restore_lid_on_windows(prior: i32) {
     }
     let _ = sysutil::run_elevated_self(&["__set_lid__", &ac.to_string(), &dc.to_string()]);
 }
-
-// ---- even-lid supervisor (macOS) ----
 
 /// Windows never spawns the lid supervisor (even-lid is overlaid on the normal session via the
 /// power-plan lid action), so this is an inert stub there.
@@ -326,7 +322,7 @@ fn lid_cleanup(child_pid: u32, prior_disable_sleep: i32) {
         .unwrap_or(false);
     sysutil::terminate(child_pid);
     if restored {
-        if let Err(error) = commands::finish_mac_lid_restore(prior_disable_sleep, true) {
+        if let Err(error) = commands::finish_mac_lid_restore(prior_disable_sleep) {
             eprintln!("wake supervisor: {error}");
         }
     } else {

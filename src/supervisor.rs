@@ -326,11 +326,8 @@ fn lid_cleanup(child_pid: u32, prior_disable_sleep: i32) {
         .unwrap_or(false);
     sysutil::terminate(child_pid);
     if restored {
-        let marker = session::LidRestore::Macos {
-            sleep_disabled: prior_disable_sleep,
-        };
-        if session::clear_lid_restore(&marker).is_ok() {
-            session::delete_state_file();
+        if let Err(error) = commands::finish_mac_lid_restore(prior_disable_sleep, true) {
+            eprintln!("wake supervisor: {error}");
         }
     } else {
         commands::print_sleep_restore_rescue(prior_disable_sleep);

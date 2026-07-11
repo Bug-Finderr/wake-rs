@@ -319,8 +319,25 @@ pub fn write(s: &Session) -> Result<()> {
     write_session_at(&state_file(), s)
 }
 
+fn remove_state_file_at(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(dir) = path.parent() {
+                sync_parent(dir).map_err(|error| state_io_err(dir, error))?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(state_io_err(path, error)),
+    }
+}
+
+pub fn remove_state_file() -> Result<()> {
+    remove_state_file_at(&state_file())
+}
+
 pub fn delete_state_file() {
-    let _ = fs::remove_file(state_file());
+    let _ = remove_state_file();
 }
 
 pub struct LockGuard {
@@ -512,5 +529,20 @@ mod tests {
 
         clear_lid_restore_at(&path, &saved).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn removing_session_is_idempotent_and_keeps_lid_marker() {
+        let dir = TestDir::new("session-remove");
+        let session = dir.join("session.json");
+        let marker = dir.join("lid-restore.json");
+        write_session_at(&session, &sample_session()).unwrap();
+        write_lid_restore_at(&marker, &LidRestore::Macos { sleep_disabled: 0 }).unwrap();
+
+        remove_state_file_at(&session).unwrap();
+        remove_state_file_at(&session).unwrap();
+
+        assert!(!session.exists());
+        assert!(marker.exists());
     }
 }

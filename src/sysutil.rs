@@ -280,10 +280,10 @@ mod win {
         pub fn terminate(&self) -> Result<()> {
             // SAFETY: handle was opened with PROCESS_TERMINATE and remains owned here.
             if unsafe { TerminateProcess(self.handle, 1) } == 0 {
-                Err(os_error("could not terminate supervisor"))
-            } else {
-                Ok(())
+                return Err(os_error("could not terminate supervisor"));
             }
+            wait_handle(self.handle, 15_000)?
+                .ok_or_else(|| AppError::fail("supervisor did not exit after termination"))
         }
     }
 

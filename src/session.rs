@@ -362,6 +362,7 @@ fn write_watchdog_at(path: &Path, state: &WatchdogState) -> Result<()> {
     write_json(path, state)
 }
 
+#[cfg(any(test, windows, target_os = "macos"))]
 fn remove_watchdog_if_owner_at(path: &Path, owner: &ProcessRef) -> Result<bool> {
     let Some(state) = read_watchdog_at(path)? else {
         return Ok(false);
@@ -420,11 +421,11 @@ pub fn write_watchdog(state: &WatchdogState) -> Result<()> {
     write_watchdog_at(&lid_watchdog_file(), state)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub fn remove_watchdog_if_owner(owner: &ProcessRef) -> Result<bool> {
     remove_watchdog_if_owner_at(&lid_watchdog_file(), owner)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
 pub fn remove_watchdog_file() -> Result<()> {
     remove_state_file_at(&lid_watchdog_file())
 }

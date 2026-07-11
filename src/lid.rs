@@ -49,49 +49,132 @@ enum WatchdogHealth {
     Dead,
 }
 
-#[cfg(any(test, windows, target_os = "macos"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OrphanDecision {
-    None,
-    Remove,
-    Invalid,
+enum RecoverySession {
+    Missing,
+    Malformed,
+    LiveOrdinary,
+    LiveLid,
+    Stale,
 }
 
-#[cfg(any(test, windows, target_os = "macos"))]
-fn orphan_watchdog_decision(
-    state_exists: bool,
-    watchdog_live: bool,
-    owner_live: bool,
-) -> OrphanDecision {
-    match (state_exists, watchdog_live || owner_live) {
-        (false, _) => OrphanDecision::None,
-        (true, false) => OrphanDecision::Remove,
-        (true, true) => OrphanDecision::Invalid,
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryWatchdog {
+    Missing,
+    Malformed,
+    Valid {
+        watchdog_live: bool,
+        owner_live: bool,
+        owner_matches_session: bool,
+    },
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryDecision {
-    None,
+    Keep,
+    Remove,
     Restore,
-    Invalid,
+    QuiesceRestore,
+    Reject,
 }
 
-#[cfg(test)]
-fn recovery_decision(
-    session: Option<(bool, bool)>,
-    marker_exists: bool,
-    watchdog: WatchdogHealth,
+fn decide_recovery(
+    marker: bool,
+    session: RecoverySession,
+    watchdog: RecoveryWatchdog,
 ) -> RecoveryDecision {
-    match (session, marker_exists) {
-        (None, false) => RecoveryDecision::None,
-        (None, true) => RecoveryDecision::Restore,
-        (Some((true, true)), true) if watchdog == WatchdogHealth::Ready => RecoveryDecision::None,
-        (Some((true, _)), true) => RecoveryDecision::Restore,
-        (Some((false, true)), true) | (Some((true, true)), false) => RecoveryDecision::Invalid,
-        (Some(_), _) => RecoveryDecision::None,
+    use RecoveryDecision::{Keep, QuiesceRestore, Reject, Remove, Restore};
+    use RecoverySession::{LiveLid, LiveOrdinary, Malformed, Missing, Stale};
+    use RecoveryWatchdog::{Malformed as BadWatchdog, Missing as NoWatchdog, Valid};
+
+    if !marker {
+        return match (session, watchdog) {
+            (Malformed | LiveLid, _) | (_, BadWatchdog) => Reject,
+            (
+                _,
+                Valid {
+                    watchdog_live: true,
+                    ..
+                }
+                | Valid {
+                    owner_live: true, ..
+                },
+            ) => Reject,
+            (Stale, _) | (_, Valid { .. }) => Remove,
+            (Missing | LiveOrdinary, NoWatchdog) => Keep,
+        };
     }
+
+    match (session, watchdog) {
+        (_, BadWatchdog) | (LiveOrdinary, _) => Reject,
+        (
+            LiveLid | Malformed | Stale,
+            Valid {
+                watchdog_live,
+                owner_live,
+                owner_matches_session: false,
+            },
+        ) if watchdog_live || owner_live => Reject,
+        (
+            LiveLid,
+            Valid {
+                watchdog_live: true,
+                owner_matches_session: true,
+                ..
+            },
+        ) => Keep,
+        (
+            Missing | Malformed | Stale,
+            Valid {
+                watchdog_live: true,
+                ..
+            },
+        ) => QuiesceRestore,
+        (
+            _,
+            Valid {
+                owner_live: true, ..
+            },
+        )
+        | (LiveLid, _) => QuiesceRestore,
+        (Missing | Malformed | Stale, NoWatchdog | Valid { .. }) => Restore,
+    }
+}
+
+#[cfg(any(test, windows, target_os = "macos"))]
+fn finish_after_mutation(
+    primary: Result<()>,
+    restore: impl FnOnce() -> Result<()>,
+    remove_session: impl FnOnce() -> Result<()>,
+    clear_marker: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    merge_results(
+        primary,
+        finish_change(restore, remove_session, clear_marker),
+    )
+}
+
+#[cfg(any(test, windows, target_os = "macos"))]
+fn merge_results(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(AppError::fail(format!(
+            "{primary}; cleanup failed: {cleanup}"
+        ))),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[cfg(any(test, windows, target_os = "macos"))]
+fn abort_start_cleanup(
+    stop_owner: impl FnOnce() -> Result<()>,
+    wait_helper: impl FnOnce() -> Result<()>,
+    restore: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    stop_owner()?;
+    wait_helper()?;
+    restore()
 }
 
 fn watchdog_health(
@@ -163,23 +246,126 @@ pub fn launch_watchdog(saved: &Session) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        let mut child = sysutil::launch_elevated_self("__lid_watchdog__")?;
-        wait_for_child_ready(saved, Some(child.id()), || child.try_wait())
+        let mut child = match sysutil::launch_elevated_self("__lid_watchdog__") {
+            Ok(child) => child,
+            Err(error) => return abort_watchdog_start(saved, error, || Ok(())),
+        };
+        match wait_for_child_ready(saved, Some(child.id()), || child.try_wait()) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                abort_watchdog_start(saved, error, || wait_for_helper_exit(|| child.try_wait()))
+            }
+        }
     }
     #[cfg(target_os = "macos")]
     {
         let command = mac_helper_command("__lid_watchdog__")?;
-        let mut child = sysutil::spawn_detached(&command)
-            .map_err(|error| AppError::fail(format!("could not launch lid watchdog: {error}")))?;
-        wait_for_child_ready(saved, None, || {
+        let mut child = match sysutil::spawn_detached(&command) {
+            Ok(child) => child,
+            Err(error) => {
+                return abort_watchdog_start(
+                    saved,
+                    AppError::fail(format!("could not launch lid watchdog: {error}")),
+                    || Ok(()),
+                );
+            }
+        };
+        let mut status = || {
             child
                 .try_wait()
                 .map(|status| status.map(|status| status.code().unwrap_or(1) as u32))
                 .map_err(AppError::from)
-        })
+        };
+        match wait_for_child_ready(saved, None, &mut status) {
+            Ok(()) => Ok(()),
+            Err(error) => abort_watchdog_start(saved, error, || wait_for_helper_exit(&mut status)),
+        }
     }
     #[cfg(target_os = "linux")]
     Err(AppError::fail("lid watchdog is unavailable on Linux"))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn abort_watchdog_start(
+    saved: &Session,
+    error: AppError,
+    wait_helper: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let cleanup = abort_start_cleanup(
+        || stop_exact_owner(saved),
+        || {
+            wait_helper()?;
+            wait_recorded_watchdog_exit(saved)
+        },
+        || {
+            rollback_pending_marker()?;
+            finish_recovered_state(saved)
+        },
+    );
+    merge_results(Err(error), cleanup)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn wait_recorded_watchdog_exit(saved: &Session) -> Result<()> {
+    let Some(state) = session::read_watchdog()? else {
+        return Ok(());
+    };
+    if state.owner != saved.owner {
+        return Err(AppError::fail(
+            "lid watchdog state changed during startup cleanup",
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && sysutil::process_matches(&state.watchdog) {
+        sleep(Duration::from_millis(100));
+    }
+    if sysutil::process_matches(&state.watchdog) {
+        Err(AppError::fail(
+            "lid watchdog remained alive after its owner",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn wait_for_helper_exit(mut status: impl FnMut() -> Result<Option<u32>>) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if status()?.is_some() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100));
+    }
+    Err(AppError::fail(
+        "lid watchdog did not exit after startup failure",
+    ))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn stop_exact_owner(saved: &Session) -> Result<()> {
+    session::request_stop(saved)?;
+    if sysutil::process_matches(&saved.owner)
+        && !sysutil::terminate_exact(&saved.owner)
+        && sysutil::process_matches(&saved.owner)
+    {
+        Err(AppError::fail("could not stop lid session owner"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn rollback_pending_marker() -> Result<()> {
+    let Some(marker) = session::read_lid_restore()? else {
+        return Ok(());
+    };
+    let snapshot = snapshot_from_marker(&marker)?;
+    if platform::lid_is_restored(&snapshot)? {
+        session::clear_lid_restore(&marker)
+    } else {
+        restore_pending_marker()
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -268,58 +454,53 @@ pub fn run_watchdog() -> Result<()> {
         || platform::restore_lid(&snapshot),
         || session::clear_lid_restore(&marker),
     )?;
-    let state = WatchdogState {
-        owner: saved.owner.clone(),
-        watchdog: sysutil::capture_process(sysutil::current_pid())?,
-    };
-    if let Err(error) = session::write_watchdog(&state) {
-        let rollback = restore_and_clear(&marker, &snapshot);
-        return match rollback {
-            Ok(()) => Err(error),
-            Err(rollback) => Err(AppError::fail(format!(
-                "{error}; rollback failed: {rollback}"
-            ))),
-        };
-    }
-
-    let mut protection_lost = false;
-    loop {
-        #[cfg(windows)]
-        let owner_alive = owner.alive()?;
-        #[cfg(target_os = "macos")]
-        let owner_alive = sysutil::process_matches(&saved.owner);
-        if !owner_alive {
-            break;
-        }
-        if !platform::lid_override_is_active(&snapshot)? {
-            protection_lost = true;
+    let primary = (|| -> Result<()> {
+        session::write_watchdog(&WatchdogState {
+            owner: saved.owner.clone(),
+            watchdog: sysutil::capture_process(sysutil::current_pid())?,
+        })?;
+        loop {
             #[cfg(windows)]
-            owner.terminate()?;
+            let owner_alive = owner.alive()?;
             #[cfg(target_os = "macos")]
-            if !sysutil::terminate_exact(&saved.owner) {
+            let owner_alive = sysutil::process_matches(&saved.owner);
+            if !owner_alive {
+                return Ok(());
+            }
+            if !platform::lid_override_is_active(&snapshot)? {
                 return Err(AppError::fail(
-                    "lid protection was lost and the supervisor could not be stopped",
+                    "lid protection ended because the power configuration changed",
                 ));
             }
-            break;
+            sleep(Duration::from_secs(1));
         }
-        sleep(Duration::from_secs(1));
-    }
+    })();
+    let primary = if primary.is_err() {
+        #[cfg(windows)]
+        let stopped = owner
+            .alive()
+            .and_then(|alive| if alive { owner.terminate() } else { Ok(()) });
+        #[cfg(target_os = "macos")]
+        let stopped = if sysutil::process_matches(&saved.owner) {
+            stop_exact_owner(&saved)
+        } else {
+            Ok(())
+        };
+        merge_results(primary, stopped)
+    } else {
+        primary
+    };
 
-    finish_change(
+    finish_after_mutation(
+        primary,
         || platform::restore_lid(&snapshot),
         || remove_matching_session(&saved),
-        || session::clear_lid_restore(&marker),
-    )?;
-    session::clear_stop(&saved)?;
-    session::remove_watchdog_if_owner(&saved.owner)?;
-    if protection_lost {
-        Err(AppError::fail(
-            "lid protection ended because the active power configuration changed",
-        ))
-    } else {
-        Ok(())
-    }
+        || {
+            session::clear_stop(&saved)?;
+            session::remove_watchdog_if_owner(&saved.owner)?;
+            session::clear_lid_restore(&marker)
+        },
+    )
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -330,17 +511,16 @@ pub fn run_restore() -> Result<()> {
     restore_and_clear(&marker, &snapshot)
 }
 
-pub fn finish_stop(saved: &Session) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
-        if session::read_lid_restore()?.is_none() {
-            return finish_recovered_state(saved);
-        }
-        sleep(Duration::from_millis(100));
+pub fn finish_stop(_saved: &Session) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return Err(AppError::fail("unexpected Linux lid session"));
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let watchdog = session::read_watchdog()?;
+        quiesce_recovery(Some(_saved), watchdog.as_ref())?;
+        restore_pending_marker()?;
+        finish_recovered_state(_saved)
     }
-    restore_elevated()?;
-    ensure_marker_cleared()?;
-    finish_recovered_state(saved)
 }
 
 pub fn recover_foreground() -> Result<()> {
@@ -351,72 +531,122 @@ pub fn recover_foreground() -> Result<()> {
 pub fn recover_unlocked() -> Result<()> {
     let marker = session::read_lid_restore()?;
     let saved = session::read_saved_for_recovery();
-    if marker.is_none() {
-        #[cfg(any(windows, target_os = "macos"))]
-        if let Some(state) = session::read_watchdog()? {
-            match orphan_watchdog_decision(
-                true,
-                sysutil::process_matches(&state.watchdog),
-                sysutil::process_matches(&state.owner),
-            ) {
-                OrphanDecision::Remove => session::remove_watchdog_file()?,
-                OrphanDecision::Invalid => {
-                    return Err(AppError::fail(
-                        "live lid watchdog state has no restoration marker",
-                    ));
-                }
-                OrphanDecision::None => {}
+    let watchdog = session::read_watchdog();
+    let session_state = recovery_session(&saved);
+    let watchdog_state = recovery_watchdog(&saved, &watchdog);
+    let decision = decide_recovery(marker.is_some(), session_state, watchdog_state);
+    match decision {
+        RecoveryDecision::Keep => Ok(()),
+        RecoveryDecision::Reject => match (saved, watchdog) {
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            _ => Err(AppError::fail("inconsistent lid recovery state")),
+        },
+        RecoveryDecision::Remove => {
+            if session_state == RecoverySession::Stale {
+                session::remove_state_file()?;
             }
+            if matches!(watchdog_state, RecoveryWatchdog::Valid { .. }) {
+                session::remove_watchdog_file()?;
+            }
+            Ok(())
         }
-        return match saved {
-            Ok(Some(saved)) if saved.matches_live_process() && saved.spec.even_lid => Err(
-                AppError::fail("live even-lid session has no restoration marker"),
-            ),
-            Ok(Some(saved)) if !saved.matches_live_process() => session::remove_state_file(),
-            result => result.map(|_| ()),
-        };
-    }
-    #[cfg(target_os = "linux")]
-    return Err(AppError::fail(
-        "lid restoration marker found on unsupported platform",
-    ));
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        let marker = marker.expect("checked above");
-        snapshot_from_marker(&marker)?;
-        if let Ok(Some(saved)) = &saved
-            && saved.matches_live_process()
-        {
-            if !saved.spec.even_lid {
-                return Err(AppError::fail(
-                    "live ordinary session conflicts with lid restoration state",
-                ));
-            }
-            let watchdog = session::read_watchdog().ok().flatten();
-            if watchdog_health(&saved.owner, watchdog.as_ref(), sysutil::process_matches)
-                == WatchdogHealth::Ready
+        RecoveryDecision::Restore | RecoveryDecision::QuiesceRestore => {
+            #[cfg(target_os = "linux")]
+            return Err(AppError::fail(
+                "lid restoration marker found on unsupported platform",
+            ));
+            #[cfg(any(windows, target_os = "macos"))]
             {
-                return Ok(());
-            }
-            session::request_stop(saved)?;
-            if !sysutil::terminate_exact(&saved.owner) && saved.matches_live_process() {
-                return Err(AppError::fail(
-                    "could not stop unprotected even-lid supervisor",
-                ));
+                let marker = marker.expect("restore decision requires a marker");
+                snapshot_from_marker(&marker)?;
+                if decision == RecoveryDecision::QuiesceRestore {
+                    quiesce_recovery(
+                        saved.as_ref().ok().and_then(Option::as_ref),
+                        watchdog.as_ref().ok().and_then(Option::as_ref),
+                    )?;
+                }
+                restore_pending_marker()?;
+                session::remove_state_file()?;
+                session::remove_watchdog_file()?;
+                session::reconcile_stop()
             }
         }
-        restore_elevated()?;
-        ensure_marker_cleared()?;
-        session::remove_state_file()?;
-        session::remove_watchdog_file()?;
-        session::reconcile_stop()
     }
+}
+
+fn recovery_session(saved: &Result<Option<Session>>) -> RecoverySession {
+    match saved {
+        Err(_) => RecoverySession::Malformed,
+        Ok(None) => RecoverySession::Missing,
+        Ok(Some(saved)) if !saved.matches_live_process() => RecoverySession::Stale,
+        Ok(Some(saved)) if saved.spec.even_lid => RecoverySession::LiveLid,
+        Ok(Some(_)) => RecoverySession::LiveOrdinary,
+    }
+}
+
+fn recovery_watchdog(
+    saved: &Result<Option<Session>>,
+    watchdog: &Result<Option<WatchdogState>>,
+) -> RecoveryWatchdog {
+    match watchdog {
+        Err(_) => RecoveryWatchdog::Malformed,
+        Ok(None) => RecoveryWatchdog::Missing,
+        Ok(Some(state)) => RecoveryWatchdog::Valid {
+            watchdog_live: sysutil::process_matches(&state.watchdog),
+            owner_live: sysutil::process_matches(&state.owner),
+            owner_matches_session: saved
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .is_some_and(|saved| saved.owner == state.owner),
+        },
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn quiesce_recovery(saved: Option<&Session>, watchdog: Option<&WatchdogState>) -> Result<()> {
+    let owner = saved
+        .filter(|saved| saved.spec.even_lid)
+        .map(|saved| &saved.owner)
+        .or_else(|| watchdog.map(|state| &state.owner));
+    if let Some(saved) = saved.filter(|saved| saved.spec.even_lid) {
+        session::request_stop(saved)?;
+    }
+    if let Some(owner) = owner
+        && sysutil::process_matches(owner)
+        && !sysutil::terminate_exact(owner)
+        && sysutil::process_matches(owner)
+    {
+        return Err(AppError::fail("could not stop lid session owner"));
+    }
+    if let Some(state) = watchdog {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && sysutil::process_matches(&state.watchdog) {
+            sleep(Duration::from_millis(100));
+        }
+        if sysutil::process_matches(&state.watchdog) {
+            return Err(AppError::fail("lid watchdog did not exit after its owner"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn restore_pending_marker() -> Result<()> {
+    if session::read_lid_restore()?.is_none() {
+        return Ok(());
+    }
+    restore_elevated()?;
+    ensure_marker_cleared()
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 fn remove_matching_session(saved: &Session) -> Result<()> {
     match session::read_saved_for_recovery()? {
         None => Ok(()),
+        Some(actual) if actual.owner == saved.owner && actual.matches_live_process() => Err(
+            AppError::fail("lid session owner is still running after watchdog exit"),
+        ),
         Some(actual) if actual.owner == saved.owner => {
             session::remove_if_matches(saved).map(|_| ())
         }
@@ -426,6 +656,7 @@ fn remove_matching_session(saved: &Session) -> Result<()> {
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn finish_recovered_state(saved: &Session) -> Result<()> {
     session::remove_if_matches(saved)?;
     session::clear_stop(saved)?;
@@ -433,6 +664,7 @@ fn finish_recovered_state(saved: &Session) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn ensure_marker_cleared() -> Result<()> {
     if session::read_lid_restore()?.is_none() {
         Ok(())
@@ -536,11 +768,6 @@ fn mac_helper_command(action: &str) -> Result<Vec<String>> {
         sysutil::self_exe()?,
         action.into(),
     ])
-}
-
-#[cfg(target_os = "linux")]
-fn restore_elevated() -> Result<()> {
-    Err(AppError::fail("lid restoration is unavailable on Linux"))
 }
 
 #[cfg(test)]
@@ -692,74 +919,184 @@ mod tests {
     }
 
     #[test]
-    fn recovery_decision_covers_owner_and_marker_states() {
+    fn recovery_decision_covers_serialized_state_without_unsafe_guessing() {
+        use RecoveryDecision::{Keep, QuiesceRestore, Reject, Remove, Restore};
+        use RecoverySession::{LiveLid, LiveOrdinary, Malformed, Missing, Stale};
+        use RecoveryWatchdog::{Malformed as BadWatchdog, Missing as NoWatchdog, Valid};
+
         let cases = [
-            (None, false, WatchdogHealth::Missing, RecoveryDecision::None),
+            (false, Missing, NoWatchdog, Keep),
+            (false, LiveOrdinary, NoWatchdog, Keep),
+            (false, Stale, NoWatchdog, Remove),
+            (false, LiveLid, NoWatchdog, Reject),
+            (false, Malformed, NoWatchdog, Reject),
+            (false, Missing, BadWatchdog, Reject),
             (
-                Some((false, true)),
                 false,
-                WatchdogHealth::Missing,
-                RecoveryDecision::None,
+                Missing,
+                Valid {
+                    watchdog_live: true,
+                    owner_live: true,
+                    owner_matches_session: false,
+                },
+                Reject,
             ),
             (
-                Some((true, true)),
-                false,
-                WatchdogHealth::Missing,
-                RecoveryDecision::Invalid,
-            ),
-            (
-                Some((false, true)),
                 true,
-                WatchdogHealth::Missing,
-                RecoveryDecision::Invalid,
+                LiveLid,
+                Valid {
+                    watchdog_live: true,
+                    owner_live: true,
+                    owner_matches_session: true,
+                },
+                Keep,
             ),
             (
-                Some((true, true)),
                 true,
-                WatchdogHealth::Ready,
-                RecoveryDecision::None,
+                LiveLid,
+                Valid {
+                    watchdog_live: true,
+                    owner_live: true,
+                    owner_matches_session: false,
+                },
+                Reject,
+            ),
+            (true, LiveLid, NoWatchdog, QuiesceRestore),
+            (
+                true,
+                Malformed,
+                Valid {
+                    watchdog_live: true,
+                    owner_live: true,
+                    owner_matches_session: false,
+                },
+                Reject,
             ),
             (
-                Some((true, true)),
                 true,
-                WatchdogHealth::Dead,
-                RecoveryDecision::Restore,
+                Stale,
+                Valid {
+                    watchdog_live: true,
+                    owner_live: false,
+                    owner_matches_session: false,
+                },
+                Reject,
             ),
             (
-                Some((true, false)),
                 true,
-                WatchdogHealth::Missing,
-                RecoveryDecision::Restore,
+                Missing,
+                Valid {
+                    watchdog_live: true,
+                    owner_live: false,
+                    owner_matches_session: false,
+                },
+                QuiesceRestore,
             ),
             (
-                None,
                 true,
-                WatchdogHealth::Missing,
-                RecoveryDecision::Restore,
+                Malformed,
+                Valid {
+                    watchdog_live: false,
+                    owner_live: false,
+                    owner_matches_session: false,
+                },
+                Restore,
             ),
+            (true, Missing, NoWatchdog, Restore),
+            (true, LiveOrdinary, NoWatchdog, Reject),
+            (true, Missing, BadWatchdog, Reject),
         ];
-        for (session, marker, health, expected) in cases {
-            assert_eq!(recovery_decision(session, marker, health), expected);
+        for (marker, session, watchdog, expected) in cases {
+            assert_eq!(decide_recovery(marker, session, watchdog), expected);
         }
     }
 
     #[test]
-    fn orphan_watchdog_state_is_removed_only_when_both_processes_are_dead() {
-        assert_eq!(
-            orphan_watchdog_decision(false, false, false),
-            OrphanDecision::None
+    fn post_mutation_error_restores_before_cleanup_and_is_preserved() {
+        let events = RefCell::new(Vec::new());
+        let result = finish_after_mutation(
+            Err(AppError::fail("monitor failed")),
+            || {
+                events.borrow_mut().push("restore");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("session");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("marker");
+                Ok(())
+            },
         );
-        assert_eq!(
-            orphan_watchdog_decision(true, false, false),
-            OrphanDecision::Remove
+
+        assert_eq!(result.unwrap_err().message(), "monitor failed");
+        assert_eq!(*events.borrow(), ["restore", "session", "marker"]);
+    }
+
+    #[test]
+    fn post_mutation_restore_failure_retains_session_and_marker() {
+        let events = RefCell::new(Vec::new());
+        let result = finish_after_mutation(
+            Err(AppError::fail("monitor failed")),
+            || {
+                events.borrow_mut().push("restore");
+                Err(AppError::fail("restore failed"))
+            },
+            || {
+                events.borrow_mut().push("session");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("marker");
+                Ok(())
+            },
         );
-        assert_eq!(
-            orphan_watchdog_decision(true, true, false),
-            OrphanDecision::Invalid
+
+        assert!(result.unwrap_err().message().contains("restore failed"));
+        assert_eq!(*events.borrow(), ["restore"]);
+    }
+
+    #[test]
+    fn failed_helper_start_stops_owner_and_proves_exit_before_restore() {
+        let events = RefCell::new(Vec::new());
+        abort_start_cleanup(
+            || {
+                events.borrow_mut().push("stop-owner");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("wait-helper");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("restore");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), ["stop-owner", "wait-helper", "restore"]);
+    }
+
+    #[test]
+    fn failed_helper_wait_prevents_restore() {
+        let events = RefCell::new(Vec::new());
+        let result = abort_start_cleanup(
+            || {
+                events.borrow_mut().push("stop-owner");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("wait-helper");
+                Err(AppError::fail("helper still running"))
+            },
+            || {
+                events.borrow_mut().push("restore");
+                Ok(())
+            },
         );
-        assert_eq!(
-            orphan_watchdog_decision(true, false, true),
-            OrphanDecision::Invalid
-        );
+
+        assert_eq!(result.unwrap_err().message(), "helper still running");
+        assert_eq!(*events.borrow(), ["stop-owner", "wait-helper"]);
     }
 }

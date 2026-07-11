@@ -241,11 +241,6 @@ pub fn start(args: &[String]) -> Result<()> {
         && let Err(error) = lid::launch_watchdog(&saved)
     {
         stop_child(&mut child);
-        if let Err(rollback) = lid::finish_stop(&saved) {
-            return Err(AppError::fail(format!(
-                "{error}; lid rollback failed: {rollback}"
-            )));
-        }
         return Err(error);
     }
     print_start_confirmation(&saved);

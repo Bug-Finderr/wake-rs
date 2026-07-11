@@ -129,13 +129,7 @@ pub fn disable_lid(snapshot: &LidSnapshot) -> Result<()> {
     }
     write_ac(&scheme, 0)?;
     write_dc(&scheme, 0)?;
-    let active = active_scheme()?;
-    if !should_reapply(&scheme, Some(&active)) {
-        return Err(AppError::fail(
-            "active power scheme changed during the lid override",
-        ));
-    }
-    set_active(&scheme)?;
+    apply_if_active(&scheme, "lid override")?;
     verify_lid_values(&scheme, 0, 0, "enable")
 }
 
@@ -145,7 +139,7 @@ pub fn restore_lid(snapshot: &LidSnapshot) -> Result<()> {
     write_dc(&scheme, snapshot.dc_action)?;
     let active = active_scheme()?;
     if should_reapply(&scheme, Some(&active)) {
-        set_active(&scheme)?;
+        apply_if_active(&scheme, "lid restoration")?;
     }
     verify_lid_values(&scheme, snapshot.ac_action, snapshot.dc_action, "restore")
 }
@@ -252,6 +246,21 @@ fn set_active(scheme: &GUID) -> Result<()> {
     (code == ERROR_SUCCESS)
         .then_some(())
         .ok_or_else(|| power_error("could not apply lid action", code))
+}
+
+fn apply_if_active(scheme: &GUID, action: &str) -> Result<()> {
+    if !guid_eq(&active_scheme()?, scheme) {
+        return Err(AppError::fail(format!(
+            "active power scheme changed before {action}"
+        )));
+    }
+    set_active(scheme)?;
+    if !guid_eq(&active_scheme()?, scheme) {
+        return Err(AppError::fail(format!(
+            "active power scheme changed while applying {action}"
+        )));
+    }
+    Ok(())
 }
 
 fn verify_lid_values(scheme: &GUID, ac: u32, dc: u32, action: &str) -> Result<()> {

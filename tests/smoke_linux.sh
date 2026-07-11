@@ -39,6 +39,7 @@ run() {
 
 run 0 "wake "                    -- --version
 run 0 "wake --until-charge N"   -- --help
+run 0 "wake --until-charge N"   -- forever --help
 run 2 "conflicting triggers"    -- --until-charge 80 --while-pid 1
 run 2 "unknown flag"            -- --bogus
 run 2 "invalid duration"        -- 5x

@@ -51,7 +51,7 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
             }
             "status" => return commands::status(),
             "stop" => return commands::stop(),
-            "forever" | "indefinite" => return commands::start_forever(args),
+            "forever" | "indefinite" => return commands::start(args),
             _ => return commands::start(args),
         }
     }

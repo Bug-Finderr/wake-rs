@@ -32,6 +32,7 @@ try {
   Test-Wake 0 'wake '                  @('--version')
   Test-Wake 0 'wake '                  @('version')
   Test-Wake 0 'wake --until-charge N' @('--help')
+  Test-Wake 0 'wake --until-charge N' @('forever', '--help')
   Test-Wake 2 'conflicting triggers'  @('--until-charge', '80', '--while-pid', '1')
   Test-Wake 2 'unknown flag'           @('--bogus')
   Test-Wake 2 'invalid duration'       @('5x')

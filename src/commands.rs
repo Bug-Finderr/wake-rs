@@ -247,18 +247,6 @@ pub fn start(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub fn start_forever(args: &[String]) -> Result<()> {
-    if args[1..]
-        .iter()
-        .any(|arg| !matches!(arg.as_str(), "--no-display" | "--even-lid"))
-    {
-        return Err(AppError::usage(
-            "forever only accepts --no-display and --even-lid",
-        ));
-    }
-    start(&args[1..])
-}
-
 fn spawn_supervisor(spec: &RunSpec) -> Result<(Child, Session)> {
     spec.validate()?;
     let command = vec![

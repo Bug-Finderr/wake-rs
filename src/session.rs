@@ -273,8 +273,23 @@ fn write_stop_at(path: &Path, session: &Session) -> Result<()> {
     )
 }
 
+fn read_stop_at(path: &Path) -> Result<Option<StopRequest>> {
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(state_io_err(path, error)),
+    };
+    match serde_json::from_slice(&data) {
+        Ok(request) => Ok(Some(request)),
+        Err(_) => {
+            remove_state_file_at(path)?;
+            Ok(None)
+        }
+    }
+}
+
 fn stop_requested_at(path: &Path, session: &Session) -> Result<bool> {
-    let request: Option<StopRequest> = read_json(path)?;
+    let request = read_stop_at(path)?;
     Ok(request.is_some_and(|request| request.session == session.identity()))
 }
 
@@ -287,7 +302,7 @@ fn clear_stop_at(path: &Path, session: &Session) -> Result<bool> {
 }
 
 fn reconcile_stop_at(path: &Path, is_live: impl FnOnce(&ProcessRef) -> bool) -> Result<()> {
-    let Some(request) = read_json::<StopRequest>(path)? else {
+    let Some(request) = read_stop_at(path)? else {
         return Ok(());
     };
     if is_live(&request.session) {
@@ -673,8 +688,8 @@ mod tests {
         assert!(!path.exists());
 
         fs::write(&path, b"not json").unwrap();
-        assert!(stop_requested_at(&path, &expected).is_err());
-        assert!(path.exists());
+        assert!(!stop_requested_at(&path, &expected).unwrap());
+        assert!(!path.exists());
         write_stop_at(&path, &expected).unwrap();
         assert!(stop_requested_at(&path, &expected).unwrap());
     }
@@ -699,8 +714,8 @@ mod tests {
 
         let malformed = dir.join("malformed.json");
         fs::write(&malformed, b"not json").unwrap();
-        assert!(reconcile_stop_at(&malformed, |_| false).is_err());
-        assert!(malformed.exists());
+        reconcile_stop_at(&malformed, |_| false).unwrap();
+        assert!(!malformed.exists());
     }
 
     #[test]

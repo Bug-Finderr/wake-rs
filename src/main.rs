@@ -51,7 +51,6 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
             }
             "status" => return commands::status(),
             "stop" => return commands::stop(),
-            "forever" | "indefinite" => return commands::start(args),
             _ => return commands::start(args),
         }
     }
@@ -67,7 +66,7 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
 
 pub(crate) fn print_help() {
     println!(
-        r#"wake - keep your machine awake from the CLI
+        r"wake - keep your machine awake from the CLI
 
 platforms:
   macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;
@@ -103,6 +102,6 @@ exit codes:
 
 state file:
   ~/.local/state/wake/session.json (override dir with WAKE_STATE_DIR)
-  Windows: %LOCALAPPDATA%\wake\session.json"#
+  Windows: %LOCALAPPDATA%\wake\session.json"
     );
 }

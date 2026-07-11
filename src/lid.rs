@@ -160,8 +160,7 @@ fn merge_results(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
         (Err(primary), Err(cleanup)) => Err(AppError::fail(format!(
             "{primary}; cleanup failed: {cleanup}"
         ))),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
@@ -906,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_state_json_is_strict() -> Result<()> {
+    fn watchdog_state_json_is_strict() {
         let state = WatchdogState {
             owner: process(10),
             watchdog: process(20),
@@ -915,7 +914,6 @@ mod tests {
         assert_eq!(serde_json::from_str::<WatchdogState>(&json).unwrap(), state);
         let unknown = json.replacen('{', r#"{"extra":true,"#, 1);
         assert!(serde_json::from_str::<WatchdogState>(&unknown).is_err());
-        Ok(())
     }
 
     #[test]

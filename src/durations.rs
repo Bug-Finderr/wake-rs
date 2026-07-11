@@ -1,6 +1,6 @@
 use crate::error::AppError;
 
-const MAX_SECONDS: i64 = 30 * 24 * 60 * 60;
+pub(crate) const MAX_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 pub fn parse(raw: &str) -> Result<i64, AppError> {
     if raw.trim().is_empty() {

@@ -154,7 +154,9 @@ impl RunSpec {
     pub fn validate(&self) -> Result<()> {
         let valid = match &self.trigger {
             Trigger::Indefinite => true,
-            Trigger::Timed { seconds, input } => *seconds > 0 && !input.trim().is_empty(),
+            Trigger::Timed { seconds, input } => {
+                (1..=crate::durations::MAX_SECONDS).contains(seconds) && !input.trim().is_empty()
+            }
             Trigger::Until { time, .. } => !time.trim().is_empty(),
             Trigger::Pid { process } => process.is_valid(),
             Trigger::App { name, process } => !name.trim().is_empty() && process.is_valid(),
@@ -338,6 +340,10 @@ mod tests {
             Trigger::Timed {
                 seconds: 0,
                 input: " ".into(),
+            },
+            Trigger::Timed {
+                seconds: i64::MAX,
+                input: "too long".into(),
             },
             Trigger::Pid {
                 process: ProcessRef {

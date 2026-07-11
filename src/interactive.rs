@@ -2,32 +2,61 @@ use crate::commands;
 use crate::error::Result;
 use crate::session::{self, Session};
 use chrono::{Local, Utc};
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::io::{BufRead, Write};
-
-const ESC: &str = "\u{1B}";
+use crossterm::execute;
+use crossterm::style::{Attribute, Color, ContentStyle, ResetColor, StyledContent};
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use std::fmt::{Display, Write as _};
+use std::io::{BufRead, Write as _};
 
 fn style_enabled() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
+    std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM")
+            .is_ok_and(|term| !term.trim().is_empty() && !term.eq_ignore_ascii_case("dumb"))
+}
+
+#[derive(Clone, Copy)]
+struct Theme(bool);
+
+impl Theme {
+    fn current() -> Self {
+        Self(style_enabled())
     }
-    match std::env::var("TERM") {
-        Ok(t) => !t.trim().is_empty() && !t.eq_ignore_ascii_case("dumb"),
-        Err(_) => false,
+
+    fn paint<D: Display>(
+        self,
+        content: D,
+        color: Option<u8>,
+        attribute: Option<Attribute>,
+    ) -> StyledContent<D> {
+        let mut style = ContentStyle::new();
+        if self.0 {
+            style.foreground_color = color.map(Color::AnsiValue);
+            if let Some(attribute) = attribute {
+                style.attributes.set(attribute);
+            }
+        }
+        style.apply(content)
+    }
+
+    fn color<D: Display>(self, content: D, color: u8) -> StyledContent<D> {
+        self.paint(content, Some(color), None)
+    }
+
+    fn bold<D: Display>(self, content: D, color: u8) -> StyledContent<D> {
+        self.paint(content, Some(color), Some(Attribute::Bold))
+    }
+
+    fn dim<D: Display>(self, content: D) -> StyledContent<D> {
+        self.paint(content, None, Some(Attribute::Dim))
     }
 }
 
-fn style(code: &str) -> String {
-    if style_enabled() {
-        format!("{ESC}{code}")
-    } else {
-        String::new()
-    }
-}
-
+#[derive(Clone, Copy)]
 enum Action {
-    Noop,
     ToggleDetail,
     Quit,
     Stop,
@@ -36,36 +65,71 @@ enum Action {
 }
 
 struct Item {
-    label: String,
-    hint: String,
-    action: Action,
-    separator: bool,
-    exit_after: bool,
+    label: &'static str,
+    hint: &'static str,
+    action: Option<Action>,
 }
 
 impl Item {
-    fn new(label: &str, hint: &str, action: Action, exit_after: bool) -> Self {
-        Item {
-            label: label.into(),
-            hint: hint.into(),
-            action,
-            separator: false,
-            exit_after,
+    const fn new(label: &'static str, hint: &'static str, action: Action) -> Self {
+        Self {
+            label,
+            hint,
+            action: Some(action),
         }
     }
-    fn sep() -> Self {
-        Item {
-            label: String::new(),
-            hint: String::new(),
-            action: Action::Noop,
-            separator: true,
-            exit_after: false,
+
+    const fn separator() -> Self {
+        Self {
+            label: "",
+            hint: "",
+            action: None,
         }
     }
 }
 
 pub fn run() -> Result<()> {
-    Picker::default().loop_()
+    let Some((action, no_display)) = Picker::default().pick()? else {
+        return Ok(());
+    };
+    run_action(action, no_display)
+}
+
+#[derive(Default)]
+struct Terminal {
+    active: bool,
+    raw: bool,
+}
+
+impl Terminal {
+    fn enter() -> Self {
+        let terminal = Self {
+            active: true,
+            raw: enable_raw_mode().is_ok(),
+        };
+        execute!(std::io::stdout(), EnterAlternateScreen, Hide).ok();
+        terminal
+    }
+
+    fn leave(&mut self) {
+        self.leave_to(&mut std::io::stdout());
+    }
+
+    fn leave_to(&mut self, output: &mut impl std::io::Write) {
+        if !std::mem::take(&mut self.active) {
+            return;
+        }
+        execute!(output, Show, LeaveAlternateScreen, ResetColor).ok();
+        if std::mem::take(&mut self.raw) {
+            disable_raw_mode().ok();
+        }
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        self.leave();
+    }
 }
 
 #[derive(Default)]
@@ -73,349 +137,260 @@ struct Picker {
     no_display: bool,
     show_detail: bool,
     selected: usize,
-    raw: bool,
-}
-
-impl Drop for Picker {
-    fn drop(&mut self) {
-        self.cleanup();
-    }
 }
 
 impl Picker {
-    fn loop_(&mut self) -> Result<()> {
-        enable_raw_mode().ok();
-        self.raw = true;
-        print!("{}{}", alt_on(), hide_cursor());
-        std::io::stdout().flush().ok();
-
+    fn pick(&mut self) -> Result<Option<(Action, bool)>> {
+        let _terminal = Terminal::enter();
         let existing = session::read_if_alive()?;
-        let items = build_menu(&existing);
-        self.selected = items.iter().position(|i| !i.separator).unwrap_or(0);
+        let items = build_menu(existing.is_some());
+        self.selected = items
+            .iter()
+            .position(|item| item.action.is_some())
+            .unwrap_or(0);
 
         loop {
             self.render(&items, &existing);
-            match self.read_key()? {
-                Key::Up => self.selected = prev(&items, self.selected),
-                Key::Down => self.selected = next(&items, self.selected),
-                Key::Toggle if existing.is_none() => self.no_display = !self.no_display,
-                Key::Quit => {
-                    self.cleanup();
-                    return Ok(());
+            let key = read_key()?;
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.selected = prev(&items, self.selected);
                 }
-                Key::Enter => {
-                    let it = &items[self.selected];
-                    if it.separator {
-                        continue;
-                    }
-                    if it.exit_after {
-                        self.cleanup();
-                        return self.run_action(&it.action);
-                    }
-                    if let Action::ToggleDetail = it.action {
-                        self.show_detail = !self.show_detail;
-                    }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.selected = next(&items, self.selected);
                 }
+                KeyCode::Char('d' | 'D') if existing.is_none() => {
+                    self.no_display = !self.no_display;
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(None);
+                }
+                KeyCode::Char('q' | 'Q') | KeyCode::Esc => return Ok(None),
+                KeyCode::Enter => match items[self.selected].action {
+                    Some(Action::ToggleDetail) => self.show_detail = !self.show_detail,
+                    Some(Action::Quit) => return Ok(None),
+                    Some(action) => return Ok(Some((action, self.no_display))),
+                    None => {}
+                },
                 _ => {}
             }
         }
     }
 
-    fn run_action(&self, action: &Action) -> Result<()> {
-        match action {
-            Action::Stop => commands::stop(),
-            Action::StartIndefinite => self.start_indefinite(),
-            Action::Ask(prompt, flag) => self.ask_and_start(prompt, *flag),
-            _ => Ok(()),
-        }
-    }
-
-    fn start_indefinite(&self) -> Result<()> {
-        if crate::platform::supports_even_lid()
-            && ask_yes_no("Keep awake with the lid closed too? (needs sudo)")
-        {
-            commands::start(&self.build_args(&["--even-lid"]))
-        } else {
-            commands::start(&self.build_args(&[]))
-        }
-    }
-
-    fn ask_and_start(&self, prompt: &str, flag: Option<&str>) -> Result<()> {
-        let Some(v) = read_line(prompt) else {
-            println!("wake: cancelled");
-            return Ok(());
-        };
-        let v = v.trim().to_string();
-        if v.is_empty() {
-            println!("wake: cancelled");
-            return Ok(());
-        }
-        match flag {
-            None => commands::start(&self.build_args(&[&v])),
-            Some(f) => commands::start(&self.build_args(&[f, &v])),
-        }
-    }
-
-    fn build_args(&self, parts: &[&str]) -> Vec<String> {
-        let mut out = Vec::new();
-        if self.no_display {
-            out.push("--no-display".to_string());
-        }
-        out.extend(parts.iter().map(|s| s.to_string()));
-        out
-    }
-
     fn render(&self, items: &[Item], existing: &Option<Session>) {
         let mut sb = String::with_capacity(2048);
-        sb.push_str(&clear());
-        sb.push_str(&home());
+        let theme = Theme::current();
+        writeln!(sb, "{}{}", Clear(ClearType::All), MoveTo(0, 0)).ok();
+        writeln!(
+            sb,
+            "  {}  {}",
+            theme.bold("☕ wake", 87),
+            theme.dim("- keep your machine awake")
+        )
+        .ok();
         sb.push('\n');
-        sb.push_str(&format!("  {}{}☕ wake{}", bold(), fg_cyan(), reset()));
-        sb.push_str(&format!(
-            "  {}- keep your machine awake{}\n\n",
-            dim(),
-            reset()
-        ));
 
-        if let Some(s) = existing {
-            sb.push_str(&format!(
-                "  {}● active{}   {} {}",
-                fg_yellow(),
-                reset(),
-                s.spec.trigger.label(),
-                s.spec.trigger.detail()
-            ));
-            if let Some(end) = s.ends_at {
-                let rem = (end - Utc::now()).num_seconds().max(0);
-                sb.push_str(&format!(
-                    "   {}({} left){}",
-                    dim(),
-                    commands::pretty_duration(rem),
-                    reset()
-                ));
+        if let Some(session) = existing {
+            let now = Utc::now();
+            write!(
+                sb,
+                "  {}   {} {}",
+                theme.color("● active", 220),
+                session.spec.trigger.label(),
+                session.spec.trigger.detail()
+            )
+            .ok();
+            if let Some(end) = session.ends_at {
+                let remaining = commands::pretty_duration((end - now).num_seconds().max(0));
+                write!(sb, "   {}", theme.dim(format!("({remaining} left)"))).ok();
             }
             sb.push('\n');
             if self.show_detail {
-                append_detail(&mut sb, s);
+                append_detail(&mut sb, session, now);
             }
             sb.push('\n');
         } else {
-            sb.push_str(&format!(
-                "  {}○ no active session{}\n\n",
-                fg_grey(),
-                reset()
-            ));
+            writeln!(sb, "  {}\n", theme.color("○ no active session", 245)).ok();
         }
 
-        for (i, it) in items.iter().enumerate() {
-            if it.separator {
-                sb.push_str(&format!(
-                    "    {}─────────────────────────{}\n",
-                    dim(),
-                    reset()
-                ));
-                continue;
-            }
-            if i == self.selected {
-                sb.push_str(&format!(
-                    "  {}▸ {}{}{}",
-                    fg_pink(),
-                    bold(),
-                    it.label,
-                    reset()
-                ));
-                if !it.hint.is_empty() {
-                    sb.push_str(&format!("   {}{}{}", dim(), it.hint, reset()));
+        for (index, item) in items.iter().enumerate() {
+            if item.action.is_none() {
+                writeln!(sb, "    {}", theme.dim("─────────────────────────")).ok();
+            } else if index == self.selected {
+                write!(sb, "  {}", theme.bold(format!("▸ {}", item.label), 213)).ok();
+                if !item.hint.is_empty() {
+                    write!(sb, "   {}", theme.dim(item.hint)).ok();
                 }
+                sb.push('\n');
             } else {
-                sb.push_str(&format!("    {}", it.label));
+                writeln!(sb, "    {}", item.label).ok();
             }
-            sb.push('\n');
         }
 
-        sb.push_str(&format!("\n  {}↑↓/jk navigate · ↵ select", dim()));
+        let mut footer = "↑↓/jk navigate · ↵ select".to_string();
         if existing.is_none() {
-            sb.push_str(&format!(
+            write!(
+                footer,
                 " · d display-sleep [{}]",
                 if self.no_display { "ON" } else { "off" }
-            ));
+            )
+            .ok();
         }
-        sb.push_str(&format!(" · q quit{}\n", reset()));
+        footer.push_str(" · q quit");
+        writeln!(sb, "\n  {}", theme.dim(footer)).ok();
 
         print!("{sb}");
         std::io::stdout().flush().ok();
     }
+}
 
-    fn read_key(&self) -> Result<Key> {
-        loop {
-            match event::read().map_err(|e| crate::error::AppError::fail(e.to_string()))? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    return Ok(match k.code {
-                        KeyCode::Up => Key::Up,
-                        KeyCode::Down => Key::Down,
-                        KeyCode::Char('k') => Key::Up,
-                        KeyCode::Char('j') => Key::Down,
-                        KeyCode::Char('d') | KeyCode::Char('D') => Key::Toggle,
-                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            Key::Quit
-                        }
-                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Key::Quit,
-                        KeyCode::Enter => Key::Enter,
-                        _ => Key::Other,
-                    });
-                }
-                _ => continue,
-            }
-        }
-    }
-
-    fn cleanup(&mut self) {
-        print!("{}{}{}", show_cursor(), alt_off(), reset());
-        std::io::stdout().flush().ok();
-        if self.raw {
-            disable_raw_mode().ok();
-            self.raw = false;
+fn read_key() -> Result<crossterm::event::KeyEvent> {
+    loop {
+        if let Event::Key(key) =
+            event::read().map_err(|error| crate::error::AppError::fail(error.to_string()))?
+            && key.kind == KeyEventKind::Press
+        {
+            return Ok(key);
         }
     }
 }
 
-enum Key {
-    Up,
-    Down,
-    Toggle,
-    Quit,
-    Enter,
-    Other,
+fn run_action(action: Action, no_display: bool) -> Result<()> {
+    match action {
+        Action::Stop => commands::stop(),
+        Action::StartIndefinite => start_indefinite(no_display),
+        Action::Ask(prompt, flag) => ask_and_start(no_display, prompt, flag),
+        Action::ToggleDetail | Action::Quit => Ok(()),
+    }
 }
 
-fn build_menu(existing: &Option<Session>) -> Vec<Item> {
-    let mut items = Vec::new();
-    if existing.is_some() {
-        items.push(Item::new(
-            "Show status",
-            "view session details",
-            Action::ToggleDetail,
-            false,
-        ));
-        items.push(Item::new(
-            "Stop session",
-            "end the active session",
-            Action::Stop,
-            true,
-        ));
+fn start_indefinite(no_display: bool) -> Result<()> {
+    let even_lid = crate::platform::supports_even_lid()
+        && ask_yes_no("Keep awake with the lid closed too? (needs sudo)");
+    commands::start(&start_args(
+        no_display,
+        if even_lid { &["--even-lid"] } else { &[] },
+    ))
+}
+
+fn ask_and_start(no_display: bool, prompt: &str, flag: Option<&str>) -> Result<()> {
+    let Some(value) = read_line(prompt) else {
+        println!("wake: cancelled");
+        return Ok(());
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        println!("wake: cancelled");
+        return Ok(());
+    }
+    match flag {
+        Some(flag) => commands::start(&start_args(no_display, &[flag, value])),
+        None => commands::start(&start_args(no_display, &[value])),
+    }
+}
+
+fn start_args(no_display: bool, parts: &[&str]) -> Vec<String> {
+    let mut args = Vec::with_capacity(parts.len() + usize::from(no_display));
+    if no_display {
+        args.push("--no-display".to_string());
+    }
+    args.extend(parts.iter().map(|part| (*part).to_string()));
+    args
+}
+
+fn build_menu(active: bool) -> Vec<Item> {
+    let mut items = if active {
+        vec![
+            Item::new("Show status", "view session details", Action::ToggleDetail),
+            Item::new("Stop session", "end the active session", Action::Stop),
+        ]
     } else {
-        items.push(Item::new(
-            "Indefinite",
-            "stay awake forever",
-            Action::StartIndefinite,
-            true,
-        ));
-        items.push(Item::new(
-            "For a duration…",
-            "1h, 30m, 1h30m, 90s",
-            Action::Ask("Duration (e.g. 1h30m, 90s)", None),
-            true,
-        ));
-        items.push(Item::new(
-            "Until clock time…",
-            "stay awake until HH:MM",
-            Action::Ask("Until clock time (HH:MM)", Some("--until")),
-            true,
-        ));
-        items.push(Item::new(
-            "Until battery %…",
-            "until charge hits N%",
-            Action::Ask("Target battery percent (1-100)", Some("--until-charge")),
-            true,
-        ));
-        items.push(Item::new(
-            "While app running…",
-            "watch a running app/process",
-            Action::Ask("App/process name", Some("--while-app")),
-            true,
-        ));
-        items.push(Item::new(
-            "While PID alive…",
-            "watch a specific process id",
-            Action::Ask("PID to watch", Some("--while-pid")),
-            true,
-        ));
-    }
-    items.push(Item::sep());
-    items.push(Item::new(
-        "Quit",
-        "exit without changes",
-        Action::Quit,
-        true,
-    ));
+        vec![
+            Item::new("Indefinite", "stay awake forever", Action::StartIndefinite),
+            Item::new(
+                "For a duration…",
+                "1h, 30m, 1h30m, 90s",
+                Action::Ask("Duration (e.g. 1h30m, 90s)", None),
+            ),
+            Item::new(
+                "Until clock time…",
+                "stay awake until HH:MM",
+                Action::Ask("Until clock time (HH:MM)", Some("--until")),
+            ),
+            Item::new(
+                "Until battery %…",
+                "until charge hits N%",
+                Action::Ask("Target battery percent (1-100)", Some("--until-charge")),
+            ),
+            Item::new(
+                "While app running…",
+                "watch a running app/process",
+                Action::Ask("App/process name", Some("--while-app")),
+            ),
+            Item::new(
+                "While PID alive…",
+                "watch a specific process id",
+                Action::Ask("PID to watch", Some("--while-pid")),
+            ),
+        ]
+    };
+    items.extend([
+        Item::separator(),
+        Item::new("Quit", "exit without changes", Action::Quit),
+    ]);
     items
 }
 
 fn next(items: &[Item], cur: usize) -> usize {
-    let n = items.len();
-    for step in 1..=n {
-        let idx = (cur + step) % n;
-        if !items[idx].separator {
-            return idx;
-        }
-    }
-    cur
+    adjacent(items, cur, 1)
 }
 
 fn prev(items: &[Item], cur: usize) -> usize {
-    let n = items.len();
-    for step in 1..=n {
-        let idx = (cur + n - (step % n)) % n;
-        if !items[idx].separator {
-            return idx;
-        }
-    }
-    cur
+    adjacent(items, cur, -1)
 }
 
-fn append_detail(sb: &mut String, s: &Session) {
-    let now = Utc::now();
+fn adjacent(items: &[Item], current: usize, direction: isize) -> usize {
+    let len = items.len() as isize;
+    (1..=len)
+        .map(|step| (current as isize + direction * step).rem_euclid(len) as usize)
+        .find(|&index| items[index].action.is_some())
+        .unwrap_or(current)
+}
+
+fn append_detail(sb: &mut String, s: &Session, now: chrono::DateTime<Utc>) {
     let started = s.started_at;
     let elapsed = (now - started).num_seconds();
     let remaining = match s.ends_at {
         None => "-".to_string(),
         Some(e) => commands::pretty_duration((e - now).num_seconds().max(0)),
     };
-    sb.push_str(&format!("    mode      : {}\n", s.spec.mode.label()));
-    sb.push_str(&format!(
-        "    trigger   : {} ({})\n",
+    writeln!(sb, "    mode      : {}", s.spec.mode.label()).ok();
+    writeln!(
+        sb,
+        "    trigger   : {} ({})",
         s.spec.trigger.label(),
         s.spec.trigger.detail()
-    ));
-    sb.push_str(&format!(
-        "    started   : {} ({} ago)\n",
+    )
+    .ok();
+    writeln!(
+        sb,
+        "    started   : {} ({} ago)",
         started.with_timezone(&Local).format("%H:%M:%S"),
         commands::pretty_duration(elapsed)
-    ));
-    sb.push_str(&format!("    remaining : {remaining}\n"));
+    )
+    .ok();
+    writeln!(sb, "    remaining : {remaining}").ok();
 }
 
 fn ask_yes_no(prompt: &str) -> bool {
-    print!(
-        "\n  {}{}{} {}[y/N]{} ",
-        fg_cyan(),
-        prompt,
-        reset(),
-        dim(),
-        reset()
-    );
+    let theme = Theme::current();
+    print!("\n  {} {} ", theme.color(prompt, 87), theme.dim("[y/N]"));
     std::io::stdout().flush().ok();
-    match read_stdin_line() {
-        Some(answer) => {
-            let a = answer.trim();
-            matches!(a.chars().next(), Some('y') | Some('Y'))
-        }
-        None => false,
-    }
+    read_stdin_line().is_some_and(|answer| matches!(answer.trim().chars().next(), Some('y' | 'Y')))
 }
 
 fn read_line(prompt: &str) -> Option<String> {
-    print!("\n  {}{}:{} ", fg_cyan(), prompt, reset());
+    print!("\n  {} ", Theme::current().color(format!("{prompt}:"), 87));
     std::io::stdout().flush().ok();
     read_stdin_line()
 }
@@ -428,43 +403,67 @@ fn read_stdin_line() -> Option<String> {
     }
 }
 
-// Compute styles at use time so runtime environment changes are honored.
-fn alt_on() -> String {
-    format!("{ESC}[?1049h")
-}
-fn alt_off() -> String {
-    format!("{ESC}[?1049l")
-}
-fn clear() -> String {
-    format!("{ESC}[2J")
-}
-fn home() -> String {
-    format!("{ESC}[H")
-}
-fn hide_cursor() -> String {
-    format!("{ESC}[?25l")
-}
-fn show_cursor() -> String {
-    format!("{ESC}[?25h")
-}
-fn reset() -> String {
-    style("[0m")
-}
-fn bold() -> String {
-    style("[1m")
-}
-fn dim() -> String {
-    style("[2m")
-}
-fn fg_cyan() -> String {
-    style("[38;5;87m")
-}
-fn fg_yellow() -> String {
-    style("[38;5;220m")
-}
-fn fg_grey() -> String {
-    style("[38;5;245m")
-}
-fn fg_pink() -> String {
-    style("[38;5;213m")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_restore_is_idempotent() {
+        let mut terminal = Terminal {
+            active: true,
+            raw: false,
+        };
+        let mut output = Vec::new();
+
+        terminal.leave_to(&mut output);
+        let restored = output.clone();
+        terminal.leave_to(&mut output);
+
+        assert!(!restored.is_empty());
+        assert_eq!(output, restored);
+    }
+
+    #[test]
+    fn menus_keep_every_user_action() {
+        let labels = |active| {
+            build_menu(active)
+                .into_iter()
+                .filter(|item| item.action.is_some())
+                .map(|item| item.label)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(labels(true), ["Show status", "Stop session", "Quit"]);
+        assert_eq!(
+            labels(false),
+            [
+                "Indefinite",
+                "For a duration…",
+                "Until clock time…",
+                "Until battery %…",
+                "While app running…",
+                "While PID alive…",
+                "Quit",
+            ]
+        );
+    }
+
+    #[test]
+    fn display_sleep_flag_precedes_action_arguments() {
+        assert_eq!(
+            start_args(true, &["--until", "12:30"]),
+            ["--no-display", "--until", "12:30"]
+        );
+        assert_eq!(start_args(false, &["1h"]), ["1h"]);
+    }
+
+    #[test]
+    fn navigation_skips_separator_and_wraps() {
+        let items = build_menu(true);
+
+        assert_eq!(next(&items, 1), 3);
+        assert_eq!(next(&items, 3), 0);
+        assert_eq!(prev(&items, 0), 3);
+        assert_eq!(prev(&items, 3), 1);
+    }
 }

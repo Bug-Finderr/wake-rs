@@ -78,6 +78,7 @@ pub struct Session {
 pub struct WatchdogState {
     pub owner: ProcessRef,
     pub watchdog: ProcessRef,
+    pub ready: bool,
 }
 
 impl WatchdogState {
@@ -361,7 +362,9 @@ fn write_watchdog_at(path: &Path, state: &WatchdogState) -> Result<()> {
         return Err(AppError::fail("invalid lid watchdog state"));
     }
     if let Some(saved) = read_watchdog_at(path)?
-        && saved != *state
+        && (saved.owner != state.owner
+            || saved.watchdog != state.watchdog
+            || (saved.ready && !state.ready))
     {
         return Err(AppError::fail(format!(
             "unresolved lid watchdog state already exists at {}",
@@ -681,10 +684,18 @@ mod tests {
                 start: 1_700_000_100,
                 command: "/usr/bin/wake".into(),
             },
+            ready: false,
         };
 
         write_watchdog_at(&path, &state).unwrap();
         assert_eq!(read_watchdog_at(&path).unwrap(), Some(state.clone()));
+        let ready = WatchdogState {
+            ready: true,
+            ..state.clone()
+        };
+        write_watchdog_at(&path, &ready).unwrap();
+        assert_eq!(read_watchdog_at(&path).unwrap(), Some(ready));
+        assert!(write_watchdog_at(&path, &state).is_err());
         assert!(
             !remove_watchdog_if_owner_at(
                 &path,
@@ -721,6 +732,7 @@ mod tests {
                 start: 1_700_000_100,
                 command: "/usr/bin/wake".into(),
             },
+            ready: false,
         };
         write_watchdog_at(&path, &first).unwrap();
         first.owner.pid += 1;

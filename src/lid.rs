@@ -13,16 +13,21 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(test, windows, target_os = "macos"))]
 fn begin_change(
-    write_marker: impl FnOnce() -> Result<()>,
+    publish_watchdog: impl FnOnce() -> Result<()>,
     mutate: impl FnOnce() -> Result<()>,
+    publish_ready: impl FnOnce() -> Result<()>,
     restore: impl FnOnce() -> Result<()>,
     clear_marker: impl FnOnce() -> Result<()>,
+    clear_watchdog: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    write_marker()?;
-    let Err(change_error) = mutate() else {
+    publish_watchdog()?;
+    let Err(change_error) = mutate().and_then(|()| publish_ready()) else {
         return Ok(());
     };
-    match restore().and_then(|()| clear_marker()) {
+    match restore()
+        .and_then(|()| clear_marker())
+        .and_then(|()| clear_watchdog())
+    {
         Ok(()) => Err(change_error),
         Err(rollback_error) => Err(AppError::fail(format!(
             "{change_error}; rollback failed: {rollback_error}"
@@ -34,16 +39,21 @@ fn begin_change(
 fn finish_change(
     restore: impl FnOnce() -> Result<()>,
     remove_session: impl FnOnce() -> Result<()>,
+    clear_stop: impl FnOnce() -> Result<()>,
     clear_marker: impl FnOnce() -> Result<()>,
+    clear_watchdog: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     restore()?;
     remove_session()?;
-    clear_marker()
+    clear_stop()?;
+    clear_marker()?;
+    clear_watchdog()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WatchdogHealth {
     Ready,
+    Starting,
     Missing,
     Mismatch,
     Dead,
@@ -146,11 +156,19 @@ fn finish_after_mutation(
     primary: Result<()>,
     restore: impl FnOnce() -> Result<()>,
     remove_session: impl FnOnce() -> Result<()>,
+    clear_stop: impl FnOnce() -> Result<()>,
     clear_marker: impl FnOnce() -> Result<()>,
+    clear_watchdog: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     merge_results(
         primary,
-        finish_change(restore, remove_session, clear_marker),
+        finish_change(
+            restore,
+            remove_session,
+            clear_stop,
+            clear_marker,
+            clear_watchdog,
+        ),
     )
 }
 
@@ -186,10 +204,12 @@ fn watchdog_health(
     };
     if &state.owner != owner {
         WatchdogHealth::Mismatch
-    } else if is_live(&state.watchdog) {
+    } else if !is_live(&state.watchdog) {
+        WatchdogHealth::Dead
+    } else if state.ready {
         WatchdogHealth::Ready
     } else {
-        WatchdogHealth::Dead
+        WatchdogHealth::Starting
     }
 }
 
@@ -404,6 +424,9 @@ fn ready_state(saved: &Session, expected_pid: Option<u32>) -> Result<Option<Watc
     if !sysutil::process_matches(&state.watchdog) {
         return Err(AppError::fail("lid watchdog exited during startup"));
     }
+    if !state.ready {
+        return Ok(None);
+    }
     Ok(Some(state))
 }
 
@@ -446,18 +469,25 @@ pub fn run_watchdog() -> Result<()> {
     let snapshot = snapshot_from_marker(&marker)?;
     #[cfg(windows)]
     let owner = sysutil::OwnerHandle::open(&saved.owner)?;
+    let starting = WatchdogState {
+        owner: saved.owner.clone(),
+        watchdog: sysutil::capture_process(sysutil::current_pid())?,
+        ready: false,
+    };
+    let ready = WatchdogState {
+        ready: true,
+        ..starting.clone()
+    };
 
     begin_change(
-        || session::write_lid_restore(&marker),
+        || session::write_watchdog(&starting),
         || platform::disable_lid(&snapshot),
+        || session::write_watchdog(&ready),
         || platform::restore_lid(&snapshot),
         || session::clear_lid_restore(&marker),
+        || session::remove_watchdog_if_owner(&saved.owner).map(|_| ()),
     )?;
     let primary = (|| -> Result<()> {
-        session::write_watchdog(&WatchdogState {
-            owner: saved.owner.clone(),
-            watchdog: sysutil::capture_process(sysutil::current_pid())?,
-        })?;
         loop {
             #[cfg(windows)]
             let owner_alive = owner.alive()?;
@@ -494,10 +524,11 @@ pub fn run_watchdog() -> Result<()> {
         primary,
         || platform::restore_lid(&snapshot),
         || remove_matching_session(&saved),
+        || session::clear_stop(&saved).map(|_| ()),
+        || session::clear_lid_restore(&marker),
         || {
-            session::clear_stop(&saved)?;
             session::remove_watchdog_if_owner(&saved.owner)?;
-            session::clear_lid_restore(&marker)
+            Ok(())
         },
     )
 }
@@ -783,76 +814,125 @@ mod tests {
     }
 
     #[test]
-    fn startup_records_marker_before_mutation() {
+    fn startup_publishes_watchdog_before_mutation_and_readiness() {
         let events = RefCell::new(Vec::new());
         begin_change(
             || {
-                events.borrow_mut().push("marker");
+                events.borrow_mut().push("watchdog");
                 Ok(())
             },
             || {
                 events.borrow_mut().push("mutate");
                 Ok(())
             },
+            || {
+                events.borrow_mut().push("ready");
+                Ok(())
+            },
+            || Ok(()),
             || Ok(()),
             || Ok(()),
         )
         .unwrap();
 
-        assert_eq!(*events.borrow(), ["marker", "mutate"]);
+        assert_eq!(*events.borrow(), ["watchdog", "mutate", "ready"]);
     }
 
     #[test]
-    fn startup_failure_restores_before_clearing_marker() {
+    fn startup_failure_restores_then_clears_marker_and_watchdog() {
         let events = RefCell::new(Vec::new());
         let result = begin_change(
             || {
-                events.borrow_mut().push("marker");
+                events.borrow_mut().push("watchdog");
                 Ok(())
             },
             || {
                 events.borrow_mut().push("mutate");
                 Err(AppError::fail("change failed"))
             },
+            || Ok(()),
             || {
                 events.borrow_mut().push("restore");
                 Ok(())
             },
             || {
-                events.borrow_mut().push("clear");
+                events.borrow_mut().push("marker");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("watchdog-clear");
                 Ok(())
             },
         );
 
         assert_eq!(result.unwrap_err().message(), "change failed");
-        assert_eq!(*events.borrow(), ["marker", "mutate", "restore", "clear"]);
+        assert_eq!(
+            *events.borrow(),
+            ["watchdog", "mutate", "restore", "marker", "watchdog-clear"]
+        );
     }
 
     #[test]
-    fn failed_restore_retains_marker() {
+    fn readiness_publication_failure_rolls_back_the_mutation() {
         let events = RefCell::new(Vec::new());
         let result = begin_change(
+            || Ok(()),
+            || {
+                events.borrow_mut().push("mutate");
+                Ok(())
+            },
+            || Err(AppError::fail("ready failed")),
+            || {
+                events.borrow_mut().push("restore");
+                Ok(())
+            },
             || {
                 events.borrow_mut().push("marker");
                 Ok(())
             },
+            || {
+                events.borrow_mut().push("watchdog");
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err().message(), "ready failed");
+        assert_eq!(
+            *events.borrow(),
+            ["mutate", "restore", "marker", "watchdog"]
+        );
+    }
+
+    #[test]
+    fn failed_restore_retains_marker_and_watchdog() {
+        let events = RefCell::new(Vec::new());
+        let result = begin_change(
+            || {
+                events.borrow_mut().push("watchdog");
+                Ok(())
+            },
             || Err(AppError::fail("change failed")),
+            || Ok(()),
             || {
                 events.borrow_mut().push("restore");
                 Err(AppError::fail("restore failed"))
             },
             || {
-                events.borrow_mut().push("clear");
+                events.borrow_mut().push("marker");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("watchdog-clear");
                 Ok(())
             },
         );
 
         assert!(result.unwrap_err().message().contains("restore failed"));
-        assert_eq!(*events.borrow(), ["marker", "restore"]);
+        assert_eq!(*events.borrow(), ["watchdog", "restore"]);
     }
 
     #[test]
-    fn natural_cleanup_restores_then_removes_session_then_marker() {
+    fn natural_cleanup_keeps_watchdog_recorded_until_marker_is_clear() {
         let events = RefCell::new(Vec::new());
         finish_change(
             || {
@@ -864,13 +944,24 @@ mod tests {
                 Ok(())
             },
             || {
+                events.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
                 events.borrow_mut().push("marker");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("watchdog");
                 Ok(())
             },
         )
         .unwrap();
 
-        assert_eq!(*events.borrow(), ["restore", "session", "marker"]);
+        assert_eq!(
+            *events.borrow(),
+            ["restore", "session", "stop", "marker", "watchdog"]
+        );
     }
 
     #[test]
@@ -880,10 +971,16 @@ mod tests {
         let ready = WatchdogState {
             owner: owner.clone(),
             watchdog: watchdog.clone(),
+            ready: true,
+        };
+        let starting = WatchdogState {
+            ready: false,
+            ..ready.clone()
         };
         let wrong = WatchdogState {
             owner: process(11),
             watchdog: watchdog.clone(),
+            ready: true,
         };
 
         assert_eq!(
@@ -899,6 +996,10 @@ mod tests {
             WatchdogHealth::Mismatch
         );
         assert_eq!(
+            watchdog_health(&owner, Some(&starting), |_| true),
+            WatchdogHealth::Starting
+        );
+        assert_eq!(
             watchdog_health(&owner, Some(&ready), |_| false),
             WatchdogHealth::Dead
         );
@@ -909,6 +1010,7 @@ mod tests {
         let state = WatchdogState {
             owner: process(10),
             watchdog: process(20),
+            ready: true,
         };
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(serde_json::from_str::<WatchdogState>(&json).unwrap(), state);
@@ -1023,13 +1125,24 @@ mod tests {
                 Ok(())
             },
             || {
+                events.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
                 events.borrow_mut().push("marker");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("watchdog");
                 Ok(())
             },
         );
 
         assert_eq!(result.unwrap_err().message(), "monitor failed");
-        assert_eq!(*events.borrow(), ["restore", "session", "marker"]);
+        assert_eq!(
+            *events.borrow(),
+            ["restore", "session", "stop", "marker", "watchdog"]
+        );
     }
 
     #[test]
@@ -1045,10 +1158,12 @@ mod tests {
                 events.borrow_mut().push("session");
                 Ok(())
             },
+            || Ok(()),
             || {
                 events.borrow_mut().push("marker");
                 Ok(())
             },
+            || Ok(()),
         );
 
         assert!(result.unwrap_err().message().contains("restore failed"));

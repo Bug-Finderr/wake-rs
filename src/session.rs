@@ -176,7 +176,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .map_err(|error| AppError::fail(format!("could not encode {}: {error}", path.display())))?;
     let tmp = path.with_extension("json.tmp");
     let result = (|| {
-        let mut file = File::create(&tmp).map_err(|error| state_io_err(&tmp, error))?;
+        let mut file = create_temp(&tmp).map_err(|error| state_io_err(&tmp, error))?;
         file.write_all(&data)
             .and_then(|_| file.write_all(b"\n"))
             .and_then(|_| file.sync_all())
@@ -188,6 +188,17 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+fn create_temp(path: &Path) -> std::io::Result<File> {
+    let open = || OpenOptions::new().write(true).create_new(true).open(path);
+    match open() {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(path)?;
+            open()
+        }
+        result => result,
+    }
 }
 
 #[cfg(not(windows))]
@@ -587,6 +598,20 @@ mod tests {
         assert_eq!(saved.started_at, expected.started_at);
         assert_eq!(saved.ends_at, expected.ends_at);
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn atomic_write_does_not_follow_an_existing_temp_link() {
+        let dir = TestDir::new("state-temp-link");
+        let path = dir.join("session.json");
+        let victim = dir.join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        fs::hard_link(&victim, path.with_extension("json.tmp")).unwrap();
+
+        write_session_at(&path, &sample_session()).unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert!(read_session_at(&path).unwrap().is_some());
     }
 
     #[test]

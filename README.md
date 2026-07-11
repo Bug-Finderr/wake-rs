@@ -40,7 +40,7 @@ wake --even-lid          # stay awake with the lid closed (macOS: sudo; Windows:
 wake status | stop | help | version
 ```
 
-State lives at `~/.local/state/wake/session.properties` (`%LOCALAPPDATA%\wake` on Windows, `$XDG_STATE_HOME` if set on Linux; override the dir with `WAKE_STATE_DIR`).
+State lives at `~/.local/state/wake/session.json` (`%LOCALAPPDATA%\wake` on Windows, `$XDG_STATE_HOME` if set on Linux; override the dir with `WAKE_STATE_DIR`). Lid restoration uses a separate `lid-restore.json` marker.
 
 | Platform | Mechanism |
 |---|---|

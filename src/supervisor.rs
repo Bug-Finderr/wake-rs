@@ -5,8 +5,6 @@
 use crate::commands;
 use crate::error::{AppError, Result};
 use crate::platform;
-#[cfg(not(windows))]
-use crate::session::PHASE_ACTIVE;
 use crate::session::{self, Session};
 use crate::sysutil;
 use chrono::Utc;
@@ -133,21 +131,22 @@ pub fn run_charge(args: &[String]) -> Result<()> {
     let mut child = sysutil::spawn_supervised_child(&ka.cmd)?;
     sysutil::require_child_alive(child.id(), &ka.cmd);
 
-    let mut s = Session::new();
-    s.pid = sysutil::current_pid();
-    s.mode = mode;
-    s.trigger = "until-charge".into();
-    s.detail = format!(
-        "{target}% (was {}%, {})",
-        initial.percent,
-        if charging_up {
-            "charging up"
-        } else {
-            "discharging down"
-        }
-    );
-    s.started_at = Some(Utc::now());
-    s.ends_at = None;
+    let mut s = Session {
+        pid: sysutil::current_pid(),
+        mode,
+        trigger: "until-charge".into(),
+        detail: format!(
+            "{target}% (was {}%, {})",
+            initial.percent,
+            if charging_up {
+                "charging up"
+            } else {
+                "discharging down"
+            }
+        ),
+        started_at: Some(Utc::now()),
+        ..Default::default()
+    };
     #[cfg(windows)]
     if let Some(prior) = prior_lid {
         s.even_lid = true;
@@ -252,7 +251,7 @@ pub fn run_lid(args: &[String]) -> Result<()> {
     let mut child = sysutil::spawn_supervised_child(&ka.cmd)?;
     sysutil::require_child_alive(child.id(), &ka.cmd);
 
-    let mut s = Session::new();
+    let mut s = Session::default();
     s.pid = sysutil::current_pid();
     s.mode = if no_display {
         "system-only".into()
@@ -265,7 +264,6 @@ pub fn run_lid(args: &[String]) -> Result<()> {
     s.ends_at = timeout_sec.map(|t| Utc::now() + chrono::Duration::seconds(t));
     s.even_lid = true;
     s.prior_disable_sleep = prior_disable_sleep;
-    s.phase = PHASE_ACTIVE.into();
     if let Err(e) = s
         .capture_process_identity()
         .and_then(|_| session::write(&s))
@@ -328,7 +326,12 @@ fn lid_cleanup(child_pid: u32, prior_disable_sleep: i32) {
         .unwrap_or(false);
     sysutil::terminate(child_pid);
     if restored {
-        session::delete_state_file();
+        let marker = session::LidRestore::Macos {
+            sleep_disabled: prior_disable_sleep,
+        };
+        if session::clear_lid_restore(&marker).is_ok() {
+            session::delete_state_file();
+        }
     } else {
         commands::print_sleep_restore_rescue(prior_disable_sleep);
     }

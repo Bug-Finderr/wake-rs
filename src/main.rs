@@ -114,7 +114,7 @@ exit codes:
   2 usage, 1 error
 
 state file:
-  ~/.local/state/wake/session.properties (override dir with WAKE_STATE_DIR)
-  Windows: %LOCALAPPDATA%\wake\session.properties"#
+  ~/.local/state/wake/session.json (override dir with WAKE_STATE_DIR)
+  Windows: %LOCALAPPDATA%\wake\session.json"#
     );
 }

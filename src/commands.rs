@@ -2,8 +2,6 @@
 //! recovery machinery and shared formatting helpers.
 
 use crate::error::{AppError, Result};
-#[cfg(not(windows))]
-use crate::session::PHASE_ENABLING;
 use crate::session::{self, Session};
 use crate::supervisor::{plan_charge, read_battery_status};
 use crate::sysutil;
@@ -160,7 +158,7 @@ pub fn start(args: &[String]) -> Result<()> {
 
     let _lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
-    if let Some(existing) = session::read_if_alive(true) {
+    if let Some(existing) = session::read_if_alive()? {
         eprintln!(
             "wake: session already active (pid {}, {} {})",
             existing.pid, existing.trigger, existing.detail
@@ -208,12 +206,14 @@ pub fn start(args: &[String]) -> Result<()> {
 
     let ka = platform::keep_awake_command(p.no_display, p.timeout_sec, p.wait_pid)?;
     let now = Utc::now();
-    let mut s = Session::new();
-    s.mode = mode;
-    s.trigger = p.trigger.clone();
-    s.detail = p.trigger_detail.clone();
-    s.started_at = Some(now);
-    s.ends_at = p.timeout_sec.map(|t| now + Duration::seconds(t));
+    let mut s = Session {
+        mode,
+        trigger: p.trigger.clone(),
+        detail: p.trigger_detail.clone(),
+        started_at: Some(now),
+        ends_at: p.timeout_sec.map(|t| now + Duration::seconds(t)),
+        ..Default::default()
+    };
     #[cfg(windows)]
     if let Some((ac, dc)) = prior_lid {
         s.even_lid = true;
@@ -276,7 +276,7 @@ fn start_charge_supervisor(charge: i32, mode: &str, no_display: bool) -> Result<
     ];
     let _child = sysutil::spawn_named(&cmd)?;
     wait_for_state_file();
-    match session::read_if_alive(false) {
+    match session::read_if_alive()? {
         Some(s) => print_start_confirmation(&s, None),
         None => {
             eprintln!("wake: supervisor failed to start");
@@ -300,7 +300,7 @@ fn wait_for_state_file() {
 pub fn status() -> Result<()> {
     let _lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
-    let Some(s) = session::read_if_alive(false) else {
+    let Some(s) = session::read_if_alive()? else {
         println!("wake: no active session");
         return Ok(());
     };
@@ -342,7 +342,7 @@ pub fn status() -> Result<()> {
 pub fn stop() -> Result<()> {
     let _lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
-    let Some(s) = session::read_if_alive(false) else {
+    let Some(s) = session::read_if_alive()? else {
         println!("wake: no active session");
         session::delete_state_file();
         return Ok(());
@@ -518,7 +518,7 @@ fn start_charge_supervisor_windows(
     ];
     let _child = sysutil::spawn_named(&cmd)?;
     wait_for_state_file();
-    let Some(s) = session::read_if_alive(false) else {
+    let Some(s) = session::read_if_alive()? else {
         eprintln!("wake: supervisor failed to start");
         std::process::exit(1);
     };
@@ -588,7 +588,12 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
         }
         Err(e) => {
             if restore_disable_sleep_best_effort(prior) {
-                session::delete_state_file();
+                let marker = session::LidRestore::Macos {
+                    sleep_disabled: prior,
+                };
+                if session::clear_lid_restore(&marker).is_ok() {
+                    session::delete_state_file();
+                }
             }
             Err(e)
         }
@@ -623,7 +628,7 @@ fn lid_enable_and_launch(
         charge_target.map(|c| c.to_string()).unwrap_or_default(),
     ];
     let child = sysutil::spawn_named(&cmd)?;
-    wait_for_supervisor_session(child.id(), true)
+    wait_for_supervisor_session(child.id(), true)?
         .ok_or_else(|| AppError::fail("lid supervisor failed to publish session state"))
 }
 
@@ -636,7 +641,7 @@ fn write_lid_startup_recovery_record(
     prior: i32,
 ) -> Result<()> {
     let now = Utc::now();
-    let mut s = Session::new();
+    let mut s = Session::default();
     s.pid = sysutil::current_pid();
     s.mode = mode.to_string();
     s.trigger = trigger.to_string();
@@ -645,38 +650,40 @@ fn write_lid_startup_recovery_record(
     s.ends_at = timeout_sec.map(|t| now + Duration::seconds(t));
     s.even_lid = true;
     s.prior_disable_sleep = prior;
-    s.phase = PHASE_ENABLING.into();
     s.capture_process_identity()?;
+    session::write_lid_restore(&session::LidRestore::Macos {
+        sleep_disabled: prior,
+    })?;
     session::write(&s)
 }
 
 #[cfg(not(windows))]
-fn wait_for_supervisor_session(supervisor_pid: u32, even_lid: bool) -> Option<Session> {
+fn wait_for_supervisor_session(supervisor_pid: u32, even_lid: bool) -> Result<Option<Session>> {
     for _ in 0..50 {
-        if let Some(s) = session::read_if_alive(false)
+        if let Some(s) = session::read_if_alive()?
             && s.pid == supervisor_pid
             && s.even_lid == even_lid
         {
-            return Some(s);
+            return Ok(Some(s));
         }
         if !sysutil::is_alive(supervisor_pid) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    None
+    Ok(None)
 }
 
 #[cfg(not(windows))]
 fn verify_disable_sleep_restored_after_stop(s: &Session) -> Result<()> {
     for _ in 0..20 {
         if platform::read_disable_sleep()? == s.prior_disable_sleep {
-            return Ok(());
+            return clear_mac_lid_marker(s.prior_disable_sleep);
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     if platform::read_disable_sleep()? == s.prior_disable_sleep {
-        return Ok(());
+        return clear_mac_lid_marker(s.prior_disable_sleep);
     }
     restore_disable_sleep_with_prompt_if_possible(
         s.prior_disable_sleep,
@@ -694,7 +701,14 @@ fn verify_disable_sleep_restored_after_stop(s: &Session) -> Result<()> {
         "wake: restored SleepDisabled to {} after lid supervisor exit",
         s.prior_disable_sleep
     );
-    Ok(())
+    clear_mac_lid_marker(s.prior_disable_sleep)
+}
+
+#[cfg(not(windows))]
+fn clear_mac_lid_marker(prior: i32) -> Result<()> {
+    session::clear_lid_restore(&session::LidRestore::Macos {
+        sleep_disabled: prior,
+    })
 }
 
 #[cfg(not(windows))]
@@ -740,12 +754,6 @@ fn restore_disable_sleep_best_effort(prior: i32) -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn print_sleep_restore_command(value: i32) {
-    eprintln!("wake: manual sleep restore command: sudo pmset -a disablesleep {value}");
-    print_sleep_state_path();
-}
-
-#[cfg(not(windows))]
 pub fn print_sleep_restore_rescue(value: i32) {
     eprintln!("wake: could not restore sleep; run: sudo pmset -a disablesleep {value}");
     print_sleep_state_path();
@@ -753,7 +761,10 @@ pub fn print_sleep_restore_rescue(value: i32) {
 
 #[cfg(not(windows))]
 fn print_sleep_state_path() {
-    eprintln!("wake: recovery state: {}", session::state_file().display());
+    eprintln!(
+        "wake: recovery state: {}",
+        session::lid_restore_file().display()
+    );
 }
 
 // ---- crash recovery ----
@@ -764,13 +775,9 @@ pub fn recover_stale_lid_session_foreground() -> Result<()> {
 }
 
 pub fn recover_stale_lid_session_unlocked() -> Result<()> {
-    let state = match session::read_saved_for_recovery() {
+    let saved = match session::read_saved_for_recovery()? {
         None => return Ok(()),
         Some(s) => s,
-    };
-    let saved = match state {
-        session::SavedState::Malformed(m) => return recover_malformed_lid_session_unlocked(&m),
-        session::SavedState::Valid(s) => s,
     };
     if saved.matches_live_process() {
         return Ok(());
@@ -792,6 +799,15 @@ pub fn recover_stale_lid_session_unlocked() -> Result<()> {
 
 #[cfg(not(windows))]
 fn recover_crashed_even_lid_unix(saved: &Session) -> Result<()> {
+    let expected = session::LidRestore::Macos {
+        sleep_disabled: saved.prior_disable_sleep,
+    };
+    if session::read_lid_restore()?.as_ref() != Some(&expected) {
+        return Err(AppError::fail(format!(
+            "lid restoration marker does not match the stale session at {}",
+            session::lid_restore_file().display()
+        )));
+    }
     let current = platform::read_disable_sleep()?;
     if current != saved.prior_disable_sleep {
         restore_disable_sleep_with_prompt_if_possible(
@@ -811,7 +827,7 @@ fn recover_crashed_even_lid_unix(saved: &Session) -> Result<()> {
             eprintln!("wake: recovered a crashed lid session; restored prior SleepDisabled value");
         }
     }
-    Ok(())
+    clear_mac_lid_marker(saved.prior_disable_sleep)
 }
 
 /// Crash recovery for a stale Windows even-lid session: re-elevate and restore the prior lid action.
@@ -831,91 +847,5 @@ fn recover_crashed_even_lid_windows(saved: &Session) -> Result<()> {
         )));
     }
     eprintln!("wake: recovered a crashed lid session; restored the prior lid action");
-    Ok(())
-}
-
-fn recover_malformed_lid_session_unlocked(m: &session::MalformedState) -> Result<()> {
-    if !platform::supports_even_lid() {
-        if m.has_lid_recovery_hints() {
-            return Err(AppError::fail(format!(
-                "malformed --even-lid recovery state found at {}, but this platform cannot restore the lid action",
-                session::state_file().display()
-            )));
-        }
-        session::delete_state_file();
-        return Ok(());
-    }
-    #[cfg(windows)]
-    return recover_malformed_lid_session_windows(m);
-    #[cfg(not(windows))]
-    recover_malformed_lid_session_unix(m)
-}
-
-#[cfg(not(windows))]
-fn recover_malformed_lid_session_unix(m: &session::MalformedState) -> Result<()> {
-    let current = platform::read_disable_sleep().ok();
-    if !m.has_lid_recovery_hints() && current != Some(1) {
-        session::delete_state_file();
-        return Ok(());
-    }
-
-    let safe_restore = 0;
-    eprintln!(
-        "wake: malformed --even-lid recovery state at {}; using safe SleepDisabled=0 recovery",
-        session::state_file().display()
-    );
-    if let Some(prior) = m.parsed_prior_disable_sleep
-        && prior != safe_restore
-    {
-        eprintln!(
-            "wake: malformed state contained priorDisableSleep={prior}; safe recovery still uses 0"
-        );
-    }
-    print_sleep_restore_command(safe_restore);
-
-    if current == Some(safe_restore) {
-        session::delete_state_file();
-        return Ok(());
-    }
-    restore_disable_sleep_with_prompt_if_possible(
-        safe_restore,
-        "malformed lid recovery state needs sudo recovery, but no interactive terminal is available",
-    )?;
-    let after = platform::read_disable_sleep()?;
-    if after != safe_restore {
-        print_sleep_restore_rescue(safe_restore);
-        return Err(AppError::fail(format!(
-            "failed to recover malformed lid session; SleepDisabled is {after}"
-        )));
-    }
-    session::delete_state_file();
-    Ok(())
-}
-
-/// Windows malformed-state recovery: the prior lid action is not trustworthy, so restore the OS
-/// default (lid close = Sleep) so the machine is not left unable to sleep on lid close.
-#[cfg(windows)]
-fn recover_malformed_lid_session_windows(m: &session::MalformedState) -> Result<()> {
-    if !m.has_lid_recovery_hints() {
-        session::delete_state_file();
-        return Ok(());
-    }
-    let (safe_ac, safe_dc) = (1u32, 1u32); // Sleep on lid close
-    eprintln!(
-        "wake: malformed --even-lid recovery state at {}; restoring lid close to Sleep",
-        session::state_file().display()
-    );
-    let current = platform::read_lid_action()?;
-    if current != (safe_ac, safe_dc) {
-        set_lid(safe_ac, safe_dc)?;
-        let after = platform::read_lid_action()?;
-        if after != (safe_ac, safe_dc) {
-            return Err(AppError::fail(format!(
-                "failed to recover malformed lid session; lid action is AC={} DC={}",
-                after.0, after.1
-            )));
-        }
-    }
-    session::delete_state_file();
     Ok(())
 }

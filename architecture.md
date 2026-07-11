@@ -45,9 +45,11 @@ flowchart TD
 
 ## Session lifecycle
 
-A session is the OS sleep-inhibitor process plus a `session.properties` record. The record stores the
-pid **and** a process-identity fingerprint (start time, exe, command line); every read verifies the pid
+A session is the OS sleep-inhibitor process plus a `session.json` record. The record stores the
+pid **and** a process-identity fingerprint (start time and executable); every read verifies the pid
 is still that same live process before trusting it, so a recycled pid never looks like a live session.
+Writes are atomic JSON replacements. `--even-lid` uses a separate `lid-restore.json` marker that is
+kept until the recorded platform setting is verified as restored.
 
 ```mermaid
 sequenceDiagram

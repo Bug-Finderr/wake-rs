@@ -1,16 +1,14 @@
-//! Session state: the `session.properties` file, the advisory lock, and crash-recovery parsing.
+//! Durable session and lid-restoration state.
 
 use crate::error::{AppError, Result};
 use crate::platform;
 use crate::sysutil;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::path::PathBuf;
-
-#[cfg(not(windows))]
-pub const PHASE_ENABLING: &str = "enabling";
-pub const PHASE_ACTIVE: &str = "active";
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("WAKE_STATE_DIR")
@@ -21,8 +19,6 @@ pub fn state_dir() -> PathBuf {
     default_state_dir()
 }
 
-// NOTE: the Windows base moved from ~/.local/state to %LOCALAPPDATA%; any session written under the
-// old location is orphaned, but recovery is best-effort and a stale child dies on its own.
 #[cfg(windows)]
 fn default_state_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
@@ -43,7 +39,12 @@ fn default_state_dir() -> PathBuf {
 }
 
 pub fn state_file() -> PathBuf {
-    state_dir().join("session.properties")
+    state_dir().join("session.json")
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub fn lid_restore_file() -> PathBuf {
+    state_dir().join("lid-restore.json")
 }
 
 fn home() -> PathBuf {
@@ -56,7 +57,8 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Session {
     pub pid: u32,
     pub mode: String,
@@ -66,30 +68,66 @@ pub struct Session {
     pub ends_at: Option<DateTime<Utc>>,
     pub process_start: u64,
     pub process_command: String,
-    pub process_command_line: String,
     pub even_lid: bool,
     pub prior_disable_sleep: i32,
-    pub phase: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "platform")]
+pub enum LidRestore {
+    Macos {
+        sleep_disabled: i32,
+    },
+    Windows {
+        scheme_guid: String,
+        ac_action: u32,
+        dc_action: u32,
+    },
+}
+
+impl LidRestore {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Macos {
+                sleep_disabled: 0 | 1,
+            } => Ok(()),
+            Self::Macos { .. } => Err(AppError::fail("SleepDisabled must be 0 or 1")),
+            Self::Windows {
+                scheme_guid,
+                ac_action,
+                dc_action,
+            } if is_guid(scheme_guid)
+                && (0..=3).contains(ac_action)
+                && (0..=3).contains(dc_action) =>
+            {
+                Ok(())
+            }
+            Self::Windows { .. } => Err(AppError::fail(
+                "Windows lid restoration requires a scheme GUID and AC/DC actions in 0..=3",
+            )),
+        }
+    }
+}
+
+fn is_guid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 impl Session {
-    pub fn new() -> Self {
-        Session {
-            phase: PHASE_ACTIVE.to_string(),
-            ..Default::default()
-        }
-    }
-
-    /// Fill identity fields from the live process at `self.pid`.
     pub fn capture_process_identity(&mut self) -> Result<()> {
         let id = sysutil::capture_identity(self.pid)?;
         self.process_start = id.start;
         self.process_command = id.command;
-        self.process_command_line = id.command_line;
         Ok(())
     }
 
-    /// True if the recorded pid is still the same live process we started.
     pub fn matches_live_process(&self) -> bool {
         match sysutil::live_identity(self.pid) {
             None => false,
@@ -111,158 +149,166 @@ fn is_expected_command(command: &str, command_line: &str) -> bool {
     platform::expected_command_basenames().contains(&base.as_str()) || line.contains("wake")
 }
 
-// ---- read ----
-
-pub enum SavedState {
-    Valid(Session),
-    Malformed(MalformedState),
-}
-
-pub struct MalformedState {
-    pub even_lid_true: bool,
-    pub has_prior_disable_sleep: bool,
-    // Only the macOS malformed-recovery path inspects the parsed prior; Windows recovery restores a
-    // safe default instead.
-    #[cfg_attr(windows, allow(dead_code))]
-    pub parsed_prior_disable_sleep: Option<i32>,
-}
-
-impl MalformedState {
-    pub fn has_lid_recovery_hints(&self) -> bool {
-        self.even_lid_true || self.has_prior_disable_sleep
-    }
-}
-
-pub fn read_saved_for_recovery() -> Option<SavedState> {
-    let path = state_file();
-    if !path.exists() {
-        return None;
-    }
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return Some(SavedState::Malformed(malformed_from(&HashMap::new()))),
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(state_io_err(path, error)),
     };
-    let props = parse_properties(&text);
-    Some(match build_session(&props) {
-        Some(s) => SavedState::Valid(s),
-        None => SavedState::Malformed(malformed_from(&props)),
-    })
+    serde_json::from_reader(file)
+        .map(Some)
+        .map_err(|error| AppError::fail(format!("invalid JSON at {}: {error}", path.display())))
 }
 
-/// Valid live-or-not session, deleting a stale/dead file. `may_delete_malformed` removes a malformed
-/// file only when it carries no lid-recovery hints.
-pub fn read_if_alive(may_delete_malformed: bool) -> Option<Session> {
-    match read_saved_for_recovery() {
-        Some(SavedState::Valid(s)) => {
-            if s.matches_live_process() {
-                Some(s)
-            } else {
-                let _ = fs::remove_file(state_file());
-                None
-            }
-        }
-        Some(SavedState::Malformed(m)) => {
-            if may_delete_malformed && !m.has_lid_recovery_hints() {
-                let _ = fs::remove_file(state_file());
-            }
-            None
-        }
-        None => None,
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| AppError::fail(format!("state path has no parent: {}", path.display())))?;
+    fs::create_dir_all(dir).map_err(|error| state_io_err(dir, error))?;
+    let data = serde_json::to_vec(value)
+        .map_err(|error| AppError::fail(format!("could not encode {}: {error}", path.display())))?;
+    let tmp = path.with_extension("json.tmp");
+    let result = (|| {
+        let mut file = File::create(&tmp).map_err(|error| state_io_err(&tmp, error))?;
+        file.write_all(&data)
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.sync_all())
+            .map_err(|error| state_io_err(&tmp, error))?;
+        replace_file(&tmp, path).map_err(|error| state_io_err(path, error))?;
+        sync_parent(dir).map_err(|error| state_io_err(dir, error))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    result
 }
 
-fn parse_properties(text: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim_start();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            map.insert(k.trim().to_string(), v.to_string());
-        }
-    }
-    map
-}
-
-fn build_session(p: &HashMap<String, String>) -> Option<Session> {
-    let pid = p.get("pid").map_or(Some(0), |v| v.trim().parse().ok())?;
-    let started_at = parse_ts(p.get("startedAt")?)?;
-    let ends_at = match p.get("endsAt").map(String::as_str) {
-        None | Some("") => None,
-        Some(s) => Some(parse_ts(s)?),
-    };
-    let process_start = p.get("processStartMs")?.trim().parse().ok()?;
-    let prior_disable_sleep = parse_disable_sleep(p.get("priorDisableSleep").map_or("0", |v| v))?;
-
-    Some(Session {
-        pid,
-        mode: p.get("mode").cloned().unwrap_or_default(),
-        trigger: p.get("trigger").cloned().unwrap_or_default(),
-        detail: p.get("detail").cloned().unwrap_or_default(),
-        started_at: Some(started_at),
-        ends_at,
-        process_start,
-        process_command: p.get("processCommand").cloned().unwrap_or_default(),
-        process_command_line: p.get("processCommandLine").cloned().unwrap_or_default(),
-        even_lid: p
-            .get("evenLid")
-            .map(|v| v.trim() == "true")
-            .unwrap_or(false),
-        prior_disable_sleep,
-        phase: p
-            .get("phase")
-            .cloned()
-            .unwrap_or_else(|| PHASE_ACTIVE.to_string()),
-    })
-}
-
-fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s.trim())
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
-}
-
-// The `priorDisableSleep` field is reused on Windows to store the encoded prior lid action
-// (`ac | (dc << 4)`, each nibble 0..=3), so accept that range there; elsewhere it is macOS's
-// SleepDisabled which is strictly 0 or 1.
 #[cfg(not(windows))]
-fn parse_disable_sleep(raw: &str) -> Option<i32> {
-    match raw.trim().parse::<i32>().ok()? {
-        v @ (0 | 1) => Some(v),
-        _ => None,
-    }
+fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(tmp, path)
 }
 
 #[cfg(windows)]
-fn parse_disable_sleep(raw: &str) -> Option<i32> {
-    let v = raw.trim().parse::<i32>().ok()?;
-    let (ac, dc) = (v & 0xF, (v >> 4) & 0xF);
-    if v == (ac | (dc << 4)) && (0..=3).contains(&ac) && (0..=3).contains(&dc) {
-        Some(v)
+fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let wide = |value: &Path| {
+        value
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let (tmp, path) = (wide(tmp), wide(path));
+    // SAFETY: both paths are valid, NUL-terminated UTF-16 buffers retained for the call.
+    if unsafe {
+        MoveFileExW(
+            tmp.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
     } else {
-        None
+        Ok(())
     }
 }
 
-fn malformed_from(p: &HashMap<String, String>) -> MalformedState {
-    MalformedState {
-        even_lid_true: p
-            .get("evenLid")
-            .map(|v| v.trim() == "true")
-            .unwrap_or(false),
-        has_prior_disable_sleep: p.contains_key("priorDisableSleep"),
-        parsed_prior_disable_sleep: p
-            .get("priorDisableSleep")
-            .and_then(|v| parse_disable_sleep(v)),
+#[cfg(unix)]
+fn sync_parent(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn read_session_at(path: &Path) -> Result<Option<Session>> {
+    read_json(path)
+}
+
+fn write_session_at(path: &Path, session: &Session) -> Result<()> {
+    write_json(path, session)
+}
+
+fn read_lid_restore_at(path: &Path) -> Result<Option<LidRestore>> {
+    let marker: Option<LidRestore> = read_json(path)?;
+    if let Some(marker) = &marker {
+        marker.validate()?;
+    }
+    Ok(marker)
+}
+
+fn write_lid_restore_at(path: &Path, marker: &LidRestore) -> Result<()> {
+    marker.validate()?;
+    if let Some(saved) = read_lid_restore_at(path)?
+        && saved != *marker
+    {
+        return Err(AppError::fail(format!(
+            "unresolved lid restoration marker already exists at {}",
+            path.display()
+        )));
+    }
+    write_json(path, marker)
+}
+
+fn clear_lid_restore_at(path: &Path, expected: &LidRestore) -> Result<()> {
+    match read_lid_restore_at(path)? {
+        Some(actual) if &actual == expected => {
+            fs::remove_file(path).map_err(|error| state_io_err(path, error))?;
+            if let Some(dir) = path.parent() {
+                sync_parent(dir).map_err(|error| state_io_err(dir, error))?;
+            }
+            Ok(())
+        }
+        Some(_) => Err(AppError::fail(format!(
+            "lid restoration marker changed at {}; refusing to remove it",
+            path.display()
+        ))),
+        None => Err(AppError::fail(format!(
+            "lid restoration marker is missing at {}",
+            path.display()
+        ))),
     }
 }
 
-// ---- write ----
+#[cfg_attr(windows, allow(dead_code))]
+pub fn read_lid_restore() -> Result<Option<LidRestore>> {
+    read_lid_restore_at(&lid_restore_file())
+}
 
-/// Wrap a state-file IO error with the offending path and the `WAKE_STATE_DIR` escape hatch, so
-/// permission/quota failures point at the directory instead of surfacing a bare OS error.
-fn state_io_err(path: &std::path::Path, e: std::io::Error) -> AppError {
+#[cfg_attr(windows, allow(dead_code))]
+pub fn write_lid_restore(marker: &LidRestore) -> Result<()> {
+    write_lid_restore_at(&lid_restore_file(), marker)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub fn clear_lid_restore(expected: &LidRestore) -> Result<()> {
+    clear_lid_restore_at(&lid_restore_file(), expected)
+}
+
+pub fn read_saved_for_recovery() -> Result<Option<Session>> {
+    read_session_at(&state_file())
+}
+
+pub fn read_if_alive() -> Result<Option<Session>> {
+    let Some(session) = read_saved_for_recovery()? else {
+        return Ok(None);
+    };
+    if session.matches_live_process() {
+        Ok(Some(session))
+    } else {
+        delete_state_file();
+        Ok(None)
+    }
+}
+
+fn state_io_err(path: &Path, e: std::io::Error) -> AppError {
     AppError::fail(format!(
         "state IO failed at {}: {e}; set WAKE_STATE_DIR to a writable directory",
         path.display()
@@ -270,62 +316,12 @@ fn state_io_err(path: &std::path::Path, e: std::io::Error) -> AppError {
 }
 
 pub fn write(s: &Session) -> Result<()> {
-    let dir = state_dir();
-    fs::create_dir_all(&dir).map_err(|e| state_io_err(&dir, e))?;
-    let mut out = String::new();
-    let push = |out: &mut String, k: &str, v: &str| {
-        out.push_str(k);
-        out.push('=');
-        out.push_str(v);
-        out.push('\n');
-    };
-    push(&mut out, "pid", &s.pid.to_string());
-    push(&mut out, "mode", &s.mode);
-    push(&mut out, "trigger", &s.trigger);
-    push(&mut out, "detail", &s.detail);
-    push(&mut out, "startedAt", &ts(s.started_at));
-    push(
-        &mut out,
-        "endsAt",
-        &s.ends_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
-    );
-    push(&mut out, "processStartMs", &s.process_start.to_string());
-    push(&mut out, "processCommand", &s.process_command);
-    push(&mut out, "processCommandLine", &s.process_command_line);
-    push(&mut out, "evenLid", &s.even_lid.to_string());
-    push(
-        &mut out,
-        "priorDisableSleep",
-        &s.prior_disable_sleep.to_string(),
-    );
-    push(
-        &mut out,
-        "phase",
-        if s.phase.is_empty() {
-            PHASE_ACTIVE
-        } else {
-            &s.phase
-        },
-    );
-
-    let tmp = dir.join("session.properties.tmp");
-    fs::write(&tmp, out).map_err(|e| state_io_err(&tmp, e))?;
-    if let Err(e) = fs::rename(&tmp, state_file()) {
-        let _ = fs::remove_file(&tmp);
-        return Err(state_io_err(&state_file(), e));
-    }
-    Ok(())
-}
-
-fn ts(t: Option<DateTime<Utc>>) -> String {
-    t.map(|t| t.to_rfc3339()).unwrap_or_default()
+    write_session_at(&state_file(), s)
 }
 
 pub fn delete_state_file() {
     let _ = fs::remove_file(state_file());
 }
-
-// ---- lock ----
 
 pub struct LockGuard {
     file: File,
@@ -359,57 +355,162 @@ pub fn acquire_lock() -> Result<LockGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[test]
-    fn properties_round_trip_builds_session() {
-        let text = "pid=4321\n\
-             mode=display+system\n\
-             trigger=timed\n\
-             detail=1h\n\
-             startedAt=2024-01-02T03:04:05+00:00\n\
-             endsAt=2024-01-02T04:04:05+00:00\n\
-             processStartMs=1700000000\n\
-             processCommand=/usr/bin/caffeinate\n\
-             processCommandLine=/usr/bin/caffeinate -d\n\
-             evenLid=false\n\
-             priorDisableSleep=0\n\
-             phase=active\n";
-        let s = build_session(&parse_properties(text)).expect("valid session");
-        assert_eq!(s.pid, 4321);
-        assert_eq!(s.mode, "display+system");
-        assert_eq!(s.trigger, "timed");
-        assert_eq!(s.detail, "1h");
-        assert_eq!(s.process_start, 1_700_000_000);
-        assert_eq!(s.process_command, "/usr/bin/caffeinate");
-        assert!(s.started_at.is_some());
-        assert!(s.ends_at.is_some());
-        assert!(!s.even_lid);
-        assert_eq!(s.phase, PHASE_ACTIVE);
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "wake-rs-{name}-{}-{}",
+                std::process::id(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("create test directory");
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sample_session() -> Session {
+        Session {
+            pid: 4321,
+            mode: "display+system".into(),
+            trigger: "timed".into(),
+            detail: "1h".into(),
+            started_at: Some("2024-01-02T03:04:05Z".parse().unwrap()),
+            ends_at: Some("2024-01-02T04:04:05Z".parse().unwrap()),
+            process_start: 1_700_000_000,
+            process_command: "/usr/bin/caffeinate".into(),
+            even_lid: false,
+            prior_disable_sleep: 0,
+        }
     }
 
     #[test]
-    fn missing_started_at_is_none() {
-        let text = "pid=1\nprocessStartMs=10\n";
-        assert!(build_session(&parse_properties(text)).is_none());
+    fn session_json_round_trips_without_storing_command_line() {
+        let dir = TestDir::new("session-round-trip");
+        let path = dir.join("session.json");
+        let expected = sample_session();
+
+        write_session_at(&path, &expected).unwrap();
+        let saved = read_session_at(&path).unwrap().unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(saved.pid, expected.pid);
+        assert_eq!(saved.mode, expected.mode);
+        assert_eq!(saved.trigger, expected.trigger);
+        assert_eq!(saved.detail, expected.detail);
+        assert_eq!(saved.started_at, expected.started_at);
+        assert_eq!(saved.ends_at, expected.ends_at);
+        assert_eq!(saved.process_start, expected.process_start);
+        assert_eq!(saved.process_command, expected.process_command);
+        assert!(!text.contains("processCommandLine"));
+        assert!(!path.with_extension("json.tmp").exists());
     }
 
     #[test]
-    fn parse_properties_skips_comments_and_blanks() {
-        let text = "# a comment\n! also a comment\n\n  \nkey=value\n  spaced = trimmed-key\n";
-        let p = parse_properties(text);
-        assert_eq!(p.get("key").map(String::as_str), Some("value"));
-        assert_eq!(p.get("spaced").map(String::as_str), Some(" trimmed-key"));
-        assert!(!p.contains_key("# a comment"));
-        assert_eq!(p.len(), 2);
+    fn missing_session_is_not_an_error() {
+        let dir = TestDir::new("session-missing");
+        assert!(
+            read_session_at(&dir.join("missing.json"))
+                .unwrap()
+                .is_none()
+        );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn parse_disable_sleep_packed_nibbles() {
-        // 0x21 = 33 -> ac=1, dc=2 (both in 0..=3): accepted.
-        assert_eq!(parse_disable_sleep("33"), Some(33));
-        assert_eq!(platform::decode_lid(33), (1, 2));
-        // 0x44 = 68 -> ac=4, dc=4 (out of 0..=3): rejected.
-        assert_eq!(parse_disable_sleep("68"), None);
+    fn malformed_session_is_an_error_and_is_retained() {
+        let dir = TestDir::new("session-malformed");
+        let path = dir.join("session.json");
+        fs::write(&path, br#"{"pid": "not valid"}"#).unwrap();
+
+        let error = read_session_at(&path).unwrap_err();
+
+        assert!(error.message().contains("invalid JSON"));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn lid_restore_markers_round_trip() {
+        let dir = TestDir::new("lid-round-trip");
+        let markers = [
+            LidRestore::Macos { sleep_disabled: 1 },
+            LidRestore::Windows {
+                scheme_guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+                ac_action: 1,
+                dc_action: 2,
+            },
+        ];
+
+        for (index, marker) in markers.into_iter().enumerate() {
+            let path = dir.join(&format!("lid-restore-{index}.json"));
+            write_lid_restore_at(&path, &marker).unwrap();
+            assert_eq!(read_lid_restore_at(&path).unwrap(), Some(marker));
+        }
+    }
+
+    #[test]
+    fn write_lid_restore_does_not_replace_an_unresolved_marker() {
+        let dir = TestDir::new("lid-no-overwrite");
+        let path = dir.join("lid-restore.json");
+        let saved = LidRestore::Macos { sleep_disabled: 1 };
+        let replacement = LidRestore::Macos { sleep_disabled: 0 };
+        write_lid_restore_at(&path, &saved).unwrap();
+
+        assert!(write_lid_restore_at(&path, &replacement).is_err());
+        assert_eq!(read_lid_restore_at(&path).unwrap(), Some(saved));
+    }
+
+    #[test]
+    fn invalid_lid_restore_is_an_error_and_is_retained() {
+        let dir = TestDir::new("lid-invalid");
+        let path = dir.join("lid-restore.json");
+        fs::write(&path, br#"{"platform":"macos","sleep_disabled":2}"#).unwrap();
+
+        let error = read_lid_restore_at(&path).unwrap_err();
+
+        assert!(error.message().contains("SleepDisabled"));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn invalid_windows_scheme_guid_is_rejected() {
+        let dir = TestDir::new("lid-invalid-guid");
+        let path = dir.join("lid-restore.json");
+        fs::write(
+            &path,
+            br#"{"platform":"windows","scheme_guid":"not-a-guid","ac_action":1,"dc_action":1}"#,
+        )
+        .unwrap();
+
+        assert!(read_lid_restore_at(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn clear_lid_restore_requires_the_exact_marker() {
+        let dir = TestDir::new("lid-retention");
+        let path = dir.join("lid-restore.json");
+        let saved = LidRestore::Macos { sleep_disabled: 1 };
+        let wrong = LidRestore::Macos { sleep_disabled: 0 };
+        write_lid_restore_at(&path, &saved).unwrap();
+
+        assert!(clear_lid_restore_at(&path, &wrong).is_err());
+        assert_eq!(read_lid_restore_at(&path).unwrap(), Some(saved.clone()));
+
+        clear_lid_restore_at(&path, &saved).unwrap();
+        assert!(!path.exists());
     }
 }

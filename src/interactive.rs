@@ -92,7 +92,7 @@ impl Picker {
         print!("{}{}", alt_on(), hide_cursor());
         std::io::stdout().flush().ok();
 
-        let existing = session::read_if_alive(false);
+        let existing = session::read_if_alive()?;
         let items = build_menu(&existing);
         self.selected = items.iter().position(|i| !i.separator).unwrap_or(0);
 

@@ -1,5 +1,3 @@
-//! Durable session and lid-restoration state.
-
 use crate::error::{AppError, Result};
 use crate::run::{ProcessRef, RunSpec};
 use crate::sysutil;

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 const BATTERY_INTERVAL: Duration = Duration::from_secs(30);
 const RUN_INTERVAL: Duration = Duration::from_secs(1);
+const STARTUP_SETTLE: Duration = Duration::from_millis(300);
 #[cfg(not(windows))]
 const SUDO_HEARTBEAT: Duration = Duration::from_secs(180);
 
@@ -43,25 +44,27 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 fn supervise(spec: RunSpec) -> Result<()> {
+    let started = Instant::now();
+    let started_at = Utc::now();
     let mut inhibitor = platform::Inhibitor::start(spec.mode)?;
+    sleep(STARTUP_SETTLE);
     if !inhibitor.alive() {
         return Err(AppError::fail("sleep inhibitor exited during startup"));
     }
-    let now = Utc::now();
     let mut session = Session {
         pid: sysutil::current_pid(),
         mode: spec.mode.label().into(),
         trigger: spec.trigger.label().into(),
         detail: spec.trigger.detail(),
-        started_at: Some(now),
-        ends_at: spec.trigger.ends_at(),
+        started_at: Some(started_at),
+        ends_at: spec.trigger.session_ends_at(started_at),
         note: inhibitor.note().map(str::to_string),
         ..Default::default()
     };
     session.capture_process_identity()?;
     session::write(&session)?;
 
-    let result = supervise_loop(&spec, &session, &mut inhibitor);
+    let result = supervise_loop(&spec, &session, &mut inhibitor, started);
     drop(inhibitor);
     let remove = session::remove_if_matches(&session).map(|_| ());
     let clear = session::clear_stop(&session).map(|_| ());
@@ -72,18 +75,20 @@ fn supervise_loop(
     spec: &RunSpec,
     session: &Session,
     inhibitor: &mut platform::Inhibitor,
+    started: Instant,
 ) -> Result<()> {
     let signal = install_stop_flag();
-    let mut next_battery = Instant::now() + BATTERY_INTERVAL;
+    let mut next_battery = Instant::now();
     loop {
-        sleep(RUN_INTERVAL);
-        if signal.load(Ordering::Relaxed) || session::stop_requested(session)? {
+        if signal.load(Ordering::Relaxed)
+            || session::stop_requested(session).is_ok_and(|requested| requested)
+        {
             return Ok(());
         }
         if !inhibitor.alive() {
             return Err(AppError::fail("sleep inhibitor exited unexpectedly"));
         }
-        if spec.trigger.ends_at().is_some_and(|end| Utc::now() >= end) {
+        if spec.trigger.is_complete(Utc::now(), started.elapsed()) {
             return Ok(());
         }
         if spec
@@ -103,6 +108,7 @@ fn supervise_loop(
                 return Ok(());
             }
         }
+        sleep(RUN_INTERVAL);
     }
 }
 

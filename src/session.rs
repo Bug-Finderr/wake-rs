@@ -309,6 +309,19 @@ fn clear_stop_at(path: &Path, session: &Session) -> Result<bool> {
     Ok(true)
 }
 
+fn reconcile_stop_at(path: &Path, is_live: impl FnOnce(&ProcessRef) -> bool) -> Result<()> {
+    let Some(request) = read_json::<StopRequest>(path)? else {
+        return Ok(());
+    };
+    if is_live(&request.session) {
+        return Err(AppError::fail(format!(
+            "stop request still targets a live process at {}",
+            path.display()
+        )));
+    }
+    remove_state_file_at(path)
+}
+
 fn remove_session_if_matches_at(path: &Path, expected: &Session) -> Result<bool> {
     let Some(actual) = read_session_at(path)? else {
         return Ok(false);
@@ -413,6 +426,10 @@ pub fn stop_requested(session: &Session) -> Result<bool> {
 
 pub fn clear_stop(session: &Session) -> Result<bool> {
     clear_stop_at(&stop_file(), session)
+}
+
+pub fn reconcile_stop() -> Result<()> {
+    reconcile_stop_at(&stop_file(), sysutil::process_matches)
 }
 
 pub fn remove_if_matches(session: &Session) -> Result<bool> {
@@ -683,6 +700,30 @@ mod tests {
         write_stop_at(&path, &other).unwrap();
         assert!(write_stop_at(&path, &expected).is_err());
         assert!(stop_requested_at(&path, &other).unwrap());
+    }
+
+    #[test]
+    fn stop_marker_reconciliation_table() {
+        let dir = TestDir::new("stop-reconcile");
+        let session = sample_session();
+
+        let missing = dir.join("missing.json");
+        reconcile_stop_at(&missing, |_| false).unwrap();
+
+        let dead = dir.join("dead.json");
+        write_stop_at(&dead, &session).unwrap();
+        reconcile_stop_at(&dead, |_| false).unwrap();
+        assert!(!dead.exists());
+
+        let live = dir.join("live.json");
+        write_stop_at(&live, &session).unwrap();
+        assert!(reconcile_stop_at(&live, |_| true).is_err());
+        assert!(live.exists());
+
+        let malformed = dir.join("malformed.json");
+        fs::write(&malformed, b"not json").unwrap();
+        assert!(reconcile_stop_at(&malformed, |_| false).is_err());
+        assert!(malformed.exists());
     }
 
     #[test]

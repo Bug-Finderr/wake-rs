@@ -35,8 +35,7 @@ impl Mode {
 pub enum Trigger {
     Indefinite,
     Timed {
-        #[serde(rename = "endsAt")]
-        ends_at: DateTime<Utc>,
+        seconds: i64,
         input: String,
     },
     Until {
@@ -91,10 +90,19 @@ impl Trigger {
         }
     }
 
-    pub fn ends_at(&self) -> Option<DateTime<Utc>> {
+    pub fn session_ends_at(&self, started_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
-            Self::Timed { ends_at, .. } | Self::Until { ends_at, .. } => Some(*ends_at),
+            Self::Timed { seconds, .. } => Some(started_at + chrono::Duration::seconds(*seconds)),
+            Self::Until { ends_at, .. } => Some(*ends_at),
             _ => None,
+        }
+    }
+
+    pub fn is_complete(&self, wall_now: DateTime<Utc>, elapsed: std::time::Duration) -> bool {
+        match self {
+            Self::Timed { seconds, .. } => elapsed.as_secs() >= *seconds as u64,
+            Self::Until { ends_at, .. } => wall_now >= *ends_at,
+            _ => false,
         }
     }
 
@@ -149,7 +157,7 @@ impl RunSpec {
     pub fn validate(&self) -> Result<()> {
         let valid = match &self.trigger {
             Trigger::Indefinite => true,
-            Trigger::Timed { input, .. } => !input.trim().is_empty(),
+            Trigger::Timed { seconds, input } => *seconds > 0 && !input.trim().is_empty(),
             Trigger::Until { time, .. } => !time.trim().is_empty(),
             Trigger::Pid { process } => process.is_valid(),
             Trigger::App { name, process } => !name.trim().is_empty() && process.is_valid(),
@@ -298,7 +306,7 @@ mod tests {
         let valid = [
             Trigger::Indefinite,
             Trigger::Timed {
-                ends_at: end,
+                seconds: 300,
                 input: "5m".into(),
             },
             Trigger::Until {
@@ -329,7 +337,7 @@ mod tests {
 
         let invalid = [
             Trigger::Timed {
-                ends_at: end,
+                seconds: 0,
                 input: " ".into(),
             },
             Trigger::Pid {
@@ -413,6 +421,33 @@ mod tests {
         assert!(!expected.matches(43, 1_700_000_000, "/usr/bin/editor"));
         assert!(!expected.matches(42, 1_700_000_001, "/usr/bin/editor"));
         assert!(!expected.matches(42, 1_700_000_000, "/usr/bin/other"));
+    }
+
+    #[test]
+    fn completion_uses_monotonic_time_only_for_durations() {
+        let wall = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
+        let timed = Trigger::Timed {
+            seconds: 60,
+            input: "1m".into(),
+        };
+        assert!(!timed.is_complete(
+            wall + chrono::Duration::days(1),
+            std::time::Duration::from_secs(59)
+        ));
+        assert!(timed.is_complete(
+            wall - chrono::Duration::days(1),
+            std::time::Duration::from_secs(60)
+        ));
+
+        let until = Trigger::Until {
+            ends_at: wall,
+            time: "12:00".into(),
+        };
+        assert!(!until.is_complete(
+            wall - chrono::Duration::seconds(1),
+            std::time::Duration::from_secs(999)
+        ));
+        assert!(until.is_complete(wall, std::time::Duration::ZERO));
     }
 
     #[test]

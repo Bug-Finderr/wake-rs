@@ -2,12 +2,12 @@
 //! recovery machinery and shared formatting helpers.
 
 use crate::error::{AppError, Result};
-use crate::run::{ChargePlan, Mode, ProcessRef, RunSpec, Trigger, plan_charge, until_deadline};
+use crate::run::{ChargePlan, Mode, RunSpec, Trigger, plan_charge, until_deadline};
 use crate::session::{self, Session};
 use crate::supervisor::read_battery_status;
 use crate::sysutil;
 use crate::{durations, platform};
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Local, Utc};
 use std::io::IsTerminal;
 use std::process::Child;
 use std::time::{Duration as StdDuration, Instant};
@@ -19,22 +19,28 @@ pub fn is_console() -> bool {
 }
 
 struct Parsed {
-    timeout_sec: Option<i64>,
-    charge_target: Option<i32>,
-    wait_process: Option<ProcessRef>,
-    trigger: Trigger,
-    charge_reached: Option<(i32, i32)>,
+    trigger: ParsedTrigger,
     no_display: bool,
     even_lid: bool,
 }
 
+enum ParsedTrigger {
+    Indefinite,
+    Timed { input: String, bare: bool },
+    Until(String),
+    Charge(String),
+    Pid(String),
+    App(String),
+}
+
+enum ResolvedTrigger {
+    Run(Trigger),
+    ChargeReached { target: i32, percent: i32 },
+}
+
 fn parse_start_args(args: &[String]) -> Result<Parsed> {
     let mut p = Parsed {
-        timeout_sec: None,
-        charge_target: None,
-        wait_process: None,
-        trigger: Trigger::Indefinite,
-        charge_reached: None,
+        trigger: ParsedTrigger::Indefinite,
         no_display: false,
         even_lid: false,
     };
@@ -48,99 +54,110 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
             "-t" | "--for" => {
                 let v = next_value(args, i, a)?;
                 trigger_flag = claim_trigger(trigger_flag, a)?;
-                let seconds = durations::parse(v)?;
-                p.timeout_sec = Some(seconds);
-                p.trigger = Trigger::Timed {
-                    ends_at: Utc::now() + Duration::seconds(seconds),
+                p.trigger = ParsedTrigger::Timed {
                     input: v.clone(),
+                    bare: false,
                 };
                 i += 1;
             }
             "--until" => {
                 let v = next_value(args, i, "--until")?;
                 trigger_flag = claim_trigger(trigger_flag, a)?;
-                let ends_at = until_deadline(v)?;
-                p.timeout_sec = Some((ends_at - Utc::now()).num_seconds().max(0));
-                p.trigger = Trigger::Until {
-                    ends_at,
-                    time: v.clone(),
-                };
+                p.trigger = ParsedTrigger::Until(v.clone());
                 i += 1;
             }
             "--until-charge" => {
                 let v = next_value(args, i, "--until-charge")?;
                 trigger_flag = claim_trigger(trigger_flag, a)?;
-                let target = parse_int(v, "--until-charge")?;
-                if !(1..=100).contains(&target) {
-                    return Err(AppError::usage("--until-charge must be 1-100"));
-                }
-                p.charge_target = Some(target);
-                let status = read_battery_status()?;
-                match plan_charge(target, &status)? {
-                    ChargePlan::Reached => p.charge_reached = Some((target, status.percent)),
-                    ChargePlan::Wait(direction) => {
-                        p.trigger = Trigger::Charge {
-                            target,
-                            initial: status.percent,
-                            direction,
-                        };
-                    }
-                }
+                p.trigger = ParsedTrigger::Charge(v.clone());
                 i += 1;
             }
             "--while-pid" => {
                 let v = next_value(args, i, "--while-pid")?;
                 trigger_flag = claim_trigger(trigger_flag, a)?;
-                let pid: u32 = v
-                    .trim()
-                    .parse()
-                    .map_err(|_| AppError::fail(format!("invalid pid: '{v}'")))?;
-                let process = sysutil::capture_process(pid)
-                    .map_err(|_| AppError::usage(format!("pid {pid} is not running")))?;
-                p.wait_process = Some(process.clone());
-                p.trigger = Trigger::Pid { process };
+                p.trigger = ParsedTrigger::Pid(v.clone());
                 i += 1;
             }
             "--while-app" => {
                 let v = next_value(args, i, "--while-app")?;
                 trigger_flag = claim_trigger(trigger_flag, a)?;
-                let process = sysutil::find_app_process(v)?
-                    .ok_or_else(|| AppError::usage(format!("no running process matching '{v}'")))?;
-                p.wait_process = Some(process.clone());
-                p.trigger = Trigger::App {
-                    name: v.clone(),
-                    process,
-                };
+                p.trigger = ParsedTrigger::App(v.clone());
                 i += 1;
             }
             "forever" | "indefinite" => {
                 trigger_flag = claim_trigger(trigger_flag, a)?;
-                p.trigger = Trigger::Indefinite;
+                p.trigger = ParsedTrigger::Indefinite;
             }
             other => {
                 if other.starts_with('-') {
                     return Err(AppError::usage(format!("unknown flag: {other}")));
                 }
                 trigger_flag = claim_trigger(trigger_flag, "duration")?;
-                let seconds = durations::parse(other).map_err(|e| {
-                    // A bare all-alphabetic token (e.g. `wake statsu`) is a mistyped subcommand, not a
-                    // duration; report that instead of the misleading "invalid duration" error.
-                    if !other.is_empty() && other.chars().all(|c| c.is_ascii_alphabetic()) {
-                        AppError::usage(format!("unknown command or duration: {other}"))
-                    } else {
-                        e
-                    }
-                })?;
-                p.timeout_sec = Some(seconds);
-                p.trigger = Trigger::Timed {
-                    ends_at: Utc::now() + Duration::seconds(seconds),
+                p.trigger = ParsedTrigger::Timed {
                     input: other.to_string(),
+                    bare: true,
                 };
             }
         }
         i += 1;
     }
     Ok(p)
+}
+
+fn resolve_trigger(parsed: ParsedTrigger) -> Result<ResolvedTrigger> {
+    let trigger = match parsed {
+        ParsedTrigger::Indefinite => Trigger::Indefinite,
+        ParsedTrigger::Timed { input, bare } => Trigger::Timed {
+            seconds: durations::parse(&input).map_err(|error| {
+                if bare && input.chars().all(|c| c.is_ascii_alphabetic()) {
+                    AppError::usage(format!("unknown command or duration: {input}"))
+                } else {
+                    error
+                }
+            })?,
+            input,
+        },
+        ParsedTrigger::Until(time) => Trigger::Until {
+            ends_at: until_deadline(&time)?,
+            time,
+        },
+        ParsedTrigger::Pid(raw) => {
+            let pid = raw
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| AppError::fail(format!("invalid pid: '{raw}'")))?;
+            Trigger::Pid {
+                process: sysutil::capture_process(pid)
+                    .map_err(|_| AppError::usage(format!("pid {pid} is not running")))?,
+            }
+        }
+        ParsedTrigger::App(name) => Trigger::App {
+            process: sysutil::find_app_process(&name)?
+                .ok_or_else(|| AppError::usage(format!("no running process matching '{name}'")))?,
+            name,
+        },
+        ParsedTrigger::Charge(raw) => {
+            let target = parse_int(&raw, "--until-charge")?;
+            if !(1..=100).contains(&target) {
+                return Err(AppError::usage("--until-charge must be 1-100"));
+            }
+            let status = read_battery_status()?;
+            match plan_charge(target, &status)? {
+                ChargePlan::Reached => {
+                    return Ok(ResolvedTrigger::ChargeReached {
+                        target,
+                        percent: status.percent,
+                    });
+                }
+                ChargePlan::Wait(direction) => Trigger::Charge {
+                    target,
+                    initial: status.percent,
+                    direction,
+                },
+            }
+        }
+    };
+    Ok(ResolvedTrigger::Run(trigger))
 }
 
 fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a String> {
@@ -168,14 +185,15 @@ pub fn start(args: &[String]) -> Result<()> {
         println!("wake {}", crate::VERSION);
         return Ok(());
     }
-    let p = parse_start_args(args)?;
+    let parsed = parse_start_args(args)?;
 
-    if p.even_lid && !platform::supports_even_lid() {
+    if parsed.even_lid && !platform::supports_even_lid() {
         return Err(AppError::usage(even_lid_unsupported_message()));
     }
 
     let _lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
+    session::reconcile_stop()?;
     if let Some(existing) = session::read_if_alive()? {
         return Err(AppError::fail(format!(
             "session already active (pid {}, {} {}); run 'wake stop' first",
@@ -183,31 +201,31 @@ pub fn start(args: &[String]) -> Result<()> {
         )));
     }
 
-    if let Some((target, percent)) = p.charge_reached {
-        println!("wake: battery already at {percent}%; target {target}% reached");
-        return Ok(());
-    }
+    let trigger = match resolve_trigger(parsed.trigger)? {
+        ResolvedTrigger::Run(trigger) => trigger,
+        ResolvedTrigger::ChargeReached { target, percent } => {
+            println!("wake: battery already at {percent}%; target {target}% reached");
+            return Ok(());
+        }
+    };
 
-    let mode = if p.no_display {
+    let mode = if parsed.no_display {
         Mode::SystemOnly
     } else {
         Mode::DisplaySystem
     };
 
     #[cfg(not(windows))]
-    if p.even_lid {
-        return start_lid_supervisor(&p, mode.label(), p.charge_target);
+    if parsed.even_lid {
+        return start_lid_supervisor(&trigger, parsed.no_display, mode.label());
     }
 
     #[cfg(windows)]
-    if p.even_lid {
-        return start_even_lid_windows(&p, mode);
+    if parsed.even_lid {
+        return start_even_lid_windows(&trigger, parsed.no_display, mode);
     }
 
-    start_supervisor(RunSpec {
-        mode,
-        trigger: p.trigger,
-    })
+    start_supervisor(RunSpec { mode, trigger })
 }
 
 pub fn start_forever(args: &[String]) -> Result<()> {
@@ -329,7 +347,11 @@ pub fn stop() -> Result<()> {
         return Ok(());
     };
     if s.even_lid {
-        sysutil::terminate(s.pid);
+        let process = s.identity();
+        let terminated = sysutil::terminate_exact(&process);
+        if let Some(message) = stop_failure(Some(terminated), sysutil::process_matches(&process)) {
+            return Err(AppError::fail(message));
+        }
         #[cfg(windows)]
         restore_even_lid_windows(&s)?;
         #[cfg(not(windows))]
@@ -343,8 +365,13 @@ pub fn stop() -> Result<()> {
         while Instant::now() < deadline && sysutil::process_matches(&process) {
             std::thread::sleep(StdDuration::from_millis(100));
         }
-        if sysutil::process_matches(&process) {
-            sysutil::terminate_exact(&process);
+        let fallback = if sysutil::process_matches(&process) {
+            Some(sysutil::terminate_exact(&process))
+        } else {
+            None
+        };
+        if let Some(message) = stop_failure(fallback, sysutil::process_matches(&process)) {
+            return Err(AppError::fail(message));
         }
         let _lock = session::acquire_lock()?;
         session::remove_if_matches(&s)?;
@@ -352,6 +379,16 @@ pub fn stop() -> Result<()> {
     }
     println!("wake: stopped (pid {}, {})", s.pid, s.trigger);
     Ok(())
+}
+
+fn stop_failure(fallback: Option<bool>, exact_process_alive: bool) -> Option<&'static str> {
+    if !exact_process_alive {
+        None
+    } else if fallback == Some(false) {
+        Some("could not terminate supervisor")
+    } else {
+        Some("supervisor remained alive")
+    }
 }
 
 fn print_start_confirmation(s: &Session, note: Option<&str>) {
@@ -455,23 +492,23 @@ fn restore_even_lid_windows(s: &Session) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn start_even_lid_windows(p: &Parsed, mode: Mode) -> Result<()> {
+fn start_even_lid_windows(trigger: &Trigger, no_display: bool, mode: Mode) -> Result<()> {
     let prior = platform::read_lid_action()?;
-    if let Some(charge) = p.charge_target {
-        return start_charge_supervisor_windows(charge, mode, prior);
+    if let Trigger::Charge { target, .. } = trigger {
+        return start_charge_supervisor_windows(*target, mode, prior);
     }
-    let wait_pid = p.wait_process.as_ref().map(|process| process.pid);
-    let ka = platform::keep_awake_command(p.no_display, p.timeout_sec, wait_pid)?;
+    let wait_pid = trigger.process().map(|process| process.pid);
+    let ka = platform::keep_awake_command(no_display, legacy_timeout(trigger), wait_pid)?;
     let now = Utc::now();
     let mut child = sysutil::spawn_named(&ka.cmd)?;
     sysutil::require_child_alive(child.id(), &ka.cmd)?;
     let mut saved = Session {
         pid: child.id(),
         mode: mode.label().into(),
-        trigger: p.trigger.label().into(),
-        detail: p.trigger.detail(),
+        trigger: trigger.label().into(),
+        detail: trigger.detail(),
         started_at: Some(now),
-        ends_at: p.trigger.ends_at(),
+        ends_at: trigger.session_ends_at(now),
         note: ka.note,
         even_lid: true,
         prior_disable_sleep: platform::encode_lid(prior.0, prior.1),
@@ -488,6 +525,14 @@ fn start_even_lid_windows(p: &Parsed, mode: Mode) -> Result<()> {
     }
     print_start_confirmation(&saved, saved.note.as_deref());
     Ok(())
+}
+
+fn legacy_timeout(trigger: &Trigger) -> Option<i64> {
+    match trigger {
+        Trigger::Timed { seconds, .. } => Some(*seconds),
+        Trigger::Until { ends_at, .. } => Some((*ends_at - Utc::now()).num_seconds().max(0)),
+        _ => None,
+    }
 }
 
 #[cfg(windows)]
@@ -537,20 +582,14 @@ fn ensure_sudo_for_even_lid() -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> Result<()> {
-    let supervisor_detail = p.trigger.detail();
+fn start_lid_supervisor(trigger: &Trigger, no_display: bool, mode: &str) -> Result<()> {
+    let supervisor_detail = trigger.detail();
 
     let prior = platform::read_disable_sleep()?;
     ensure_sudo_for_even_lid()?;
-    write_lid_startup_recovery_record(
-        p.trigger.label(),
-        &supervisor_detail,
-        mode,
-        p.timeout_sec,
-        prior,
-    )?;
+    write_lid_startup_recovery_record(trigger, mode, prior)?;
 
-    match lid_enable_and_launch(p, mode, &supervisor_detail, charge_target, prior) {
+    match lid_enable_and_launch(trigger, no_display, &supervisor_detail, prior) {
         Ok(s) => {
             print_start_confirmation(&s, None);
             Ok(())
@@ -568,10 +607,9 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
 
 #[cfg(not(windows))]
 fn lid_enable_and_launch(
-    p: &Parsed,
-    _mode: &str,
+    trigger: &Trigger,
+    no_display: bool,
     supervisor_detail: &str,
-    charge_target: Option<i32>,
     prior: i32,
 ) -> Result<Session> {
     platform::set_disable_sleep_foreground(1)?;
@@ -585,16 +623,21 @@ fn lid_enable_and_launch(
     let cmd = vec![
         sysutil::self_exe()?,
         "__supervise_lid__".into(),
-        if p.no_display { "i" } else { "d" }.into(),
-        p.timeout_sec.map(|t| t.to_string()).unwrap_or_default(),
-        p.wait_process
-            .as_ref()
+        if no_display { "i" } else { "d" }.into(),
+        legacy_timeout(trigger)
+            .map(|timeout| timeout.to_string())
+            .unwrap_or_default(),
+        trigger
+            .process()
             .map(|process| process.pid.to_string())
             .unwrap_or_default(),
         prior.to_string(),
-        p.trigger.label().into(),
+        trigger.label().into(),
         supervisor_detail.to_string(),
-        charge_target.map(|c| c.to_string()).unwrap_or_default(),
+        match trigger {
+            Trigger::Charge { target, .. } => target.to_string(),
+            _ => String::new(),
+        },
     ];
     let mut child = sysutil::spawn_named(&cmd)?;
     match wait_for_session(&mut child, true) {
@@ -607,21 +650,15 @@ fn lid_enable_and_launch(
 }
 
 #[cfg(not(windows))]
-fn write_lid_startup_recovery_record(
-    trigger: &str,
-    detail: &str,
-    mode: &str,
-    timeout_sec: Option<i64>,
-    prior: i32,
-) -> Result<()> {
+fn write_lid_startup_recovery_record(trigger: &Trigger, mode: &str, prior: i32) -> Result<()> {
     let now = Utc::now();
     let mut s = Session {
         pid: sysutil::current_pid(),
         mode: mode.to_string(),
-        trigger: trigger.to_string(),
-        detail: detail.to_string(),
+        trigger: trigger.label().into(),
+        detail: trigger.detail(),
         started_at: Some(now),
-        ends_at: timeout_sec.map(|t| now + Duration::seconds(t)),
+        ends_at: trigger.session_ends_at(now),
         even_lid: true,
         prior_disable_sleep: prior,
         ..Default::default()
@@ -852,6 +889,47 @@ fn recover_crashed_even_lid_windows(saved: &Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntax_errors_win_before_process_or_app_resolution() {
+        let cases = [
+            (
+                vec!["--while-pid", "4294967295", "--bogus"],
+                "unknown flag: --bogus",
+            ),
+            (
+                vec!["--while-pid", "not-a-pid", "--bogus"],
+                "unknown flag: --bogus",
+            ),
+            (vec!["12fortnights", "--bogus"], "unknown flag: --bogus"),
+            (
+                vec!["--while-app", "wake-no-such-app-42", "1m"],
+                "conflicting triggers",
+            ),
+        ];
+        for (args, expected) in cases {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let error = match parse_start_args(&args) {
+                Ok(_) => panic!("expected syntax error"),
+                Err(error) => error,
+            };
+            assert!(error.message().contains(expected), "{}", error.message());
+        }
+    }
+
+    #[test]
+    fn stop_confirmation_requires_exact_process_exit() {
+        let cases = [
+            (None, false, None),
+            (Some(true), false, None),
+            (Some(false), false, None),
+            (Some(false), true, Some("could not terminate supervisor")),
+            (Some(true), true, Some("supervisor remained alive")),
+        ];
+        for (fallback, alive, expected) in cases {
+            assert_eq!(stop_failure(fallback, alive), expected);
+        }
+    }
 
     #[test]
     fn live_session_marker_consistency_table() {

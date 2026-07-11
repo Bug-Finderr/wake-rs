@@ -171,12 +171,6 @@ pub fn parent_pid() -> Option<u32> {
         .map(|p| p.as_u32())
 }
 
-pub fn terminate(pid: u32) {
-    if let Ok(process) = capture_process(pid) {
-        terminate_exact(&process);
-    }
-}
-
 pub fn terminate_exact(reference: &ProcessRef) -> bool {
     if !process_matches(reference) {
         return false;

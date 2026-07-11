@@ -199,13 +199,13 @@ pub fn read_battery() -> Result<BatteryStatus> {
 }
 
 fn battery_from_values(ac: u8, flags: u8, percent: u8) -> Result<BatteryStatus> {
-    if flags == u8::MAX || flags & 128 != 0 || percent == u8::MAX {
+    if ac == u8::MAX || flags == u8::MAX || flags & 128 != 0 || percent > 100 {
         return Err(AppError::fail("no usable battery found"));
     }
     let charging = flags & 8 != 0;
     let discharging = !charging && ac == 0;
     Ok(BatteryStatus {
-        percent: i32::from(percent.min(100)),
+        percent: i32::from(percent),
         charging,
         discharging,
         neutral_state: (!charging && !discharging).then(|| "not charging or discharging".into()),
@@ -342,6 +342,8 @@ mod tests {
             );
         }
         assert!(battery_from_values(1, 128, 255).is_err());
+        assert!(battery_from_values(255, 0, 50).is_err());
+        assert!(battery_from_values(1, 8, 101).is_err());
     }
 
     #[test]

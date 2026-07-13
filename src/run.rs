@@ -91,11 +91,16 @@ impl Trigger {
         }
     }
 
-    pub fn session_ends_at(&self, started_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    pub fn deadline(&self, started_at: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
         match self {
-            Self::Timed { seconds, .. } => Some(started_at + chrono::Duration::seconds(*seconds)),
-            Self::Until { ends_at, .. } => Some(*ends_at),
-            _ => None,
+            Self::Timed { seconds, .. } => started_at
+                .checked_add_signed(chrono::Duration::seconds(*seconds))
+                .map(Some)
+                .ok_or_else(|| {
+                    AppError::fail("session deadline is outside the supported timestamp range")
+                }),
+            Self::Until { ends_at, .. } => Ok(Some(*ends_at)),
+            _ => Ok(None),
         }
     }
 
@@ -115,6 +120,19 @@ impl Trigger {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub native_start: u64,
+}
+
+impl ProcessIdentity {
+    pub fn is_valid(self) -> bool {
+        self.pid > 0 && self.native_start > 0
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProcessRef {
@@ -124,8 +142,15 @@ pub struct ProcessRef {
 }
 
 impl ProcessRef {
+    pub fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            native_start: self.start,
+        }
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
-        self.pid > 0 && self.start > 0 && !self.command.trim().is_empty()
+        self.identity().is_valid() && !self.command.trim().is_empty()
     }
 }
 
@@ -298,6 +323,59 @@ mod tests {
             r#"{"mode":"system-only","trigger":{"kind":"pid","process":{"pid":1,"start":2,"command":"x","extra":true}}}"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn process_identity_json_is_strict_and_validated() {
+        let identity = ProcessIdentity {
+            pid: 42,
+            native_start: 99,
+        };
+        let json = serde_json::to_string(&identity).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<ProcessIdentity>(&json).unwrap(),
+            identity
+        );
+        assert!(identity.is_valid());
+        assert!(!ProcessIdentity { pid: 0, ..identity }.is_valid());
+        assert!(
+            !ProcessIdentity {
+                native_start: 0,
+                ..identity
+            }
+            .is_valid()
+        );
+        assert!(
+            serde_json::from_str::<ProcessIdentity>(r#"{"pid":42,"nativeStart":99,"extra":true}"#,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn process_ref_exposes_its_native_identity() {
+        assert_eq!(
+            process().identity(),
+            ProcessIdentity {
+                pid: 42,
+                native_start: 1_700_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn timed_deadline_rejects_timestamp_overflow() {
+        let trigger = Trigger::Timed {
+            seconds: 1,
+            input: "1s".into(),
+        };
+
+        let error = trigger.deadline(DateTime::<Utc>::MAX_UTC).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "session deadline is outside the supported timestamp range"
+        );
     }
 
     #[test]

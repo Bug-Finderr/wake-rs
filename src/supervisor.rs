@@ -106,7 +106,7 @@ fn start_session(
     let started_at = Utc::now();
     let saved = Session {
         owner,
-        ends_at: spec.trigger.session_ends_at(started_at),
+        ends_at: spec.trigger.deadline(started_at)?,
         note: inhibitor.note().map(str::to_string),
         spec,
         started_at,
@@ -142,11 +142,8 @@ fn supervise_loop(
         {
             return Ok(());
         }
-        if saved
-            .spec
-            .trigger
-            .process()
-            .is_some_and(|process| !sysutil::process_matches(process))
+        if let Some(process) = saved.spec.trigger.process()
+            && !sysutil::process_identity_matches(&process.identity())?
         {
             return Ok(());
         }

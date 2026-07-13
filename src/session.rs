@@ -309,14 +309,18 @@ pub fn reserve_process_lease() -> Result<ProcessLeaseReservation> {
 }
 
 pub fn claim_process_lease(token: &str) -> Result<ProcessLease> {
-    claim_process_lease_at(&state_dir(), token, std::process::id())
+    claim_process_lease_at(
+        &state_dir(),
+        token,
+        sysutil::current_process_identity()?.pid,
+    )
 }
 
-pub fn process_lease_is_held(reference: &LeaseRef) -> Result<bool> {
+pub(crate) fn process_lease_is_held_in(dir: &Path, reference: &LeaseRef) -> Result<bool> {
     if !reference.has_valid_token() {
         return Err(AppError::fail("invalid process lease"));
     }
-    process_lease_is_held_at(&state_dir(), &reference.token)
+    process_lease_is_held_at(dir, &reference.token)
 }
 
 pub fn discard_process_lease(token: &str) -> Result<()> {
@@ -413,10 +417,11 @@ fn is_guid(value: &str) -> bool {
 }
 
 impl Session {
-    fn is_valid(&self) -> bool {
-        self.owner.has_valid_token()
-            && self.spec.validate().is_ok()
-            && self.ends_at == self.spec.trigger.session_ends_at(self.started_at)
+    fn is_valid(&self) -> Result<bool> {
+        if !self.owner.has_valid_token() || self.spec.validate().is_err() {
+            return Ok(false);
+        }
+        Ok(self.ends_at == self.spec.trigger.deadline(self.started_at)?)
     }
 
     pub fn owner_is_live(&self) -> Result<bool> {
@@ -532,12 +537,16 @@ fn sync_parent(_dir: &Path) -> std::io::Result<()> {
 
 fn read_session_at(path: &Path) -> Result<Option<Session>> {
     let saved: Option<Session> = read_json(path)?;
-    match saved {
-        Some(saved) if !saved.is_valid() => Err(AppError::fail(format!(
-            "invalid session at {}",
-            path.display()
-        ))),
-        saved => Ok(saved),
+    if let Some(saved) = saved {
+        if !saved.is_valid()? {
+            return Err(AppError::fail(format!(
+                "invalid session at {}",
+                path.display()
+            )));
+        }
+        Ok(Some(saved))
+    } else {
+        Ok(None)
     }
 }
 
@@ -768,7 +777,7 @@ fn state_io_err(path: &Path, e: std::io::Error) -> AppError {
 }
 
 fn write_pending_at(path: &Path, session: &Session) -> Result<()> {
-    if session.owner.pid != 0 || !session.is_valid() {
+    if session.owner.pid != 0 || !session.is_valid()? {
         return Err(AppError::fail("invalid pending session"));
     }
     if read_session_at(path)?.is_some() {
@@ -778,7 +787,7 @@ fn write_pending_at(path: &Path, session: &Session) -> Result<()> {
 }
 
 fn write_ready_at(path: &Path, session: &Session) -> Result<()> {
-    if !session.owner.is_valid() || !session.is_valid() {
+    if !session.owner.is_valid() || !session.is_valid()? {
         return Err(AppError::fail("invalid ready session"));
     }
     let Some(pending) = read_session_at(path)? else {
@@ -1108,6 +1117,27 @@ mod tests {
             write_json(&path, &saved).unwrap();
             assert!(read_session_at(&path).is_err());
         }
+    }
+
+    #[test]
+    fn session_validation_propagates_deadline_overflow() {
+        let dir = TestDir::new("session-deadline-overflow");
+        let path = dir.join("session.json");
+        let mut saved = sample_session();
+        saved.started_at = DateTime::<Utc>::MAX_UTC;
+        saved.spec.trigger = crate::run::Trigger::Timed {
+            seconds: 1,
+            input: "1s".into(),
+        };
+        saved.ends_at = None;
+        write_json(&path, &saved).unwrap();
+
+        let error = read_session_at(&path).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "session deadline is outside the supported timestamp range"
+        );
     }
 
     #[test]

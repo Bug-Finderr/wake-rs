@@ -1,5 +1,5 @@
 use crate::error::{AppError, Result};
-use crate::run::ProcessRef;
+use crate::run::{ProcessIdentity, ProcessRef};
 use crate::session::{self, LeaseRef};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
@@ -33,21 +33,24 @@ fn process_of(system: &System, pid: u32, start: u64) -> Option<(ProcessRef, Stri
     ))
 }
 
-fn observed_process(pid: u32) -> Option<(ProcessRef, String)> {
-    let before = native_process_start(pid).unwrap_or(0);
+fn observed_process(pid: u32) -> Result<Option<(ProcessRef, String)>> {
+    let Some(before) = native_process_start(pid)? else {
+        return Ok(None);
+    };
     let system = refreshed(pid);
-    let process = process_of(&system, pid, before)?;
-    let after = native_process_start(pid).unwrap_or(0);
-    (before == after).then_some(process)
-}
-
-pub fn live_process(pid: u32) -> Option<ProcessRef> {
-    observed_process(pid).map(|(process, _)| process)
+    let Some(process) = process_of(&system, pid, before) else {
+        return Ok(None);
+    };
+    let Some(after) = native_process_start(pid)? else {
+        return Ok(None);
+    };
+    Ok((before == after).then_some(process))
 }
 
 pub fn capture_process(pid: u32) -> Result<ProcessRef> {
-    let process =
-        live_process(pid).ok_or_else(|| AppError::fail(format!("process {pid} is not running")))?;
+    let process = observed_process(pid)?
+        .map(|(process, _)| process)
+        .ok_or_else(|| AppError::fail(format!("process {pid} is not running")))?;
     if !process.is_valid() {
         return Err(AppError::fail(format!(
             "process {pid} does not expose a stable identity"
@@ -56,19 +59,32 @@ pub fn capture_process(pid: u32) -> Result<ProcessRef> {
     Ok(process)
 }
 
-pub fn process_matches(reference: &ProcessRef) -> bool {
-    live_process(reference.pid)
-        .as_ref()
-        .is_some_and(|process| same_process(reference, process))
+fn process_identity_with(
+    pid: u32,
+    read_start: impl FnOnce(u32) -> Result<Option<u64>>,
+) -> Result<Option<ProcessIdentity>> {
+    read_start(pid).map(|start| start.map(|native_start| ProcessIdentity { pid, native_start }))
 }
 
-fn same_process(left: &ProcessRef, right: &ProcessRef) -> bool {
-    left.pid == right.pid && left.start == right.start
+pub fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
+    process_identity_with(pid, native_process_start)
+}
+
+pub fn current_process_identity() -> Result<ProcessIdentity> {
+    process_identity(std::process::id())?
+        .ok_or_else(|| AppError::fail("wake process does not expose a stable identity"))
+}
+
+pub fn process_identity_matches(expected: &ProcessIdentity) -> Result<bool> {
+    Ok(native_process_start(expected.pid)? == Some(expected.native_start))
 }
 
 pub fn lease_is_live(reference: &LeaseRef) -> Result<bool> {
-    let held = session::process_lease_is_held(reference)?;
-    Ok(held && (reference.pid == 0 || live_process(reference.pid).is_some()))
+    lease_is_live_at(reference, &session::state_dir())
+}
+
+fn lease_is_live_at(reference: &LeaseRef, state_dir: &std::path::Path) -> Result<bool> {
+    session::process_lease_is_held_in(state_dir, reference)
 }
 
 pub fn wait_lease_exit(reference: &LeaseRef, within: Duration) -> Result<bool> {
@@ -108,7 +124,7 @@ pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
         {
             continue;
         }
-        let Some((candidate, current_name)) = observed_process(pid.as_u32()) else {
+        let Some((candidate, current_name)) = observed_process(pid.as_u32())? else {
             continue;
         };
         if !app_name_matches(name, &current_name, &candidate.command) {
@@ -128,65 +144,140 @@ pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
 }
 
 #[cfg(target_os = "linux")]
-fn native_process_start(pid: u32) -> Option<u64> {
-    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-    let closing_paren = stat.iter().rposition(|byte| *byte == b')')?;
-    std::str::from_utf8(stat.get(closing_paren + 1..)?)
-        .ok()?
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+fn native_process_start(pid: u32) -> Result<Option<u64>> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match std::fs::read(&path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::fail(format!(
+                "could not inspect process {pid} at {path}: {error}"
+            )));
+        }
+    };
+    parse_linux_process_start(&stat).map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_start(stat: &[u8]) -> Result<u64> {
+    let closing_paren = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or_else(|| AppError::fail("process start time is missing from /proc stat"))?;
+    std::str::from_utf8(
+        stat.get(closing_paren + 1..)
+            .ok_or_else(|| AppError::fail("process start time is missing from /proc stat"))?,
+    )
+    .map_err(|error| AppError::fail(format!("process stat is not UTF-8: {error}")))?
+    .split_whitespace()
+    .nth(19)
+    .ok_or_else(|| AppError::fail("process start time is missing from /proc stat"))?
+    .parse()
+    .map_err(|error| AppError::fail(format!("invalid process start time in /proc stat: {error}")))
 }
 
 #[cfg(target_os = "macos")]
-fn native_process_start(pid: u32) -> Option<u64> {
-    let pid = i32::try_from(pid).ok()?;
+fn native_process_start(pid: u32) -> Result<Option<u64>> {
+    let native_pid = i32::try_from(pid)
+        .map_err(|_| AppError::fail(format!("process ID {pid} is outside the supported range")))?;
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
     // SAFETY: info points to writable storage of the exact size passed to proc_pidinfo. It is
-    // read only when the call reports that it initialized the entire proc_bsdinfo value.
+    // read only when the call reports that it initialized the entire proc_bsdinfo value. errno is
+    // cleared through the thread-local pointer so a zero return can be classified precisely.
     let read = unsafe {
+        *libc::__error() = 0;
         libc::proc_pidinfo(
-            pid,
+            native_pid,
             libc::PROC_PIDTBSDINFO,
             0,
             info.as_mut_ptr().cast(),
             size as i32,
         )
     };
+    if read == 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else {
+            Err(AppError::fail(format!(
+                "could not inspect process {pid}: {error}"
+            )))
+        };
+    }
     if read != size as i32 {
-        return None;
+        return Err(AppError::fail(format!(
+            "could not inspect process {pid}: proc_pidinfo returned {read} of {size} bytes"
+        )));
     }
     // SAFETY: the successful call above initialized all bytes of info.
     let info = unsafe { info.assume_init() };
-    info.pbi_start_tvsec
-        .checked_mul(1_000_000)?
-        .checked_add(info.pbi_start_tvusec)
+    let native_start = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+        .ok_or_else(|| AppError::fail(format!("process {pid} start time is out of range")))?;
+    Ok(Some(native_start))
 }
 
 #[cfg(windows)]
-fn native_process_start(pid: u32) -> Option<u64> {
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+fn native_process_start(pid: u32) -> Result<Option<u64>> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, GetLastError, WAIT_FAILED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
     };
 
     // SAFETY: the process handle is checked before use, every FILETIME points to valid writable
     // storage for the synchronous call, and the owned handle is closed exactly once.
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        );
         if handle.is_null() {
-            return None;
+            let code = GetLastError();
+            return if code == ERROR_INVALID_PARAMETER {
+                Ok(None)
+            } else {
+                Err(AppError::fail(format!(
+                    "could not inspect process {pid}: {}",
+                    std::io::Error::from_raw_os_error(code as i32)
+                )))
+            };
         }
         let mut created = FILETIME::default();
         let mut exited = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
         let read = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        if read == 0 {
+            let error = std::io::Error::last_os_error();
+            CloseHandle(handle);
+            return Err(AppError::fail(format!(
+                "could not read process {pid} start time: {error}"
+            )));
+        }
+        let native_start =
+            (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        let wait = WaitForSingleObject(handle, 0);
+        let wait_error = (wait == WAIT_FAILED).then(std::io::Error::last_os_error);
         CloseHandle(handle);
-        (read != 0)
-            .then_some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+        match wait {
+            WAIT_OBJECT_0 => Ok(None),
+            WAIT_TIMEOUT => Ok(Some(native_start)),
+            WAIT_FAILED => Err(AppError::fail(format!(
+                "could not inspect process {pid} state: {}",
+                wait_error.expect("WAIT_FAILED captures an OS error")
+            ))),
+            other => Err(AppError::fail(format!(
+                "unexpected process {pid} wait result {other}"
+            ))),
+        }
     }
 }
 
@@ -472,8 +563,8 @@ mod tests {
             ..renamed.clone()
         };
 
-        assert!(same_process(&original, &renamed));
-        assert!(!same_process(&original, &reused));
+        assert_eq!(original.identity(), renamed.identity());
+        assert_ne!(original.identity(), reused.identity());
     }
 
     #[test]
@@ -482,13 +573,109 @@ mod tests {
         let second = capture_process(current_pid()).unwrap();
 
         assert!(first.is_valid());
-        assert!(same_process(&first, &second));
+        assert_eq!(first.identity(), second.identity());
+    }
+
+    #[test]
+    fn native_identity_matches_the_current_process() {
+        let identity = current_process_identity().unwrap();
+
+        assert_eq!(identity.pid, std::process::id());
+        assert!(identity.is_valid());
+        assert!(process_identity_matches(&identity).unwrap());
+    }
+
+    #[test]
+    fn native_identity_reader_errors_are_not_treated_as_absence() {
+        let error = process_identity_with(42, |_| {
+            Err(AppError::fail("native process inspection failed"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.message(), "native process inspection failed");
+    }
+
+    #[test]
+    fn held_lease_liveness_does_not_depend_on_recorded_pid() {
+        let dir = std::env::temp_dir().join(format!(
+            "wake-held-lease-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let path = dir.join(format!("process-{token}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.lock().unwrap();
+        let reference = LeaseRef {
+            pid: u32::MAX,
+            token: token.into(),
+        };
+
+        let live = lease_is_live_at(&reference, &dir);
+
+        file.unlock().unwrap();
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(live.unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_terminated_process_object_does_not_match() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sysutil::tests::retained_process_identity_test_child",
+            ])
+            .env("WAKE_TEST_RETAINED_PROCESS_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let identity = process_identity(child.id()).unwrap().unwrap();
+        assert!(process_identity_matches(&identity).unwrap());
+
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+
+        assert!(!process_identity_matches(&identity).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_process_identity_test_child() {
+        if std::env::var_os("WAKE_TEST_RETAINED_PROCESS_CHILD").is_none() {
+            return;
+        }
+        use std::io::Read as _;
+        let mut byte = [0_u8];
+        std::io::stdin().read_exact(&mut byte).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_linux_process_stat_is_an_error() {
+        let error = parse_linux_process_start(b"42 (wake) S malformed").unwrap_err();
+
+        assert!(error.message().contains("process start time"));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn process_identity_uses_native_start_ticks() {
-        let process = live_process(current_pid()).expect("current process");
+        let process = process_identity(current_pid())
+            .unwrap()
+            .expect("current process");
         let stat = std::fs::read(format!("/proc/{}/stat", current_pid())).unwrap();
         let closing_paren = stat.iter().rposition(|byte| *byte == b')').unwrap();
         let expected = std::str::from_utf8(&stat[closing_paren + 1..])
@@ -499,6 +686,6 @@ mod tests {
             .parse::<u64>()
             .unwrap();
 
-        assert_eq!(process.start, expected);
+        assert_eq!(process.native_start, expected);
     }
 }

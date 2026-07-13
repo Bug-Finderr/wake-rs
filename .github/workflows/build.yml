@@ -10,16 +10,12 @@ on:
 permissions:
   contents: read
 
-env:
-  RUST_VERSION: 1.97.0
-
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component rustfmt
-      - run: cargo +${{ env.RUST_VERSION }} fmt --check
+      - run: cargo fmt --check
 
   audit:
     runs-on: ubuntu-latest
@@ -44,10 +40,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component clippy
-      - run: cargo +${{ env.RUST_VERSION }} clippy --all-targets --locked -- -D warnings
-      - run: cargo +${{ env.RUST_VERSION }} test --release --locked
-      - run: cargo +${{ env.RUST_VERSION }} build --release --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
 
       - name: Smoke test (Linux)
         if: runner.os == 'Linux'
@@ -61,11 +56,12 @@ jobs:
       - name: Smoke test (macOS)
         if: runner.os == 'macOS'
         run: |
+          set -o pipefail
           state="$(mktemp -d)"
           export WAKE_STATE_DIR="$state"
           trap 'target/release/wake stop >/dev/null 2>&1; rm -rf "$state"' EXIT
           target/release/wake --version | grep -F 'wake '
-          target/release/wake --help | grep -F 'wake --until-charge N'
+          target/release/wake --help | grep -F -- '--until-charge N'
           battery_output="$(target/release/wake --until-charge 80 2>&1)" && battery_code=0 || battery_code=$?
           case "$battery_code:$battery_output" in
             0:*"wake: session active"*|\
@@ -77,7 +73,10 @@ jobs:
               2:*"wake: cannot determine battery charging direction"*) ;;
             *) printf 'unexpected battery result (exit %s)\n%s\n' "$battery_code" "$battery_output"; exit 1 ;;
           esac
-          ! printf '%s\n' "$battery_output" | grep -E 'panicked|RUST_BACKTRACE'
+          if printf '%s\n' "$battery_output" | grep -E 'panicked|RUST_BACKTRACE'; then
+            echo "unexpected panic output"
+            exit 1
+          fi
           if [ "$battery_code" -eq 0 ]; then target/release/wake stop >/dev/null; fi
           if target/release/wake --even-lid >even-lid.out 2>&1; then
             echo 'expected the user-owned CI binary to refuse privileged relaunch'

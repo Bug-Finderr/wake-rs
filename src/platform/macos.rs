@@ -107,7 +107,7 @@ pub struct Inhibitor {
 }
 
 impl Inhibitor {
-    pub fn start(mode: Mode) -> Result<Self> {
+    pub fn start(mode: Mode, _even_lid: bool) -> Result<Self> {
         let mut command = Command::new(CAFFEINATE);
         command.arg("-i");
         if mode == Mode::DisplaySystem {
@@ -130,6 +130,10 @@ impl Inhibitor {
     pub fn alive(&mut self) -> bool {
         self.child.try_wait().is_ok_and(|status| status.is_none())
     }
+}
+
+pub fn inhibitor_startup_error(_even_lid: bool) -> AppError {
+    AppError::inhibitor_startup("sleep inhibitor exited during startup")
 }
 
 impl Drop for Inhibitor {

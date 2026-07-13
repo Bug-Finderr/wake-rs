@@ -219,14 +219,24 @@ pub struct Prepared {
     marker: LidRestore,
 }
 
+pub fn uses_watchdog(spec: &RunSpec) -> bool {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        spec.even_lid
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = spec;
+        false
+    }
+}
+
 pub fn prepare_start(spec: &RunSpec) -> Result<Option<Prepared>> {
     if !spec.even_lid {
         return Ok(None);
     }
     #[cfg(target_os = "linux")]
-    return Err(AppError::usage(
-        "--even-lid is unsupported on this platform",
-    ));
+    return Ok(None);
     #[cfg(target_os = "macos")]
     {
         platform::trusted_helper_executable()?;
@@ -262,7 +272,7 @@ pub fn rollback_start(_prepared: &Prepared) -> Result<()> {
 }
 
 pub fn launch_watchdog(saved: &Session, lock: session::LockGuard) -> Result<()> {
-    if !saved.spec.even_lid {
+    if !uses_watchdog(&saved.spec) {
         return Ok(());
     }
     #[cfg(windows)]
@@ -811,7 +821,7 @@ fn recovery_session(saved: &Result<Option<Session>>) -> Result<RecoverySession> 
         Err(_) => RecoverySession::Malformed,
         Ok(None) => RecoverySession::Missing,
         Ok(Some(saved)) if !saved.owner_is_live()? => RecoverySession::Stale,
-        Ok(Some(saved)) if saved.spec.even_lid => RecoverySession::LiveLid,
+        Ok(Some(saved)) if uses_watchdog(&saved.spec) => RecoverySession::LiveLid,
         Ok(Some(_)) => RecoverySession::LiveOrdinary,
     })
 }
@@ -1027,7 +1037,21 @@ fn decode_helper_state_dir(encoded: &str) -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::run::{Mode, Trigger};
     use std::cell::RefCell;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_even_lid_does_not_use_watchdog() {
+        let spec = RunSpec {
+            mode: Mode::DisplaySystem,
+            trigger: Trigger::Indefinite,
+            even_lid: true,
+        };
+
+        assert!(!uses_watchdog(&spec));
+    }
 
     fn process(pid: u32) -> LeaseRef {
         LeaseRef {

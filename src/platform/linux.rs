@@ -9,10 +9,11 @@ const POWER_SUPPLY: &str = "/sys/class/power_supply";
 const DISPLAY_SYSTEM_INHIBITORS: &[&str] = &["idle:sleep:handle-lid-switch", "idle:sleep", "sleep"];
 const SYSTEM_ONLY_INHIBITORS: &[&str] = &["sleep:handle-lid-switch", "sleep"];
 const INHIBIT_DENIED_MESSAGE: &str = "systemd-inhibit cannot take inhibitor locks in this session (polkit denied); try from a local desktop session or as root";
+const EVEN_LID_INHIBIT_DENIED_MESSAGE: &str = "could not acquire the systemd-logind handle-lid-switch inhibitor required by --even-lid; logind may be unavailable or this session may lack permission";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub fn supports_even_lid() -> bool {
-    false
+    true
 }
 
 pub struct Inhibitor {
@@ -21,13 +22,13 @@ pub struct Inhibitor {
 }
 
 impl Inhibitor {
-    pub fn start(mode: Mode) -> Result<Self> {
+    pub fn start(mode: Mode, even_lid: bool) -> Result<Self> {
         let program = super::resolve_on_path(
             "systemd-inhibit",
             "systemd-inhibit not found on PATH; wake requires systemd on Linux",
         )?;
         let tail = super::resolve_on_path("tail", "tail not found on PATH")?;
-        let (requested, what) = choose_inhibitor_what(mode.no_display(), &program)?;
+        let (requested, what) = choose_inhibitor_what(mode.no_display(), even_lid, &program)?;
         let child = Command::new(program)
             .args([
                 format!("--what={what}"),
@@ -56,6 +57,14 @@ impl Inhibitor {
 
     pub fn alive(&mut self) -> bool {
         self.child.try_wait().is_ok_and(|status| status.is_none())
+    }
+}
+
+pub fn inhibitor_startup_error(even_lid: bool) -> AppError {
+    if even_lid {
+        AppError::inhibitor_startup(EVEN_LID_INHIBIT_DENIED_MESSAGE)
+    } else {
+        AppError::fail("sleep inhibitor exited during startup")
     }
 }
 
@@ -109,20 +118,34 @@ pub fn read_battery() -> Result<BatteryStatus> {
 
 fn choose_inhibitor_what(
     no_display: bool,
+    even_lid: bool,
     systemd_inhibit: &str,
 ) -> Result<(&'static str, String)> {
-    let candidates = if no_display {
-        SYSTEM_ONLY_INHIBITORS
-    } else {
-        DISPLAY_SYSTEM_INHIBITORS
-    };
+    let candidates = inhibitor_candidates(no_display, even_lid);
     let requested = candidates[0];
     for candidate in candidates {
         if probe_inhibitor(systemd_inhibit, candidate) {
             return Ok((requested, candidate.to_string()));
         }
     }
-    Err(AppError::fail(INHIBIT_DENIED_MESSAGE))
+    if even_lid {
+        Err(inhibitor_startup_error(true))
+    } else {
+        Err(AppError::fail(INHIBIT_DENIED_MESSAGE))
+    }
+}
+
+fn inhibitor_candidates(no_display: bool, even_lid: bool) -> &'static [&'static str] {
+    let candidates = if no_display {
+        SYSTEM_ONLY_INHIBITORS
+    } else {
+        DISPLAY_SYSTEM_INHIBITORS
+    };
+    if even_lid {
+        &candidates[..1]
+    } else {
+        candidates
+    }
 }
 
 fn probe_inhibitor(systemd_inhibit: &str, what: &str) -> bool {
@@ -131,6 +154,7 @@ fn probe_inhibitor(systemd_inhibit: &str, what: &str) -> bool {
             &format!("--what={what}"),
             "--who=wake",
             "--why=probe",
+            "--mode=block",
             "true",
         ])
         .stdin(Stdio::null())
@@ -203,9 +227,10 @@ fn battery_percent(batteries: &[Battery]) -> Option<i32> {
             .iter()
             .filter_map(|battery| battery.measurement)
             .fold((0_u128, 0_u128), |totals, measurement| {
+                let full = u128::from(measurement.full);
                 (
-                    totals.0 + u128::from(measurement.now),
-                    totals.1 + u128::from(measurement.full),
+                    totals.0 + u128::from(measurement.now).min(full),
+                    totals.1 + full,
                 )
             });
         return Some(((100.0 * now as f64 / full as f64).round() as i32).clamp(0, 100));
@@ -216,7 +241,7 @@ fn battery_percent(batteries: &[Battery]) -> Option<i32> {
         .filter_map(|battery| {
             battery
                 .measurement
-                .map(|value| 100.0 * value.now as f64 / value.full as f64)
+                .map(|value| 100.0 * value.now.min(value.full) as f64 / value.full as f64)
                 .or_else(|| battery.capacity.map(f64::from))
         })
         .collect::<Vec<_>>();
@@ -282,6 +307,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_even_lid_has_no_weaker_fallback() {
+        assert_eq!(
+            inhibitor_candidates(false, true),
+            &["idle:sleep:handle-lid-switch"]
+        );
+        assert_eq!(
+            inhibitor_candidates(true, true),
+            &["sleep:handle-lid-switch"]
+        );
+        assert_eq!(
+            inhibitor_candidates(false, false),
+            DISPLAY_SYSTEM_INHIBITORS
+        );
+    }
+
+    #[test]
+    fn explicit_even_lid_uses_required_inhibitor_startup_error() {
+        let error = inhibitor_startup_error(true);
+
+        assert_eq!(
+            error.message(),
+            "could not acquire the systemd-logind handle-lid-switch inhibitor required by --even-lid; logind may be unavailable or this session may lack permission"
+        );
+        assert_eq!(error.exit_code(), crate::error::INHIBITOR_STARTUP_EXIT_CODE);
+        assert!(matches!(error, AppError::InhibitorStartup(_)));
+    }
+
+    #[test]
     fn same_unit_batteries_are_weighted_by_full_capacity() {
         let batteries = [
             measured(MeasurementKind::Energy, 9, 10),
@@ -292,10 +345,30 @@ mod tests {
     }
 
     #[test]
+    fn overfull_measurements_are_clamped_before_aggregation() {
+        let batteries = [
+            measured(MeasurementKind::Energy, 200, 100),
+            measured(MeasurementKind::Energy, 0, 100),
+        ];
+
+        assert_eq!(battery_percent(&batteries), Some(50));
+    }
+
+    #[test]
     fn incompatible_battery_units_are_not_summed() {
         let batteries = [
             measured(MeasurementKind::Energy, 9, 10),
             measured(MeasurementKind::Charge, 10, 100),
+        ];
+
+        assert_eq!(battery_percent(&batteries), Some(50));
+    }
+
+    #[test]
+    fn overfull_mixed_measurements_are_clamped_before_averaging() {
+        let batteries = [
+            measured(MeasurementKind::Energy, 200, 100),
+            measured(MeasurementKind::Charge, 0, 100),
         ];
 
         assert_eq!(battery_percent(&batteries), Some(50));

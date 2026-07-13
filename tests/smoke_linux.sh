@@ -10,6 +10,9 @@ fake_bin="$WAKE_STATE_DIR/bin"
 mkdir -p "$fake_bin"
 cat > "$fake_bin/systemd-inhibit" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${WAKE_TEST_DENY_LID:-0}" == 1 && " $* " == *handle-lid-switch* ]]; then
+  exit 1
+fi
 while [[ "${1:-}" == --* ]]; do
   shift
 done
@@ -48,6 +51,19 @@ run 0 "no active session"       -- stop
 run 0 "session active"          --
 run 0 "session active"          -- status
 run 0 "stopped"                 -- stop
+
+PATH="$fake_bin" run 1 "supervisor exited during startup" -- --even-lid 30s
+run 0 "no active session" -- status
+
+export WAKE_TEST_DENY_LID=1
+run 0 "session active" -- 30s
+run 0 "stopped" -- stop
+run 1 "handle-lid-switch inhibitor required" -- --even-lid 30s
+run 0 "no active session" -- status
+unset WAKE_TEST_DENY_LID
+run 0 "session active" -- --even-lid 30s
+run 0 "--even-lid active" -- status
+run 0 "stopped" -- stop
 
 battery_output="$("$wake" --until-charge 80 2>&1)"
 battery_code=$?

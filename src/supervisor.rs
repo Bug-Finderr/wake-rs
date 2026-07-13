@@ -55,13 +55,13 @@ fn supervise(spec: RunSpec, owner: session::LeaseRef) -> Result<()> {
             };
         }
     };
-    if saved.spec.even_lid {
+    if lid::uses_watchdog(&saved.spec) {
         lid::wait_ready(&saved)?;
     }
 
     let result = supervise_loop(&saved, &mut inhibitor, started);
     drop(inhibitor);
-    if saved.spec.even_lid {
+    if lid::uses_watchdog(&saved.spec) {
         return result;
     }
     let remove = session::remove_if_matches(&saved).map(|_| ());
@@ -97,10 +97,10 @@ fn start_session(
         return Err(AppError::fail("supervisor startup was cancelled"));
     }
 
-    let mut inhibitor = platform::Inhibitor::start(spec.mode)?;
+    let mut inhibitor = platform::Inhibitor::start(spec.mode, spec.even_lid)?;
     sleep(STARTUP_SETTLE);
     if !inhibitor.alive() {
-        return Err(AppError::fail("sleep inhibitor exited during startup"));
+        return Err(platform::inhibitor_startup_error(spec.even_lid));
     }
     let started = Instant::now();
     let started_at = Utc::now();
@@ -132,7 +132,7 @@ fn supervise_loop(
         if !inhibitor.alive() {
             return Err(AppError::fail("sleep inhibitor exited unexpectedly"));
         }
-        if saved.spec.even_lid {
+        if lid::uses_watchdog(&saved.spec) {
             lid::ensure_ready(saved)?;
         }
         if saved

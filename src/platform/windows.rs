@@ -27,7 +27,7 @@ pub struct Inhibitor {
 }
 
 impl Inhibitor {
-    pub fn start(mode: Mode) -> Result<Self> {
+    pub fn start(mode: Mode, _even_lid: bool) -> Result<Self> {
         let mut reason = "wake CLI\0".encode_utf16().collect::<Vec<_>>();
         let context = REASON_CONTEXT {
             Version: POWER_REQUEST_CONTEXT_VERSION,
@@ -74,6 +74,10 @@ impl Inhibitor {
     pub fn alive(&mut self) -> bool {
         self.handle != INVALID_HANDLE_VALUE && !self.handle.is_null()
     }
+}
+
+pub fn inhibitor_startup_error(_even_lid: bool) -> AppError {
+    AppError::inhibitor_startup("sleep inhibitor exited during startup")
 }
 
 impl Drop for Inhibitor {

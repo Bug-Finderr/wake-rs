@@ -1,9 +1,12 @@
 use std::fmt;
 
+pub const INHIBITOR_STARTUP_EXIT_CODE: i32 = 3;
+
 #[derive(Debug)]
 pub enum AppError {
     Usage(String),
     Fail(String),
+    InhibitorStartup(String),
 }
 
 impl AppError {
@@ -13,15 +16,19 @@ impl AppError {
     pub fn fail(msg: impl Into<String>) -> Self {
         AppError::Fail(msg.into())
     }
+    pub fn inhibitor_startup(msg: impl Into<String>) -> Self {
+        AppError::InhibitorStartup(msg.into())
+    }
     pub fn message(&self) -> &str {
         match self {
-            AppError::Usage(m) | AppError::Fail(m) => m,
+            AppError::Usage(m) | AppError::Fail(m) | AppError::InhibitorStartup(m) => m,
         }
     }
     pub fn exit_code(&self) -> i32 {
         match self {
             AppError::Usage(_) => 2,
             AppError::Fail(_) => 1,
+            AppError::InhibitorStartup(_) => INHIBITOR_STARTUP_EXIT_CODE,
         }
     }
 }

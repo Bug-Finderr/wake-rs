@@ -1,4 +1,4 @@
-use crate::error::{AppError, Result};
+use crate::error::{AppError, INHIBITOR_STARTUP_EXIT_CODE, Result};
 use crate::lid;
 use crate::run::{ChargePlan, Mode, RunSpec, Trigger, plan_charge, until_deadline};
 use crate::session::{self, Session};
@@ -6,7 +6,7 @@ use crate::supervisor::read_battery_status;
 use crate::sysutil;
 use crate::{durations, platform};
 use chrono::{DateTime, Local, Utc};
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
 
 struct Parsed {
@@ -379,9 +379,7 @@ fn wait_for_session(child: &mut Child, spec: &RunSpec, token: &str) -> Result<Se
             .try_wait()
             .map_err(|error| AppError::fail(format!("could not inspect supervisor: {error}")))?
         {
-            return Err(AppError::fail(format!(
-                "supervisor exited during startup with {status}"
-            )));
+            return Err(supervisor_startup_error(status, spec.even_lid));
         }
         if let Some(saved) = session::read_saved_for_recovery()? {
             if saved.owner.token != token || saved.spec != *spec {
@@ -403,6 +401,15 @@ fn wait_for_session(child: &mut Child, spec: &RunSpec, token: &str) -> Result<Se
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(AppError::fail("supervisor did not publish session state"))
+}
+
+fn supervisor_startup_error(status: ExitStatus, even_lid: bool) -> AppError {
+    if status.code() == Some(INHIBITOR_STARTUP_EXIT_CODE) {
+        let error = platform::inhibitor_startup_error(even_lid);
+        AppError::fail(error.message().to_owned())
+    } else {
+        AppError::fail(format!("supervisor exited during startup with {status}"))
+    }
 }
 
 fn stop_child(child: &mut Child) {
@@ -439,11 +446,13 @@ pub fn status() -> Result<()> {
         pretty_duration((now - saved.started_at).num_seconds())
     );
     println!("  remaining : {remaining}");
-    if saved.spec.even_lid {
+    if lid::uses_watchdog(&saved.spec) {
         println!(
-            "  even lid  : active (recovery state {})",
+            "  even lid  : --even-lid active (recovery state {})",
             session::lid_restore_file().display()
         );
+    } else if saved.spec.even_lid {
+        println!("  even lid  : --even-lid active");
     }
     Ok(())
 }
@@ -466,7 +475,7 @@ pub fn stop() -> Result<()> {
     let changed = session::read_saved_for_recovery()?
         .is_some_and(|current| !current.owner.same_lease(&saved.owner));
     if !changed {
-        if saved.spec.even_lid {
+        if lid::uses_watchdog(&saved.spec) {
             lid::finish_stop(&saved)?;
         } else {
             session::remove_if_owner(&saved.owner)?;
@@ -533,6 +542,39 @@ pub fn recover_stale_lid_session_unlocked() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::error::INHIBITOR_STARTUP_EXIT_CODE;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::ExitStatusExt;
+
+    #[cfg(target_os = "linux")]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_even_lid_supervisor_failure_keeps_generic_error() {
+        let error = supervisor_startup_error(exit_status(1), true);
+
+        assert_eq!(
+            error.message(),
+            "supervisor exited during startup with exit status: 1"
+        );
+        assert_eq!(error.exit_code(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inhibitor_supervisor_failure_is_translated_to_public_error() {
+        let error = supervisor_startup_error(exit_status(INHIBITOR_STARTUP_EXIT_CODE), true);
+
+        assert_eq!(
+            error.message(),
+            "could not acquire the systemd-logind handle-lid-switch inhibitor required by --even-lid; logind may be unavailable or this session may lack permission"
+        );
+        assert_eq!(error.exit_code(), 1);
+    }
 
     #[test]
     fn syntax_errors_win_before_process_or_app_resolution() {

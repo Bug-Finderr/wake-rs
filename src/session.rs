@@ -358,10 +358,11 @@ mod windows_security {
     use std::mem::{size_of, size_of_val};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
-        HLOCAL, LocalFree,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER,
+        ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+        LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -379,8 +380,9 @@ mod windows_security {
     #[cfg(test)]
     use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, GetSecurityDescriptorOwner};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        CREATE_NEW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
     };
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -511,6 +513,46 @@ mod windows_security {
         let owner = canonical_sid(owner)?;
         let sddl = format!("O:{owner}D:P(A;OICI;FA;;;{owner})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
         create_directory_with_sddl(path, &sddl)
+    }
+
+    pub(super) fn create_private_file(path: &Path, owner: &str) -> Result<Option<File>> {
+        let owner = canonical_sid(owner)?;
+        let descriptor = descriptor_from_sddl(&format!(
+            "O:{owner}D:P(A;;FA;;;{owner})(A;;FA;;;SY)(A;;FA;;;BA)"
+        ))?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let path_wide = path_wide(path)?;
+        // SAFETY: the path and security descriptor remain valid for this synchronous call. CREATE_NEW
+        // never opens an existing path, and a successful handle is transferred exactly once to File.
+        let handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let error = std::io::Error::last_os_error();
+            return if matches!(
+                error.raw_os_error(),
+                Some(code)
+                    if code == ERROR_FILE_EXISTS as i32 || code == ERROR_ALREADY_EXISTS as i32
+            ) {
+                Ok(None)
+            } else {
+                Err(state_io_err(path, error))
+            };
+        }
+        // SAFETY: CreateFileW returned a unique owned handle that File now closes exactly once.
+        Ok(Some(unsafe { File::from_raw_handle(handle) }))
     }
 
     pub(super) fn create_directory_with_sddl(path: &Path, sddl: &str) -> Result<()> {
@@ -1101,19 +1143,29 @@ fn write_atomic(path: &Path, state: &State) -> Result<()> {
 }
 
 fn create_random_temp(dir: &Path) -> Result<(PathBuf, File)> {
+    #[cfg(windows)]
+    let owner = windows_user_sid()?;
     for _ in 0..8 {
         let path = dir.join(format!(".state-{}.tmp", new_token()?));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        #[cfg(windows)]
+        match windows_security::create_private_file(&path, &owner)? {
+            Some(file) => return Ok((path, file)),
+            None => continue,
         }
-        match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(state_io_err(&path, error)),
+        #[cfg(not(windows))]
+        {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(state_io_err(&path, error)),
+            }
         }
     }
     Err(AppError::fail(
@@ -1554,22 +1606,27 @@ fn validate_existing_directory(path: &Path) -> Result<()> {
 }
 
 fn ensure_private_lock(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
     #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| state_io_err(path, error))?;
+    let file = {
+        let owner = windows_user_sid()?;
+        match windows_security::create_private_file(path, &owner)? {
+            Some(file) => file,
+            None => open_existing_lock(path)?,
+        }
+    };
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        options
+            .open(path)
+            .map_err(|error| state_io_err(path, error))?
+    };
     let metadata = file.metadata().map_err(|error| state_io_err(path, error))?;
     validate_regular_metadata(path, &metadata)?;
     #[cfg(unix)]
@@ -2265,6 +2322,26 @@ mod tests {
         assert_eq!(read_at(&backup).unwrap(), Some(old));
         assert!(error.message().contains(&backup.display().to_string()));
         assert_ne!(read_at(&path).unwrap(), Some(new));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_file_creation_sets_exact_security() {
+        let dir = TestDir::new("windows-private-file");
+        let path = dir.0.join("probe");
+        let owner = windows_user_sid().unwrap();
+
+        let file = windows_security::create_private_file(&path, &owner)
+            .unwrap()
+            .expect("new file");
+        drop(file);
+
+        windows_security::validate_file(&path, &owner).unwrap();
+        assert!(
+            windows_security::create_private_file(&path, &owner)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(windows)]

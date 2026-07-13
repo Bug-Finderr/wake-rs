@@ -6,14 +6,8 @@ use crate::supervisor::read_battery_status;
 use crate::sysutil;
 use crate::{durations, platform};
 use chrono::{DateTime, Local, Utc};
-use std::io::IsTerminal;
 use std::process::Child;
 use std::time::{Duration, Instant};
-
-#[cfg_attr(windows, allow(dead_code))]
-pub fn is_console() -> bool {
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-}
 
 struct Parsed {
     trigger: ParsedTrigger,

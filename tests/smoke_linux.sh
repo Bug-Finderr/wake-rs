@@ -45,6 +45,9 @@ run 2 "unknown flag"            -- --bogus
 run 2 "invalid duration"        -- 5x
 run 0 "no active session"       -- status
 run 0 "no active session"       -- stop
+run 0 "session active"          --
+run 0 "session active"          -- status
+run 0 "stopped"                 -- stop
 
 battery_output="$("$wake" --until-charge 80 2>&1)"
 battery_code=$?

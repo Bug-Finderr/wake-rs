@@ -84,7 +84,7 @@ jobs:
             exit 1
           fi
           grep -F 'root-owned protected install' even-lid.out
-          target/release/wake 30s | grep -F 'session active'
+          target/release/wake | grep -F 'session active'
           target/release/wake status | grep -F 'session active'
           target/release/wake stop | grep -F 'stopped'
 

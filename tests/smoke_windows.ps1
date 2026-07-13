@@ -36,6 +36,9 @@ try {
   Test-Wake 2 'conflicting triggers'  @('--until-charge', '80', '--while-pid', '1')
   Test-Wake 2 'unknown flag'           @('--bogus')
   Test-Wake 2 'invalid duration'       @('5x')
+  Test-Wake 0 'session active'         @()
+  Test-Wake 0 'session active'         @('status')
+  Test-Wake 0 'stopped'                @('stop')
 
   $ErrorActionPreference = 'Continue'
   $batteryOutput = (& $wake --until-charge 80 2>&1) -join "`n"

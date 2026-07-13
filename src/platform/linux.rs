@@ -11,10 +11,6 @@ const SYSTEM_ONLY_INHIBITORS: &[&str] = &["sleep:handle-lid-switch", "sleep"];
 const INHIBIT_DENIED_MESSAGE: &str = "systemd-inhibit cannot take inhibitor locks in this session (polkit denied); try from a local desktop session or as root";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub fn supports_interactive() -> bool {
-    true
-}
-
 pub fn supports_even_lid() -> bool {
     false
 }

@@ -8,9 +8,6 @@ mod session;
 mod supervisor;
 mod sysutil;
 
-#[cfg(unix)]
-mod interactive;
-
 use error::AppError;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,29 +35,19 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
         }
     }
 
-    if let Some(first) = args.first() {
-        match first.as_str() {
-            "-h" | "--help" | "help" => {
-                print_help();
-                return Ok(());
-            }
-            "-v" | "--version" | "version" => {
-                println!("wake {VERSION}");
-                return Ok(());
-            }
-            "status" => return commands::status(),
-            "stop" => return commands::stop(),
-            _ => return commands::start(args),
+    match args.first().map(String::as_str) {
+        Some("-h" | "--help" | "help") => {
+            print_help();
+            Ok(())
         }
-    }
-
-    #[cfg(unix)]
-    {
-        if commands::is_console() && platform::supports_interactive() {
-            return interactive::run();
+        Some("-v" | "--version" | "version") => {
+            println!("wake {VERSION}");
+            Ok(())
         }
+        Some("status") => commands::status(),
+        Some("stop") => commands::stop(),
+        _ => commands::start(args),
     }
-    commands::start(&[])
 }
 
 pub(crate) fn print_help() {
@@ -72,12 +59,9 @@ platforms:
   Windows uses native power requests
   note: closing the lid still sleeps the mac unless you use --even-lid
 
-interactive:
-  wake                       open the picker on macOS/Linux; on Windows, start indefinitely
-                             (macOS/Linux: a non-interactive or piped 'wake' starts indefinitely)
-
-direct:
-  wake forever               stay awake indefinitely (no menu)
+usage:
+  wake                       stay awake indefinitely
+  wake forever               stay awake indefinitely
   wake <duration>            e.g. wake 1h, wake 30m, wake 1h30m, wake 90s
   wake -t <duration>         same as above with explicit flag
   wake --until HH:MM         stay awake until clock time

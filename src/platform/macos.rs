@@ -6,10 +6,6 @@ const CAFFEINATE: &str = "/usr/bin/caffeinate";
 const PMSET: &str = "/usr/bin/pmset";
 const SUDO: &str = "/usr/bin/sudo";
 
-pub fn supports_interactive() -> bool {
-    true
-}
-
 pub fn supports_even_lid() -> bool {
     true
 }

@@ -1,8 +1,8 @@
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, combine_cleanup};
 use crate::lid;
 use crate::platform;
-use crate::run::{BatteryStatus, ChargeDirection, RunSpec, Trigger};
-use crate::session::{self, Session};
+use crate::run::{ChargeDirection, Trigger};
+use crate::session::{self, OwnerIdentity, State};
 use crate::sysutil;
 use chrono::Utc;
 use std::sync::Arc;
@@ -13,10 +13,6 @@ use std::time::{Duration, Instant};
 const BATTERY_INTERVAL: Duration = Duration::from_secs(30);
 const RUN_INTERVAL: Duration = Duration::from_secs(1);
 const STARTUP_SETTLE: Duration = Duration::from_millis(300);
-
-pub fn read_battery_status() -> Result<BatteryStatus> {
-    platform::read_battery()
-}
 
 fn install_stop_flag() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
@@ -29,141 +25,251 @@ fn install_stop_flag() -> Arc<AtomicBool> {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let [json, token] = args else {
-        return Err(AppError::fail(
-            "supervisor expects a run specification and process lease",
-        ));
+    let token = supervisor_token(args)?;
+    let owner = OwnerIdentity {
+        token: token.clone(),
+        process: sysutil::current_process_identity()?,
     };
-    let spec: RunSpec = serde_json::from_str(json)
-        .map_err(|error| AppError::fail(format!("invalid supervisor specification: {error}")))?;
-    spec.validate()?;
-    let lease = session::claim_process_lease(token)?;
-    supervise(spec, lease.reference())
+    supervise(owner)
 }
 
-fn supervise(spec: RunSpec, owner: session::LeaseRef) -> Result<()> {
-    let startup = start_session(spec, owner.clone());
-    let (mut inhibitor, saved, started) = match startup {
-        Ok(started) => started,
-        Err(error) => {
-            let cleanup = session::remove_if_owner(&owner).map(|_| ());
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(AppError::fail(format!(
-                    "{error}; startup cleanup failed: {cleanup}"
-                ))),
-            };
-        }
+fn supervisor_token(args: &[String]) -> Result<&String> {
+    let [token] = args else {
+        return Err(AppError::fail("supervisor expects a session token"));
     };
-    if lid::uses_watchdog(&saved.spec) {
-        lid::wait_ready(&saved)?;
-    }
+    Ok(token)
+}
 
-    let result = supervise_loop(&saved, &mut inhibitor, started);
+fn supervise(owner: OwnerIdentity) -> Result<()> {
+    let (mut inhibitor, saved, started) = start_session(owner)?;
+    let primary = supervise_loop(&saved, &mut inhibitor, started);
     drop(inhibitor);
-    if lid::uses_watchdog(&saved.spec) {
-        return result;
+    if lid::uses_watchdog(&saved.session.spec) {
+        return primary.map(|_| ());
     }
-    let remove = session::remove_if_matches(&saved).map(|_| ());
-    let clear = session::clear_stop(&saved).map(|_| ());
-    result.and(remove).and(clear)
+    finish_ordinary(primary, cleanup_ordinary)
 }
 
-fn start_session(
-    spec: RunSpec,
-    owner: session::LeaseRef,
-) -> Result<(platform::Inhibitor, Session, Instant)> {
-    let pending = session::read_saved_for_recovery()?
-        .ok_or_else(|| AppError::fail("supervisor startup was cancelled"))?;
-    if pending.owner.pid != 0 || pending.owner.token != owner.token || pending.spec != spec {
-        return Err(AppError::fail("pending supervisor state changed"));
-    }
-
-    let lock = loop {
-        if session::stop_requested(&pending)? {
-            return Err(AppError::fail("session stopped during startup"));
-        }
-        if let Some(lock) = session::try_acquire_lock()? {
-            break lock;
-        }
-        sleep(Duration::from_millis(100));
-    };
-    let current = session::read_saved_for_recovery()?;
-    if current
-        .as_ref()
-        .is_none_or(|current| current.owner != pending.owner || current.spec != pending.spec)
-        || session::stop_requested(&pending)?
+fn start_session(owner: OwnerIdentity) -> Result<(platform::Inhibitor, State, Instant)> {
+    let lock = session::acquire_existing_lock_wait()?;
+    let starting =
+        session::read()?.ok_or_else(|| AppError::fail("supervisor startup was cancelled"))?;
+    if starting.session.owner != owner
+        || starting.session.started_at.is_some()
+        || starting.session.stop_requested
+        || starting.lid.is_some()
     {
-        return Err(AppError::fail("supervisor startup was cancelled"));
+        return Err(AppError::fail("starting supervisor state changed"));
     }
 
-    let mut inhibitor = platform::Inhibitor::start(spec.mode, spec.even_lid)?;
+    let spec = &starting.session.spec;
+    let mut inhibitor = match platform::Inhibitor::start(spec.mode, spec.even_lid) {
+        Ok(inhibitor) => inhibitor,
+        Err(error) => {
+            session::remove_exact(&lock, &starting)?;
+            return Err(error);
+        }
+    };
     sleep(STARTUP_SETTLE);
     if !inhibitor.alive() {
-        return Err(platform::inhibitor_startup_error(spec.even_lid));
+        let error = platform::inhibitor_startup_error(spec.even_lid);
+        session::remove_exact(&lock, &starting)?;
+        return Err(error);
     }
     let started = Instant::now();
     let started_at = Utc::now();
-    let saved = Session {
-        owner,
-        ends_at: spec.trigger.deadline(started_at)?,
-        note: inhibitor.note().map(str::to_string),
-        spec,
-        started_at,
+    let saved = match session::update(&lock, &owner, |state| {
+        state.session.started_at = Some(started_at);
+        state.session.note = inhibitor.note().map(str::to_owned);
+        Ok(())
+    }) {
+        Ok(saved) => saved,
+        Err(error) => {
+            let cleanup = session::remove_exact(&lock, &starting).map(|_| ());
+            return combine_cleanup(Err(error), cleanup);
+        }
     };
-    session::write_ready(&saved)?;
     drop(lock);
     Ok((inhibitor, saved, started))
 }
 
 fn supervise_loop(
-    saved: &Session,
+    saved: &State,
     inhibitor: &mut platform::Inhibitor,
     started: Instant,
-) -> Result<()> {
+) -> Result<State> {
     let signal = install_stop_flag();
     let mut next_battery = Instant::now();
     loop {
-        if signal.load(Ordering::Relaxed)
-            || session::stop_requested(saved).is_ok_and(|requested| requested)
-        {
-            return Ok(());
+        let current =
+            session::read()?.ok_or_else(|| AppError::fail("active session state disappeared"))?;
+        if !session_matches_saved(saved, &current) {
+            return Err(AppError::fail("active session state changed"));
+        }
+        if current.session.stop_requested || signal.load(Ordering::Relaxed) {
+            return Ok(current);
         }
         if !inhibitor.alive() {
             return Err(AppError::fail("sleep inhibitor exited unexpectedly"));
         }
-        if lid::uses_watchdog(&saved.spec) {
-            lid::ensure_ready(saved)?;
-        }
-        if saved
+        if current
+            .session
             .spec
             .trigger
             .is_complete(Utc::now(), started.elapsed())
         {
-            return Ok(());
+            return Ok(current);
         }
-        if let Some(process) = saved.spec.trigger.process()
-            && !sysutil::process_identity_matches(&process.identity())?
+        if let Some(process) = current.session.spec.trigger.process()
+            && !sysutil::process_identity_matches(process)?
         {
-            return Ok(());
+            return Ok(current);
         }
         if Instant::now() >= next_battery {
             next_battery = Instant::now() + BATTERY_INTERVAL;
             if let Trigger::Charge {
                 target, direction, ..
-            } = saved.spec.trigger
-                && charge_reached(target, direction)
+            } = current.session.spec.trigger
+                && charge_reached(target, direction)?
             {
-                return Ok(());
+                return Ok(current);
             }
         }
         sleep(RUN_INTERVAL);
     }
 }
 
-fn charge_reached(target: i32, direction: ChargeDirection) -> bool {
-    read_battery_status().is_ok_and(|status| match direction {
+fn session_matches_saved(saved: &State, current: &State) -> bool {
+    if saved.session.stop_requested && !current.session.stop_requested {
+        return false;
+    }
+    let mut session = current.session.clone();
+    session.stop_requested = saved.session.stop_requested;
+    session == saved.session
+}
+
+fn finish_ordinary(
+    primary: Result<State>,
+    cleanup: impl FnOnce(&State) -> Result<()>,
+) -> Result<()> {
+    match primary {
+        Ok(completed) => cleanup(&completed),
+        Err(error) => Err(error),
+    }
+}
+
+fn cleanup_ordinary(completed: &State) -> Result<()> {
+    let lock = session::acquire_existing_lock_wait()?;
+    require_exact_removal(session::remove_exact(&lock, completed)?)
+}
+
+fn require_exact_removal(removed: bool) -> Result<()> {
+    if removed {
+        Ok(())
+    } else {
+        Err(AppError::fail(
+            "active session state changed before cleanup",
+        ))
+    }
+}
+
+fn charge_reached(target: i32, direction: ChargeDirection) -> Result<bool> {
+    let status = platform::read_battery()?;
+    Ok(match direction {
         ChargeDirection::Up => status.percent >= target,
         ChargeDirection::Down => status.percent <= target,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run::{Mode, ProcessIdentity, RunSpec};
+    use crate::session::{STATE_SCHEMA, SessionState};
+    use std::cell::Cell;
+
+    fn ordinary_state() -> State {
+        State {
+            schema: STATE_SCHEMA,
+            session: SessionState {
+                owner: OwnerIdentity {
+                    token: "0123456789abcdef0123456789abcdef".into(),
+                    process: ProcessIdentity {
+                        pid: 10,
+                        native_start: 11,
+                    },
+                },
+                spec: RunSpec {
+                    mode: Mode::DisplaySystem,
+                    trigger: Trigger::Indefinite,
+                    even_lid: false,
+                },
+                started_at: Some("2024-01-02T03:04:05Z".parse().unwrap()),
+                note: None,
+                stop_requested: false,
+            },
+            lid: None,
+        }
+    }
+
+    #[test]
+    fn supervisor_accepts_only_one_session_token() {
+        let token = "0123456789abcdef0123456789abcdef".to_string();
+        assert_eq!(
+            supervisor_token(std::slice::from_ref(&token)).unwrap(),
+            &token
+        );
+        assert!(supervisor_token(&[]).is_err());
+        assert!(supervisor_token(&[token.clone(), "extra".into()]).is_err());
+    }
+
+    #[test]
+    fn active_session_allows_only_the_monotonic_stop_transition() {
+        let saved = ordinary_state();
+        assert!(session_matches_saved(&saved, &saved));
+
+        let mut stopped = saved.clone();
+        stopped.session.stop_requested = true;
+        assert!(session_matches_saved(&saved, &stopped));
+
+        let mut drifted = stopped;
+        drifted.session.note = Some("changed".into());
+        assert!(!session_matches_saved(&saved, &drifted));
+    }
+
+    #[test]
+    fn ordinary_primary_error_retains_state() {
+        let cleaned = Cell::new(false);
+        let result = finish_ordinary(Err(AppError::fail("monitor failed")), |_| {
+            cleaned.set(true);
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert!(!cleaned.get());
+    }
+
+    #[test]
+    fn ordinary_clean_completion_removes_only_the_returned_state() {
+        let completed = ordinary_state();
+        let removed = Cell::new(false);
+        finish_ordinary(Ok(completed.clone()), |expected| {
+            assert_eq!(expected, &completed);
+            removed.set(true);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(removed.get());
+    }
+
+    #[test]
+    fn ordinary_cleanup_reports_an_exact_removal_race() {
+        let error = require_exact_removal(false).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "active session state changed before cleanup"
+        );
+    }
 }

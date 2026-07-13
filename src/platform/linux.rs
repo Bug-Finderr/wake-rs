@@ -12,10 +12,6 @@ const INHIBIT_DENIED_MESSAGE: &str = "systemd-inhibit cannot take inhibitor lock
 const EVEN_LID_INHIBIT_DENIED_MESSAGE: &str = "could not acquire the systemd-logind handle-lid-switch inhibitor required by --even-lid; logind may be unavailable or this session may lack permission";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub fn supports_even_lid() -> bool {
-    true
-}
-
 pub struct Inhibitor {
     child: Child,
     note: Option<String>,

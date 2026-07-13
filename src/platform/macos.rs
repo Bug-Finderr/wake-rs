@@ -6,10 +6,6 @@ const CAFFEINATE: &str = "/usr/bin/caffeinate";
 const PMSET: &str = "/usr/bin/pmset";
 const SUDO: &str = "/usr/bin/sudo";
 
-pub fn supports_even_lid() -> bool {
-    true
-}
-
 pub fn trusted_helper_executable() -> Result<String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -52,7 +48,7 @@ unsafe extern "C" {
     fn acl_free(object: *mut libc::c_void) -> libc::c_int;
 }
 
-fn has_extended_acl(path: &std::path::Path) -> Result<bool> {
+pub(crate) fn has_extended_acl(path: &std::path::Path) -> Result<bool> {
     const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
     let path_c = ffi_path(path)?;
     // SAFETY: __error returns this thread's errno slot and path_c is a live null-terminated path.
@@ -164,28 +160,45 @@ pub fn authenticate_privilege() -> Result<()> {
     }
 }
 
-pub fn disable_lid(_snapshot: &LidSnapshot) -> Result<()> {
+pub fn disable_lid(snapshot: &LidSnapshot) -> Result<()> {
+    if !lid_snapshot_matches(snapshot)? {
+        return Err(AppError::fail(
+            "power configuration changed before the lid override",
+        ));
+    }
     write_disable_sleep(1)
 }
 
 pub fn restore_lid(snapshot: &LidSnapshot) -> Result<()> {
-    write_disable_sleep(snapshot.sleep_disabled)
+    let current = read_disable_sleep()?;
+    if let Some(value) = restore_value(snapshot.sleep_disabled, current) {
+        write_disable_sleep(value)?;
+    }
+    if lid_is_restored(snapshot)? {
+        Ok(())
+    } else {
+        Err(AppError::fail(
+            "failed to remove the wake-owned lid override",
+        ))
+    }
 }
 
 pub fn restore_lid_elevated(snapshot: &LidSnapshot) -> Result<()> {
-    if !write_disable_sleep_with_sudo(snapshot.sleep_disabled)? {
+    let Some(value) = restore_value(snapshot.sleep_disabled, read_disable_sleep()?) else {
+        return Ok(());
+    };
+    if !write_disable_sleep_with_sudo(value)? {
         authenticate_privilege()?;
-        if !write_disable_sleep_with_sudo(snapshot.sleep_disabled)? {
+        if !write_disable_sleep_with_sudo(value)? {
             return Err(AppError::fail("elevated lid restoration failed"));
         }
     }
-    if read_disable_sleep()? == snapshot.sleep_disabled {
+    if lid_is_restored(snapshot)? {
         Ok(())
     } else {
-        Err(AppError::fail(format!(
-            "failed to restore SleepDisabled to {}",
-            snapshot.sleep_disabled
-        )))
+        Err(AppError::fail(
+            "failed to remove the wake-owned lid override",
+        ))
     }
 }
 
@@ -194,7 +207,15 @@ pub fn lid_override_is_active(_snapshot: &LidSnapshot) -> Result<bool> {
 }
 
 pub fn lid_is_restored(snapshot: &LidSnapshot) -> Result<bool> {
+    Ok(restore_value(snapshot.sleep_disabled, read_disable_sleep()?).is_none())
+}
+
+pub fn lid_snapshot_matches(snapshot: &LidSnapshot) -> Result<bool> {
     Ok(read_disable_sleep()? == snapshot.sleep_disabled)
+}
+
+fn restore_value(original: i32, current: i32) -> Option<i32> {
+    (original != 1 && current == 1).then_some(original)
 }
 
 pub fn read_battery() -> Result<BatteryStatus> {
@@ -355,5 +376,12 @@ mod tests {
         assert!(has_extended_acl(&path).unwrap());
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn restoration_changes_only_a_still_owned_value() {
+        assert_eq!(restore_value(0, 1), Some(0));
+        assert_eq!(restore_value(0, 0), None);
+        assert_eq!(restore_value(1, 1), None);
     }
 }

@@ -31,6 +31,9 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
             "__lid_watchdog__" => return lid::run_watchdog(&args[1..]),
             #[cfg(windows)]
             "__lid_restore__" => return lid::run_restore(&args[1..]),
+            // v0.1.1 in-place sessions may still invoke this elevated restore command.
+            #[cfg(windows)]
+            "__set_lid__" => return lid::run_set_lid(&args[1..]),
             _ => {}
         }
     }
@@ -54,37 +57,49 @@ pub(crate) fn print_help() {
     println!(
         r"wake - keep your machine awake from the CLI
 
-platforms:
-  macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;
-  Windows uses native power requests
-  note: closing the lid still sleeps the mac unless you use --even-lid
-
 usage:
-  wake                       stay awake indefinitely
-  wake forever               stay awake indefinitely
-  wake <duration>            e.g. wake 1h, wake 30m, wake 1h30m, wake 90s
-  wake -t <duration>         same as above with explicit flag
-  wake --until HH:MM         stay awake until clock time
-  wake --until-charge N      stay awake until battery hits N% (1-100)
-  wake --while-pid PID       stay awake while PID is running
-  wake --while-app NAME      stay awake while named app/process is running
-  wake --no-display          prevent system sleep only, allow display sleep
-  wake --even-lid            stay awake with the lid closed (macOS uses sudo; Windows sets
-                             the lid-close action to Do Nothing)
-  wake status                show current session
-  wake stop                  end current session
-  wake version, -v           print version
-  wake help, -h              this message
+  wake [OPTIONS] [TRIGGER]
+  wake <COMMAND>
+
+commands:
+  status                     show the current session
+  stop                       request a graceful stop and recovery
+  help, -h, --help           show this message
+  version, -v, --version     print the version
+
+triggers (choose at most one; omitted means indefinite):
+  <duration>                 stay awake for a duration
+  forever | indefinite      stay awake indefinitely
+  -t, --for DURATION        stay awake for a duration
+  --until HH:MM             stay awake until the next local clock time
+  --until-charge N          stay awake until battery reaches N% (1-100)
+  --while-pid PID           stay awake while the observed PID identity exists
+  --while-app NAME          stay awake while a matching process identity exists
+
+options:
+  --no-display              prevent system sleep only; allow display sleep
+  --even-lid                request closed-lid operation
 
 duration syntax:
   90s, 5m, 1h, 1h30m, 2h45m30s, 1d, or plain seconds (3600)
   maximum: 30d
 
-exit codes:
-  2 usage, 1 error
+platform requirements:
+  macOS    uses caffeinate; closed-lid operation needs interactive sudo and a
+           root-owned protected install with no extended ACL
+  Linux    uses systemd-inhibit, systemd-logind, and GNU tail with --pid;
+           closed-lid operation starts only if logind grants a
+           handle-lid-switch inhibitor
+  Windows  uses native power requests; closed-lid operation needs UAC elevation
+           by the same Windows account
+  macOS or Windows recovery may request the same elevation again
 
-state file:
-  ~/.local/state/wake/session.json (override dir with WAKE_STATE_DIR)
-  Windows: %LOCALAPPDATA%\wake\session.json"
+exit codes:
+  0 success, 1 runtime or recovery error, 2 usage error
+
+private state directory:
+  Unix: $XDG_STATE_HOME/wake or ~/.local/state/wake
+  Windows: %LOCALAPPDATA%\wake
+  Override: WAKE_STATE_DIR"
     );
 }

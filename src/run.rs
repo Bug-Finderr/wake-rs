@@ -45,11 +45,11 @@ pub enum Trigger {
         time: String,
     },
     Pid {
-        process: ProcessRef,
+        process: ProcessIdentity,
     },
     App {
         name: String,
-        process: ProcessRef,
+        process: ProcessIdentity,
     },
     Charge {
         target: i32,
@@ -112,7 +112,7 @@ impl Trigger {
         }
     }
 
-    pub fn process(&self) -> Option<&ProcessRef> {
+    pub fn process(&self) -> Option<&ProcessIdentity> {
         match self {
             Self::Pid { process } | Self::App { process, .. } => Some(process),
             _ => None,
@@ -130,27 +130,6 @@ pub struct ProcessIdentity {
 impl ProcessIdentity {
     pub fn is_valid(self) -> bool {
         self.pid > 0 && self.native_start > 0
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ProcessRef {
-    pub pid: u32,
-    pub start: u64,
-    pub command: String,
-}
-
-impl ProcessRef {
-    pub fn identity(&self) -> ProcessIdentity {
-        ProcessIdentity {
-            pid: self.pid,
-            native_start: self.start,
-        }
-    }
-
-    pub(crate) fn is_valid(&self) -> bool {
-        self.identity().is_valid() && !self.command.trim().is_empty()
     }
 }
 
@@ -296,11 +275,10 @@ mod tests {
     use super::*;
     use chrono::{LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
 
-    fn process() -> ProcessRef {
-        ProcessRef {
+    fn process() -> ProcessIdentity {
+        ProcessIdentity {
             pid: 42,
-            start: 1_700_000_000,
-            command: "/usr/bin/editor".into(),
+            native_start: 1_700_000_000,
         }
     }
 
@@ -320,7 +298,7 @@ mod tests {
         let unknown = json.replacen('{', r#"{"extra":true,"#, 1);
         assert!(serde_json::from_str::<RunSpec>(&unknown).is_err());
         assert!(serde_json::from_str::<RunSpec>(
-            r#"{"mode":"system-only","trigger":{"kind":"pid","process":{"pid":1,"start":2,"command":"x","extra":true}}}"#,
+            r#"{"mode":"system-only","trigger":{"kind":"pid","process":{"pid":1,"nativeStart":2,"extra":true}}}"#,
         )
         .is_err());
     }
@@ -353,14 +331,18 @@ mod tests {
     }
 
     #[test]
-    fn process_ref_exposes_its_native_identity() {
-        assert_eq!(
-            process().identity(),
-            ProcessIdentity {
-                pid: 42,
-                native_start: 1_700_000_000,
-            }
-        );
+    fn persisted_process_trigger_contains_only_native_identity() {
+        let spec = RunSpec {
+            mode: Mode::DisplaySystem,
+            trigger: Trigger::Pid { process: process() },
+            even_lid: false,
+        };
+
+        let json = serde_json::to_string(&spec).unwrap();
+
+        assert!(json.contains(r#""nativeStart""#));
+        assert!(!json.contains(r#""command""#));
+        assert!(!json.contains(r#""start""#));
     }
 
     #[test]
@@ -424,7 +406,7 @@ mod tests {
                 input: "too long".into(),
             },
             Trigger::Pid {
-                process: ProcessRef {
+                process: ProcessIdentity {
                     pid: 0,
                     ..process()
                 },

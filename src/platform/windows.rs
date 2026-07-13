@@ -17,10 +17,6 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::core::GUID;
 
-pub fn supports_even_lid() -> bool {
-    true
-}
-
 pub struct Inhibitor {
     handle: windows_sys::Win32::Foundation::HANDLE,
     display: bool,
@@ -126,9 +122,9 @@ pub fn read_lid_snapshot() -> Result<LidSnapshot> {
 
 pub fn disable_lid(snapshot: &LidSnapshot) -> Result<()> {
     let scheme = snapshot.scheme()?;
-    if !guid_eq(&active_scheme()?, &scheme) {
+    if !lid_snapshot_matches(snapshot)? {
         return Err(AppError::fail(
-            "active power scheme changed before the lid override",
+            "power configuration changed before the lid override",
         ));
     }
     write_ac(&scheme, 0)?;
@@ -139,22 +135,65 @@ pub fn disable_lid(snapshot: &LidSnapshot) -> Result<()> {
 
 pub fn restore_lid(snapshot: &LidSnapshot) -> Result<()> {
     let scheme = snapshot.scheme()?;
-    write_ac(&scheme, snapshot.ac_action)?;
-    write_dc(&scheme, snapshot.dc_action)?;
-    let active = active_scheme()?;
-    if should_reapply(&scheme, Some(&active)) {
-        apply_if_active(&scheme, "lid restoration")?;
+    let (ac, dc) = restore_values(snapshot, read_lid_values(&scheme)?);
+    if let Some(value) = ac {
+        write_ac(&scheme, value)?;
     }
-    verify_lid_values(&scheme, snapshot.ac_action, snapshot.dc_action, "restore")
+    if let Some(value) = dc {
+        write_dc(&scheme, value)?;
+    }
+    if ac.is_some() || dc.is_some() {
+        let active = active_scheme()?;
+        if guid_eq(&scheme, &active) {
+            apply_if_active(&scheme, "lid restoration")?;
+        }
+    }
+    if lid_is_restored(snapshot)? {
+        Ok(())
+    } else {
+        Err(AppError::fail(
+            "failed to remove the wake-owned lid override",
+        ))
+    }
 }
 
 pub fn lid_override_is_active(snapshot: &LidSnapshot) -> Result<bool> {
     let scheme = snapshot.scheme()?;
-    Ok(guid_eq(&scheme, &active_scheme()?) && read_lid_values(&scheme)? == (0, 0))
+    if !guid_eq(&scheme, &active_scheme()?) {
+        return Ok(false);
+    }
+    let (ac, dc) = read_lid_values(&scheme)?;
+    Ok((snapshot.ac_action == 0 || ac == 0) && (snapshot.dc_action == 0 || dc == 0))
 }
 
 pub fn lid_is_restored(snapshot: &LidSnapshot) -> Result<bool> {
-    Ok(read_lid_values(&snapshot.scheme()?)? == (snapshot.ac_action, snapshot.dc_action))
+    let scheme = snapshot.scheme()?;
+    Ok(restore_values(snapshot, read_lid_values(&scheme)?) == (None, None))
+}
+
+pub fn lid_snapshot_matches(snapshot: &LidSnapshot) -> Result<bool> {
+    let scheme = snapshot.scheme()?;
+    Ok(guid_eq(&scheme, &active_scheme()?)
+        && read_lid_values(&scheme)? == (snapshot.ac_action, snapshot.dc_action))
+}
+
+fn restore_values(snapshot: &LidSnapshot, current: (u32, u32)) -> (Option<u32>, Option<u32>) {
+    let restore = |original, current| (original != 0 && current == 0).then_some(original);
+    (
+        restore(snapshot.ac_action, current.0),
+        restore(snapshot.dc_action, current.1),
+    )
+}
+
+pub fn set_current_lid_actions(ac: u32, dc: u32) -> Result<()> {
+    if !(0..=3).contains(&ac) || !(0..=3).contains(&dc) {
+        return Err(AppError::fail("lid actions must be in 0..=3"));
+    }
+    let scheme = active_scheme()?;
+    write_ac(&scheme, ac)?;
+    write_dc(&scheme, dc)?;
+    apply_if_active(&scheme, "lid action update")?;
+    verify_lid_values(&scheme, ac, dc, "set")
 }
 
 fn active_scheme() -> Result<GUID> {
@@ -319,10 +358,6 @@ fn guid_eq(left: &GUID, right: &GUID) -> bool {
         && left.data4 == right.data4
 }
 
-fn should_reapply(recorded: &GUID, active: Option<&GUID>) -> bool {
-    active.is_some_and(|active| guid_eq(recorded, active))
-}
-
 pub fn read_battery() -> Result<BatteryStatus> {
     let mut status = SYSTEM_POWER_STATUS::default();
     // SAFETY: status is a valid writable struct for the synchronous call.
@@ -410,19 +445,24 @@ mod tests {
     }
 
     #[test]
-    fn reactivation_requires_the_recorded_scheme_to_still_be_active() {
-        let recorded = parse_guid("381b4222-f694-41f0-9685-ff5bb260df2e").unwrap();
-        let other = parse_guid("11111111-2222-3333-4444-555555555555").unwrap();
-        assert!(should_reapply(&recorded, Some(&recorded)));
-        assert!(!should_reapply(&recorded, Some(&other)));
-        assert!(!should_reapply(&recorded, None));
-    }
-
-    #[test]
     fn lid_snapshot_is_canonical_and_validated() {
         let snapshot =
             LidSnapshot::new("381B4222-F694-41F0-9685-FF5BB260DF2E".into(), 1, 2).unwrap();
         assert_eq!(snapshot.scheme_guid, "381b4222-f694-41f0-9685-ff5bb260df2e");
         assert!(LidSnapshot::new(snapshot.scheme_guid.clone(), 4, 0).is_err());
+    }
+
+    #[test]
+    fn restoration_changes_only_still_owned_fields() {
+        let saved = LidSnapshot::new("381b4222-f694-41f0-9685-ff5bb260df2e".into(), 1, 2).unwrap();
+        assert_eq!(restore_values(&saved, (0, 3)), (Some(1), None));
+        assert_eq!(restore_values(&saved, (3, 0)), (None, Some(2)));
+        assert_eq!(restore_values(&saved, (3, 3)), (None, None));
+    }
+
+    #[test]
+    fn original_override_has_no_restore_intent() {
+        let saved = LidSnapshot::new("381b4222-f694-41f0-9685-ff5bb260df2e".into(), 0, 2).unwrap();
+        assert_eq!(restore_values(&saved, (0, 0)), (None, Some(2)));
     }
 }

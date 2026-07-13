@@ -48,3 +48,44 @@ impl From<std::io::Error> for AppError {
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;
+
+pub fn combine_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(AppError::fail(format!(
+            "{primary}; cleanup failed: {cleanup}"
+        ))),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_combination_covers_all_result_pairs() {
+        assert_eq!(combine_cleanup(Ok(7), Ok(())).unwrap(), 7);
+        assert_eq!(
+            combine_cleanup::<()>(Err(AppError::fail("primary")), Ok(()))
+                .unwrap_err()
+                .message(),
+            "primary"
+        );
+        assert_eq!(
+            combine_cleanup(Ok(7), Err(AppError::fail("cleanup")))
+                .unwrap_err()
+                .message(),
+            "cleanup"
+        );
+        assert_eq!(
+            combine_cleanup::<()>(
+                Err(AppError::fail("primary")),
+                Err(AppError::fail("cleanup")),
+            )
+            .unwrap_err()
+            .message(),
+            "primary; cleanup failed: cleanup"
+        );
+    }
+}

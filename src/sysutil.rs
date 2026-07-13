@@ -1,6 +1,5 @@
 use crate::error::{AppError, Result};
-use crate::run::{ProcessIdentity, ProcessRef};
-use crate::session::{self, LeaseRef};
+use crate::run::ProcessIdentity;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -16,24 +15,27 @@ fn refreshed(pid: u32) -> System {
     system
 }
 
-fn process_of(system: &System, pid: u32, start: u64) -> Option<(ProcessRef, String)> {
+struct ProcessObservation {
+    identity: ProcessIdentity,
+    name: String,
+    executable: String,
+}
+
+fn process_of(system: &System, pid: u32, native_start: u64) -> Option<ProcessObservation> {
     let process = system.process(Pid::from_u32(pid))?;
     let name = process.name().to_string_lossy().into_owned();
-    let command = process
+    let executable = process
         .exe()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| name.clone());
-    Some((
-        ProcessRef {
-            pid,
-            start,
-            command,
-        },
+    Some(ProcessObservation {
+        identity: ProcessIdentity { pid, native_start },
         name,
-    ))
+        executable,
+    })
 }
 
-fn observed_process(pid: u32) -> Result<Option<(ProcessRef, String)>> {
+fn observed_process(pid: u32) -> Result<Option<ProcessObservation>> {
     let Some(before) = native_process_start(pid)? else {
         return Ok(None);
     };
@@ -47,10 +49,10 @@ fn observed_process(pid: u32) -> Result<Option<(ProcessRef, String)>> {
     Ok((before == after).then_some(process))
 }
 
-pub fn capture_process(pid: u32) -> Result<ProcessRef> {
-    let process = observed_process(pid)?
-        .map(|(process, _)| process)
+pub fn capture_process(pid: u32) -> Result<ProcessIdentity> {
+    let native_start = native_process_start(pid)?
         .ok_or_else(|| AppError::fail(format!("process {pid} is not running")))?;
+    let process = ProcessIdentity { pid, native_start };
     if !process.is_valid() {
         return Err(AppError::fail(format!(
             "process {pid} does not expose a stable identity"
@@ -79,26 +81,18 @@ pub fn process_identity_matches(expected: &ProcessIdentity) -> Result<bool> {
     Ok(native_process_start(expected.pid)? == Some(expected.native_start))
 }
 
-pub fn lease_is_live(reference: &LeaseRef) -> Result<bool> {
-    lease_is_live_at(reference, &session::state_dir())
-}
-
-fn lease_is_live_at(reference: &LeaseRef, state_dir: &std::path::Path) -> Result<bool> {
-    session::process_lease_is_held_in(state_dir, reference)
-}
-
-pub fn wait_lease_exit(reference: &LeaseRef, within: Duration) -> Result<bool> {
+pub fn wait_process_exit(reference: &ProcessIdentity, within: Duration) -> Result<bool> {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
-        if !lease_is_live(reference)? {
+        if !process_identity_matches(reference)? {
             return Ok(true);
         }
         sleep(Duration::from_millis(100));
     }
-    lease_is_live(reference).map(|live| !live)
+    process_identity_matches(reference).map(|live| !live)
 }
 
-pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
+pub fn find_app_process(name: &str) -> Result<Option<ProcessIdentity>> {
     if name.trim().is_empty() {
         return Err(AppError::usage("app/process name cannot be blank"));
     }
@@ -124,20 +118,20 @@ pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
         {
             continue;
         }
-        let Some((candidate, current_name)) = observed_process(pid.as_u32())? else {
+        let Some(candidate) = observed_process(pid.as_u32())? else {
             continue;
         };
-        if !app_name_matches(name, &current_name, &candidate.command) {
+        if !app_name_matches(name, &candidate.name, &candidate.executable) {
             continue;
         }
-        if !candidate.is_valid() {
+        if !candidate.identity.is_valid() {
             continue;
         }
         if found
             .as_ref()
-            .is_none_or(|current: &ProcessRef| candidate.pid < current.pid)
+            .is_none_or(|current: &ProcessIdentity| candidate.identity.pid < current.pid)
         {
-            found = Some(candidate);
+            found = Some(candidate.identity);
         }
     }
     Ok(found)
@@ -146,16 +140,30 @@ pub fn find_app_process(name: &str) -> Result<Option<ProcessRef>> {
 #[cfg(target_os = "linux")]
 fn native_process_start(pid: u32) -> Result<Option<u64>> {
     let path = format!("/proc/{pid}/stat");
-    let stat = match std::fs::read(&path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(AppError::fail(format!(
-                "could not inspect process {pid} at {path}: {error}"
-            )));
-        }
+    let Some(stat) = classify_linux_stat_read(pid, &path, std::fs::read(&path))? else {
+        return Ok(None);
     };
     parse_linux_process_start(&stat).map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn classify_linux_stat_read(
+    pid: u32,
+    path: &str,
+    read: std::io::Result<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    match read {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(AppError::fail(format!(
+            "could not inspect process {pid} at {path}: {error}"
+        ))),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -381,7 +389,7 @@ mod win {
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessId, INFINITE, WaitForSingleObject,
+        GetExitCodeProcess, INFINITE, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -389,14 +397,9 @@ mod win {
 
     pub struct ElevatedChild {
         handle: HANDLE,
-        id: u32,
     }
 
     impl ElevatedChild {
-        pub fn id(&self) -> u32 {
-            self.id
-        }
-
         pub fn try_wait(&mut self) -> Result<Option<u32>> {
             match wait_handle(self.handle, 0)? {
                 Some(()) => exit_code(self.handle).map(Some),
@@ -445,14 +448,8 @@ mod win {
             if info.hProcess.is_null() {
                 return Err(AppError::fail("elevated helper did not return a process"));
             }
-            let id = GetProcessId(info.hProcess);
-            if id == 0 {
-                CloseHandle(info.hProcess);
-                return Err(os_error("could not read elevated helper process ID"));
-            }
             Ok(ElevatedChild {
                 handle: info.hProcess,
-                id,
             })
         }
     }
@@ -548,32 +545,12 @@ mod tests {
     }
 
     #[test]
-    fn process_identity_ignores_mutable_display_name() {
-        let original = ProcessRef {
-            pid: 42,
-            start: 100,
-            command: "before".into(),
-        };
-        let renamed = ProcessRef {
-            command: "after".into(),
-            ..original.clone()
-        };
-        let reused = ProcessRef {
-            start: 101,
-            ..renamed.clone()
-        };
-
-        assert_eq!(original.identity(), renamed.identity());
-        assert_ne!(original.identity(), reused.identity());
-    }
-
-    #[test]
     fn current_process_exposes_a_stable_native_identity() {
         let first = capture_process(current_pid()).unwrap();
         let second = capture_process(current_pid()).unwrap();
 
         assert!(first.is_valid());
-        assert_eq!(first.identity(), second.identity());
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -593,39 +570,6 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.message(), "native process inspection failed");
-    }
-
-    #[test]
-    fn held_lease_liveness_does_not_depend_on_recorded_pid() {
-        let dir = std::env::temp_dir().join(format!(
-            "wake-held-lease-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let token = "0123456789abcdef0123456789abcdef";
-        let path = dir.join(format!("process-{token}.lock"));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .unwrap();
-        file.lock().unwrap();
-        let reference = LeaseRef {
-            pid: u32::MAX,
-            token: token.into(),
-        };
-
-        let live = lease_is_live_at(&reference, &dir);
-
-        file.unlock().unwrap();
-        drop(file);
-        std::fs::remove_dir_all(dir).unwrap();
-        assert!(live.unwrap());
     }
 
     #[cfg(windows)]
@@ -668,6 +612,19 @@ mod tests {
         let error = parse_linux_process_start(b"42 (wake) S malformed").unwrap_err();
 
         assert!(error.message().contains("process start time"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disappearing_proc_read_is_confirmed_absence() {
+        let result = classify_linux_stat_read(
+            42,
+            "/proc/42/stat",
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+        )
+        .unwrap();
+
+        assert!(result.is_none());
     }
 
     #[cfg(target_os = "linux")]

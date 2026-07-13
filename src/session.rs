@@ -1,8 +1,6 @@
 use crate::error::{AppError, Result};
-use crate::run::RunSpec;
-use crate::sysutil;
+use crate::run::{ProcessIdentity, RunSpec};
 use chrono::{DateTime, Utc};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -10,8 +8,167 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::OnceLock;
 
+pub const STATE_SCHEMA: u32 = 1;
+const STATE_FILE: &str = "state.json";
+const WAKE_LOCK_FILE: &str = "wake.lock";
+const WATCHDOG_LOCK_FILE: &str = "lid-watchdog.lock";
+const LEGACY_FILES: &[&str] = &[
+    "session.properties",
+    "session.json",
+    "stop.json",
+    "lid-restore.json",
+    "lid-watchdog.json",
+];
+
 #[cfg(windows)]
 static HELPER_STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct OwnerIdentity {
+    pub token: String,
+    pub process: ProcessIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionState {
+    pub owner: OwnerIdentity,
+    pub spec: RunSpec,
+    pub started_at: Option<DateTime<Utc>>,
+    pub note: Option<String>,
+    pub stop_requested: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct LidState {
+    pub ready: bool,
+    pub restore: LidRestore,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct State {
+    pub schema: u32,
+    pub session: SessionState,
+    pub lid: Option<LidState>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "platform")]
+pub enum LidRestore {
+    Macos {
+        sleep_disabled: i32,
+    },
+    Windows {
+        scheme_guid: String,
+        ac_action: u32,
+        dc_action: u32,
+    },
+}
+
+impl State {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != STATE_SCHEMA {
+            return Err(AppError::fail(format!(
+                "unsupported wake state schema {}",
+                self.schema
+            )));
+        }
+        if !valid_token(&self.session.owner.token) || !self.session.owner.process.is_valid() {
+            return Err(AppError::fail("invalid session owner identity"));
+        }
+        self.session.spec.validate()?;
+        if let Some(started_at) = self.session.started_at {
+            self.session.spec.trigger.deadline(started_at)?;
+        }
+        if self.session.started_at.is_none() && self.session.note.is_some() {
+            return Err(AppError::fail(
+                "a starting session cannot publish an inhibitor note",
+            ));
+        }
+        if let Some(lid) = &self.lid {
+            if !self.session.spec.even_lid || self.session.started_at.is_none() {
+                return Err(AppError::fail(
+                    "lid state requires a started even-lid session",
+                ));
+            }
+            lid.restore.validate_for_platform()?;
+        }
+        Ok(())
+    }
+}
+
+impl LidRestore {
+    fn validate_for_platform(&self) -> Result<()> {
+        match self {
+            Self::Macos {
+                sleep_disabled: 0 | 1,
+            } => {}
+            Self::Macos { .. } => {
+                return Err(AppError::fail("SleepDisabled must be 0 or 1"));
+            }
+            Self::Windows {
+                scheme_guid,
+                ac_action,
+                dc_action,
+            } if is_guid(scheme_guid)
+                && (0..=3).contains(ac_action)
+                && (0..=3).contains(dc_action) => {}
+            Self::Windows { .. } => {
+                return Err(AppError::fail(
+                    "Windows lid restoration requires a scheme GUID and AC/DC actions in 0..=3",
+                ));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Err(AppError::fail("lid state is not valid on Linux"))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if matches!(self, Self::Macos { .. }) {
+                Ok(())
+            } else {
+                Err(AppError::fail("Windows lid state is not valid on macOS"))
+            }
+        }
+        #[cfg(windows)]
+        {
+            if matches!(self, Self::Windows { .. }) {
+                Ok(())
+            } else {
+                Err(AppError::fail("macOS lid state is not valid on Windows"))
+            }
+        }
+    }
+}
+
+fn valid_token(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_guid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+pub fn new_token() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| AppError::fail(format!("could not create session identity: {error}")))?;
+    Ok(format!("{:032x}", u128::from_ne_bytes(bytes)))
+}
 
 pub fn state_dir() -> PathBuf {
     #[cfg(windows)]
@@ -36,6 +193,7 @@ pub fn set_helper_state_dir(dir: PathBuf) -> Result<()> {
     if !dir.is_absolute() {
         return Err(AppError::fail("helper state directory must be absolute"));
     }
+    validate_existing_directory(&dir)?;
     HELPER_STATE_DIR
         .set(dir)
         .map_err(|_| AppError::fail("helper state directory is already configured"))
@@ -52,283 +210,12 @@ fn default_state_dir() -> PathBuf {
 #[cfg(unix)]
 fn default_state_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
-        let p = PathBuf::from(xdg);
-        if p.is_absolute() {
-            return p.join("wake");
+        let path = PathBuf::from(xdg);
+        if path.is_absolute() {
+            return path.join("wake");
         }
     }
     home().join(".local").join("state").join("wake")
-}
-
-pub fn state_file() -> PathBuf {
-    state_dir().join("session.json")
-}
-
-fn legacy_state_file() -> PathBuf {
-    state_dir().join("session.properties")
-}
-
-pub fn ensure_no_legacy_state() -> Result<()> {
-    let path = legacy_state_file();
-    ensure_no_legacy_state_at(&path)
-}
-
-fn ensure_no_legacy_state_at(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(state_io_err(path, error)),
-        Ok(_) => Err(AppError::fail(format!(
-            "legacy wake session state found at {}; stop it with the wake binary that created it, then remove the file before retrying",
-            path.display()
-        ))),
-    }
-}
-
-pub fn stop_file() -> PathBuf {
-    state_dir().join("stop.json")
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-pub fn lid_restore_file() -> PathBuf {
-    state_dir().join("lid-restore.json")
-}
-
-pub fn lid_watchdog_file() -> PathBuf {
-    state_dir().join("lid-watchdog.json")
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct LeaseRef {
-    pub pid: u32,
-    pub token: String,
-}
-
-impl LeaseRef {
-    fn has_valid_token(&self) -> bool {
-        valid_lease_token(&self.token)
-    }
-
-    fn is_valid(&self) -> bool {
-        self.pid > 0 && self.has_valid_token()
-    }
-
-    pub(crate) fn same_lease(&self, other: &Self) -> bool {
-        self.token == other.token
-    }
-}
-
-pub struct ProcessLeaseReservation {
-    token: String,
-    path: PathBuf,
-    keep: bool,
-}
-
-impl ProcessLeaseReservation {
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
-    pub fn commit(mut self) -> String {
-        self.keep = true;
-        std::mem::take(&mut self.token)
-    }
-
-    pub fn is_claimed(&self) -> Result<bool> {
-        process_lease_is_claimed_at(&self.path)
-    }
-}
-
-impl Drop for ProcessLeaseReservation {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-pub struct ProcessLease {
-    file: Option<File>,
-    path: PathBuf,
-    reference: LeaseRef,
-}
-
-impl Drop for ProcessLease {
-    fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
-            let _ = file.unlock();
-            drop(file);
-        }
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-impl ProcessLease {
-    pub fn reference(&self) -> LeaseRef {
-        self.reference.clone()
-    }
-}
-
-fn valid_lease_token(token: &str) -> bool {
-    token.len() == 32
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn process_lease_path(dir: &Path, token: &str) -> Result<PathBuf> {
-    if !valid_lease_token(token) {
-        return Err(AppError::fail("invalid process lease token"));
-    }
-    Ok(dir.join(format!("process-{token}.lock")))
-}
-
-fn reserve_process_lease_at(dir: &Path) -> Result<ProcessLeaseReservation> {
-    fs::create_dir_all(dir).map_err(|error| state_io_err(dir, error))?;
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| AppError::fail(format!("could not create process identity: {error}")))?;
-    let token = format!("{:032x}", u128::from_ne_bytes(bytes));
-    let path = process_lease_path(dir, &token)?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|error| state_io_err(&path, error))?;
-    Ok(ProcessLeaseReservation {
-        token,
-        path,
-        keep: false,
-    })
-}
-
-fn claim_process_lease_at(dir: &Path, token: &str, pid: u32) -> Result<ProcessLease> {
-    let reference = LeaseRef {
-        pid,
-        token: token.into(),
-    };
-    if !reference.is_valid() {
-        return Err(AppError::fail("invalid process lease"));
-    }
-    let path = process_lease_path(dir, token)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(|error| state_io_err(&path, error))?;
-    finish_process_lease_claim(file, path, reference)
-}
-
-fn finish_process_lease_claim(
-    file: File,
-    path: PathBuf,
-    reference: LeaseRef,
-) -> Result<ProcessLease> {
-    file.lock().map_err(|error| {
-        AppError::fail(format!(
-            "could not claim process lease at {}: {error}",
-            path.display()
-        ))
-    })?;
-    if !path
-        .try_exists()
-        .map_err(|error| state_io_err(&path, error))?
-    {
-        return Err(AppError::fail("process lease was cancelled"));
-    }
-    Ok(ProcessLease {
-        file: Some(file),
-        path,
-        reference,
-    })
-}
-
-fn process_lease_is_claimed_at(path: &Path) -> Result<bool> {
-    process_lease_is_locked_at(path, false)
-}
-
-fn process_lease_is_held_at(dir: &Path, token: &str) -> Result<bool> {
-    process_lease_is_locked_at(&process_lease_path(dir, token)?, true)
-}
-
-fn process_lease_is_locked_at(path: &Path, remove_unlocked: bool) -> Result<bool> {
-    let file = match OpenOptions::new().read(true).write(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(state_io_err(path, error)),
-    };
-    match file.try_lock_shared() {
-        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
-        Err(std::fs::TryLockError::Error(error)) => Err(state_io_err(path, error)),
-        Ok(()) => {
-            if remove_unlocked {
-                remove_lease_file(path)?;
-            }
-            file.unlock().map_err(|error| state_io_err(path, error))?;
-            drop(file);
-            Ok(false)
-        }
-    }
-}
-
-fn remove_lease_file(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(state_io_err(path, error)),
-    }
-}
-
-fn cleanup_process_leases_at(dir: &Path) -> Result<()> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(state_io_err(dir, error)),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| state_io_err(dir, error))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(token) = name
-            .strip_prefix("process-")
-            .and_then(|name| name.strip_suffix(".lock"))
-            .filter(|token| valid_lease_token(token))
-        else {
-            continue;
-        };
-        process_lease_is_held_at(dir, token)?;
-    }
-    Ok(())
-}
-
-pub fn reserve_process_lease() -> Result<ProcessLeaseReservation> {
-    reserve_process_lease_at(&state_dir())
-}
-
-pub fn claim_process_lease(token: &str) -> Result<ProcessLease> {
-    claim_process_lease_at(
-        &state_dir(),
-        token,
-        sysutil::current_process_identity()?.pid,
-    )
-}
-
-pub(crate) fn process_lease_is_held_in(dir: &Path, reference: &LeaseRef) -> Result<bool> {
-    if !reference.has_valid_token() {
-        return Err(AppError::fail("invalid process lease"));
-    }
-    process_lease_is_held_at(dir, &reference.token)
-}
-
-pub fn discard_process_lease(token: &str) -> Result<()> {
-    process_lease_is_held_at(&state_dir(), token).map(|_| ())
-}
-
-pub fn cleanup_process_leases() -> Result<()> {
-    cleanup_process_leases_at(&state_dir())
 }
 
 fn home() -> PathBuf {
@@ -341,166 +228,990 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Session {
-    pub owner: LeaseRef,
-    pub spec: RunSpec,
-    pub started_at: DateTime<Utc>,
-    pub ends_at: Option<DateTime<Utc>>,
-    pub note: Option<String>,
+pub fn state_file() -> PathBuf {
+    state_dir().join(STATE_FILE)
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct WatchdogState {
-    pub owner: LeaseRef,
-    pub watchdog: LeaseRef,
-    pub ready: bool,
+#[cfg(any(windows, target_os = "macos"))]
+pub fn watchdog_lock_file() -> PathBuf {
+    state_dir().join(WATCHDOG_LOCK_FILE)
 }
 
-impl WatchdogState {
-    fn is_valid(&self) -> bool {
-        self.owner.is_valid()
-            && self.watchdog.has_valid_token()
-            && (!self.ready || self.watchdog.pid > 0)
-            && self.owner.token != self.watchdog.token
+#[cfg(target_os = "macos")]
+pub fn validate_helper_state_dir() -> Result<()> {
+    let dir = state_dir();
+    if !dir.is_absolute() {
+        return Err(AppError::fail("helper state directory must be absolute"));
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "lowercase", tag = "platform")]
-pub enum LidRestore {
-    Macos {
-        sleep_disabled: i32,
-    },
-    Windows {
-        scheme_guid: String,
-        ac_action: u32,
-        dc_action: u32,
-    },
-}
-
-impl LidRestore {
-    fn validate(&self) -> Result<()> {
-        match self {
-            Self::Macos {
-                sleep_disabled: 0 | 1,
-            } => Ok(()),
-            Self::Macos { .. } => Err(AppError::fail("SleepDisabled must be 0 or 1")),
-            Self::Windows {
-                scheme_guid,
-                ac_action,
-                dc_action,
-            } if is_guid(scheme_guid)
-                && (0..=3).contains(ac_action)
-                && (0..=3).contains(dc_action) =>
-            {
-                Ok(())
-            }
-            Self::Windows { .. } => Err(AppError::fail(
-                "Windows lid restoration requires a scheme GUID and AC/DC actions in 0..=3",
-            )),
-        }
-    }
-}
-
-fn is_guid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-}
-
-impl Session {
-    fn is_valid(&self) -> Result<bool> {
-        if !self.owner.has_valid_token() || self.spec.validate().is_err() {
-            return Ok(false);
-        }
-        Ok(self.ends_at == self.spec.trigger.deadline(self.started_at)?)
-    }
-
-    pub fn owner_is_live(&self) -> Result<bool> {
-        sysutil::lease_is_live(&self.owner)
-    }
-
-    pub fn identity(&self) -> LeaseRef {
-        self.owner.clone()
-    }
-}
-
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct StopRequest {
-    session: LeaseRef,
-}
-
-impl StopRequest {
-    fn is_valid(&self) -> bool {
-        self.session.has_valid_token()
-    }
-}
-
-fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(state_io_err(path, error)),
-    };
-    serde_json::from_reader(file)
-        .map(Some)
-        .map_err(|error| AppError::fail(format!("invalid JSON at {}: {error}", path.display())))
-}
-
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| AppError::fail(format!("state path has no parent: {}", path.display())))?;
-    fs::create_dir_all(dir).map_err(|error| state_io_err(dir, error))?;
-    let data = serde_json::to_vec(value)
-        .map_err(|error| AppError::fail(format!("could not encode {}: {error}", path.display())))?;
-    let tmp = path.with_extension("json.tmp");
-    let result = (|| {
-        let mut file = create_temp(&tmp).map_err(|error| state_io_err(&tmp, error))?;
-        file.write_all(&data)
-            .and_then(|_| file.write_all(b"\n"))
-            .and_then(|_| file.sync_all())
-            .map_err(|error| state_io_err(&tmp, error))?;
-        replace_file(&tmp, path).map_err(|error| state_io_err(path, error))?;
-        sync_parent(dir).map_err(|error| state_io_err(dir, error))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
-fn create_temp(path: &Path) -> std::io::Result<File> {
-    let open = || OpenOptions::new().write(true).create_new(true).open(path);
-    match open() {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            fs::remove_file(path)?;
-            open()
-        }
-        result => result,
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    fs::rename(tmp, path)
+    let expected_owner = macos_helper_owner(&dir)?;
+    validate_macos_private_layout(&dir, expected_owner)
 }
 
 #[cfg(windows)]
-fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+pub fn windows_user_sid() -> Result<String> {
+    windows_security::current_user_sid()
+}
+
+#[cfg(windows)]
+pub fn validate_helper_state_dir(expected_owner: &str) -> Result<()> {
+    let dir = state_dir();
+    if !dir.is_absolute() {
+        return Err(AppError::fail("helper state directory must be absolute"));
+    }
+    validate_windows_state_dir(&dir, expected_owner)
+}
+
+#[cfg(windows)]
+pub fn validate_windows_state_dir(dir: &Path, expected_owner: &str) -> Result<()> {
+    let expected_owner = canonical_windows_sid(expected_owner)?;
+    if windows_user_sid()? != expected_owner {
+        return Err(AppError::fail(
+            "elevated helper must run as the same Windows account",
+        ));
+    }
+    validate_windows_private_layout(dir, &expected_owner, true)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_helper_owner(dir: &Path) -> Result<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+
+    validate_existing_directory(dir)?;
+    let metadata = fs::metadata(dir).map_err(|error| state_io_err(dir, error))?;
+    match (
+        std::env::var("SUDO_UID").ok(),
+        std::env::var("SUDO_GID").ok(),
+    ) {
+        (Some(uid), Some(gid)) => Ok((
+            uid.parse::<u32>()
+                .map_err(|_| AppError::fail("invalid SUDO_UID"))?,
+            gid.parse::<u32>()
+                .map_err(|_| AppError::fail("invalid SUDO_GID"))?,
+        )),
+        (None, None) if metadata.uid() == 0 => Ok((0, metadata.gid())),
+        _ => Err(AppError::fail("cannot determine the sudo caller identity")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_private_layout(dir: &Path, expected_owner: (u32, u32)) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    validate_existing_directory(dir)?;
+    let metadata = fs::metadata(dir).map_err(|error| state_io_err(dir, error))?;
+    if metadata.permissions().mode() & 0o777 != 0o700
+        || (metadata.uid(), metadata.gid()) != expected_owner
+        || crate::platform::has_extended_acl(dir)?
+    {
+        return Err(AppError::fail(
+            "helper state directory must be caller-owned with mode 0700 and no extended ACL",
+        ));
+    }
+    for path in [
+        dir.join(WAKE_LOCK_FILE),
+        dir.join(WATCHDOG_LOCK_FILE),
+        dir.join(STATE_FILE),
+    ] {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| state_io_err(&path, error))?;
+        validate_regular_metadata(&path, &metadata)?;
+        if metadata.permissions().mode() & 0o777 != 0o600
+            || (metadata.uid(), metadata.gid()) != expected_owner
+            || crate::platform::has_extended_acl(&path)?
+        {
+            return Err(AppError::fail(format!(
+                "helper state file must be caller-owned with mode 0600 and no extended ACL: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn canonical_windows_sid(sid: &str) -> Result<String> {
+    windows_security::canonical_sid(sid)
+}
+
+#[cfg(windows)]
+fn validate_windows_private_layout(
+    dir: &Path,
+    expected_owner: &str,
+    require_state: bool,
+) -> Result<()> {
+    windows_security::validate_layout(dir, expected_owner, require_state)
+}
+
+#[cfg(all(test, windows))]
+fn set_windows_path_sddl(path: &Path, sddl: &str) -> Result<()> {
+    windows_security::set_path_sddl(path, sddl)
+}
+
+#[cfg(all(test, windows))]
+fn validate_windows_directory_sddl(sddl: &str, expected_owner: &str) -> Result<()> {
+    windows_security::validate_directory_sddl(sddl, expected_owner)
+}
+
+#[cfg(windows)]
+mod windows_security {
+    use super::*;
+    use std::ffi::c_void;
+    use std::mem::{size_of, size_of_val};
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
+        HLOCAL, LocalFree,
     };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    #[cfg(test)]
+    use windows_sys::Win32::Security::SetFileSecurityW;
+    use windows_sys::Win32::Security::{
+        ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, EqualSid,
+        GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation,
+        INHERIT_ONLY_ACE, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+        TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    #[cfg(test)]
+    use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, GetSecurityDescriptorOwner};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct LocalAllocation(*mut c_void);
+
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: this pointer was allocated by a Windows API documented for LocalFree.
+                unsafe { LocalFree(self.0 as HLOCAL) };
+            }
+        }
+    }
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: this is a live token handle returned by OpenProcessToken.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    struct OwnedSid {
+        ptr: PSID,
+        _allocation: LocalAllocation,
+    }
+
+    impl OwnedSid {
+        fn parse(value: &str) -> Result<Self> {
+            if value.is_empty() || value.encode_utf16().any(|unit| unit == 0) {
+                return Err(AppError::fail("invalid Windows caller SID"));
+            }
+            let wide = value
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: wide is a retained NUL-terminated buffer and ptr is an out parameter.
+            if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut ptr) } == 0 || ptr.is_null() {
+                return Err(last_error("invalid Windows caller SID"));
+            }
+            let allocation = LocalAllocation(ptr);
+            // SAFETY: ptr came from ConvertStringSidToSidW and remains owned by allocation.
+            if unsafe { IsValidSid(ptr) } == 0 {
+                return Err(AppError::fail("invalid Windows caller SID"));
+            }
+            Ok(Self {
+                ptr,
+                _allocation: allocation,
+            })
+        }
+    }
+
+    pub(super) fn canonical_sid(value: &str) -> Result<String> {
+        let sid = OwnedSid::parse(value)?;
+        sid_string(sid.ptr)
+    }
+
+    pub(super) fn current_user_sid() -> Result<String> {
+        let mut token = std::ptr::null_mut();
+        // SAFETY: GetCurrentProcess returns a process pseudo-handle and token is an out parameter.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(last_error("could not inspect the Windows account"));
+        }
+        let token = OwnedHandle(token);
+        let mut needed = 0;
+        // SAFETY: a null zero-length buffer is the documented size query.
+        let first = unsafe {
+            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed)
+        };
+        let size_error = std::io::Error::last_os_error();
+        if first != 0
+            || needed < size_of::<TOKEN_USER>() as u32
+            || size_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        {
+            return Err(AppError::fail(format!(
+                "could not size the Windows account identity: {size_error}"
+            )));
+        }
+        let words = (needed as usize).div_ceil(size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        // SAFETY: buffer is aligned and has at least needed writable bytes.
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(last_error("could not inspect the Windows account"));
+        }
+        // SAFETY: GetTokenInformation initialized a TOKEN_USER at the aligned buffer start.
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        sid_string(user.User.Sid)
+    }
+
+    fn sid_string(sid: PSID) -> Result<String> {
+        // SAFETY: callers provide a SID returned by a Windows security API.
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return Err(AppError::fail("Windows account SID is invalid"));
+        }
+        let mut text = std::ptr::null_mut();
+        // SAFETY: sid is valid and text is an out parameter.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+            return Err(last_error("could not encode the Windows account SID"));
+        }
+        let allocation = LocalAllocation(text.cast());
+        let len = (0..256)
+            // SAFETY: ConvertSidToStringSidW returned a NUL-terminated SID string.
+            .find(|offset| unsafe { *text.add(*offset) == 0 })
+            .ok_or_else(|| AppError::fail("Windows account SID is too long"))?;
+        // SAFETY: the terminating NUL was found within the allocated string.
+        let units = unsafe { std::slice::from_raw_parts(text, len) };
+        let value = String::from_utf16(units)
+            .map_err(|_| AppError::fail("Windows account SID is not valid UTF-16"));
+        drop(allocation);
+        value
+    }
+
+    pub(super) fn create_private_directory(path: &Path, owner: &str) -> Result<()> {
+        let owner = canonical_sid(owner)?;
+        let sddl = format!("O:{owner}D:P(A;OICI;FA;;;{owner})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+        create_directory_with_sddl(path, &sddl)
+    }
+
+    pub(super) fn create_directory_with_sddl(path: &Path, sddl: &str) -> Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+        let descriptor = descriptor_from_sddl(sddl)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let path_wide = path_wide(path)?;
+        // SAFETY: path_wide and attributes point to retained initialized buffers.
+        if unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+                return Err(state_io_err(path, error));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_layout(
+        dir: &Path,
+        expected_owner: &str,
+        require_state: bool,
+    ) -> Result<()> {
+        let expected_owner = OwnedSid::parse(expected_owner)?;
+        validate_path(dir, &expected_owner, true)?;
+        for path in [dir.join(WAKE_LOCK_FILE), dir.join(WATCHDOG_LOCK_FILE)] {
+            validate_path(&path, &expected_owner, false)?;
+        }
+        let state = dir.join(STATE_FILE);
+        match fs::symlink_metadata(&state) {
+            Ok(_) => validate_path(&state, &expected_owner, false),
+            Err(error) if !require_state && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(state_io_err(&state, error)),
+        }
+    }
+
+    pub(super) fn validate_directory(path: &Path, expected_owner: &str) -> Result<()> {
+        let expected_owner = OwnedSid::parse(expected_owner)?;
+        validate_path(path, &expected_owner, true)
+    }
+
+    pub(super) fn validate_file(path: &Path, expected_owner: &str) -> Result<()> {
+        let expected_owner = OwnedSid::parse(expected_owner)?;
+        validate_path(path, &expected_owner, false)
+    }
+
+    fn validate_path(path: &Path, expected_owner: &OwnedSid, directory: bool) -> Result<()> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        0
+                    },
+            );
+        let file = options
+            .open(path)
+            .map_err(|error| state_io_err(path, error))?;
+        let metadata = file.metadata().map_err(|error| state_io_err(path, error))?;
+        if directory {
+            if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+                return Err(AppError::fail(format!(
+                    "state directory is not a regular non-link directory: {}",
+                    path.display()
+                )));
+            }
+        } else {
+            validate_regular_metadata(path, &metadata)?;
+        }
+        validate_handle(&file, path, expected_owner, directory)
+    }
+
+    fn validate_handle(
+        file: &File,
+        path: &Path,
+        expected_owner: &OwnedSid,
+        directory: bool,
+    ) -> Result<()> {
+        let mut owner = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: file owns a live handle and all requested output pointers are valid.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(status_error(
+                &format!("could not inspect Windows security at {}", path.display()),
+                status,
+            ));
+        }
+        let _descriptor = LocalAllocation(descriptor);
+        validate_descriptor(descriptor, owner, dacl, expected_owner, path, directory)
+    }
+
+    fn validate_descriptor(
+        descriptor: PSECURITY_DESCRIPTOR,
+        owner: PSID,
+        dacl: *mut windows_sys::Win32::Security::ACL,
+        expected_owner: &OwnedSid,
+        path: &Path,
+        directory: bool,
+    ) -> Result<()> {
+        if owner.is_null()
+            // SAFETY: both pointers came from the retained security descriptor.
+            || unsafe { EqualSid(owner, expected_owner.ptr) } == 0
+        {
+            return Err(AppError::fail(format!(
+                "state path is not owned by the expected Windows account: {}",
+                path.display()
+            )));
+        }
+        if dacl.is_null() {
+            return Err(AppError::fail(format!(
+                "state path has a null Windows DACL: {}",
+                path.display()
+            )));
+        }
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor is retained and both output pointers are valid.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(last_error(
+                "could not inspect Windows security descriptor control",
+            ));
+        }
+        if directory && control & SE_DACL_PROTECTED == 0 {
+            return Err(AppError::fail(format!(
+                "state directory Windows DACL must be protected: {}",
+                path.display()
+            )));
+        }
+        validate_dacl(dacl, expected_owner, path)
+    }
+
+    fn validate_dacl(
+        dacl: *mut windows_sys::Win32::Security::ACL,
+        expected_owner: &OwnedSid,
+        path: &Path,
+    ) -> Result<()> {
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: dacl belongs to the retained descriptor and info is a writable output buffer.
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of_val(&info) as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(last_error("could not inspect the Windows state DACL"));
+        }
+        if info.AclBytesInUse < size_of::<windows_sys::Win32::Security::ACL>() as u32 {
+            return Err(AppError::fail("Windows state DACL is malformed"));
+        }
+        if info.AceCount != 3 {
+            return Err(private_dacl_error(path));
+        }
+        let acl_start = dacl as usize;
+        let acl_end = acl_start
+            .checked_add(info.AclBytesInUse as usize)
+            .ok_or_else(|| AppError::fail("Windows state DACL is malformed"))?;
+        let first_ace = acl_start + size_of::<windows_sys::Win32::Security::ACL>();
+        let mut previous_end = first_ace;
+        let mut trusted = [false; 3];
+        for index in 0..info.AceCount {
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: dacl is valid and ace is an out pointer for this bounded index.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                return Err(last_error("could not inspect a Windows state DACL entry"));
+            }
+            let start = ace as usize;
+            let header_end = start
+                .checked_add(size_of::<ACE_HEADER>())
+                .ok_or_else(|| AppError::fail("Windows state DACL entry is malformed"))?;
+            if start < previous_end || header_end > acl_end {
+                return Err(AppError::fail("Windows state DACL entry is malformed"));
+            }
+            // SAFETY: the complete ACE header was bounds-checked within the ACL allocation.
+            let header = unsafe { std::ptr::read_unaligned(ace.cast::<ACE_HEADER>()) };
+            let size = header.AceSize as usize;
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| AppError::fail("Windows state DACL entry is malformed"))?;
+            if size < size_of::<ACE_HEADER>() || !size.is_multiple_of(4) || end > acl_end {
+                return Err(AppError::fail("Windows state DACL entry is malformed"));
+            }
+            previous_end = end;
+            // SAFETY: the ACE's complete reported size was bounds-checked within the ACL.
+            let bytes = unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), size) };
+            if header.AceType as u32 != ACCESS_ALLOWED_ACE_TYPE
+                || u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0
+                || read_u32(bytes, 4)? != FILE_ALL_ACCESS
+            {
+                return Err(private_dacl_error(path));
+            }
+            let (sid, sid_len) = sid_at(bytes, 8)?;
+            if size != 8 + sid_len {
+                return Err(AppError::fail("Windows state DACL entry is malformed"));
+            }
+            let index =
+                trusted_sid_index(sid, expected_owner).ok_or_else(|| private_dacl_error(path))?;
+            if std::mem::replace(&mut trusted[index], true) {
+                return Err(private_dacl_error(path));
+            }
+        }
+        trusted
+            .iter()
+            .all(|present| *present)
+            .then_some(())
+            .ok_or_else(|| private_dacl_error(path))
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+        let bytes = bytes
+            .get(offset..offset + size_of::<u32>())
+            .ok_or_else(|| AppError::fail("Windows state DACL entry is malformed"))?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+    }
+
+    fn sid_at(ace: &[u8], offset: usize) -> Result<(PSID, usize)> {
+        let bytes = ace
+            .get(offset..)
+            .ok_or_else(|| AppError::fail("Windows state DACL SID is malformed"))?;
+        if bytes.len() < 8 {
+            return Err(AppError::fail("Windows state DACL SID is malformed"));
+        }
+        let length = 8 + usize::from(bytes[1]) * 4;
+        if length > bytes.len() {
+            return Err(AppError::fail("Windows state DACL SID is malformed"));
+        }
+        // SAFETY: the SID's count-derived length was bounds-checked inside the ACE.
+        let sid = unsafe { ace.as_ptr().add(offset) as PSID };
+        // SAFETY: sid points to the bounds-checked SID bytes retained by ace.
+        if unsafe { IsValidSid(sid) } == 0 || unsafe { GetLengthSid(sid) } as usize != length {
+            return Err(AppError::fail("Windows state DACL SID is malformed"));
+        }
+        Ok((sid, length))
+    }
+
+    fn trusted_sid_index(sid: PSID, expected_owner: &OwnedSid) -> Option<usize> {
+        // SAFETY: both SIDs were validated before this comparison.
+        if unsafe { EqualSid(sid, expected_owner.ptr) } != 0 {
+            Some(0)
+        } else if unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0 {
+            Some(1)
+        } else if unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) } != 0 {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    fn private_dacl_error(path: &Path) -> AppError {
+        AppError::fail(format!(
+            "state path must grant full control only to its owner, SYSTEM, and Administrators: {}",
+            path.display()
+        ))
+    }
+
+    fn descriptor_from_sddl(sddl: &str) -> Result<LocalAllocation> {
+        if sddl.encode_utf16().any(|unit| unit == 0) {
+            return Err(AppError::fail("Windows security descriptor contains NUL"));
+        }
+        let wide = sddl
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: wide is retained and NUL-terminated; descriptor is an out parameter.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
+            || descriptor.is_null()
+        {
+            return Err(last_error("invalid Windows security descriptor"));
+        }
+        Ok(LocalAllocation(descriptor))
+    }
+
+    fn path_wide(path: &Path) -> Result<Vec<u16>> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(AppError::fail(format!(
+                "state path contains NUL: {}",
+                path.display()
+            )));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    #[cfg(test)]
+    pub(super) fn validate_directory_sddl(sddl: &str, expected_owner: &str) -> Result<()> {
+        let descriptor = descriptor_from_sddl(sddl)?;
+        let expected_owner = OwnedSid::parse(expected_owner)?;
+        let mut owner = std::ptr::null_mut();
+        let mut owner_defaulted = 0;
+        let mut dacl = std::ptr::null_mut();
+        let mut dacl_present = 0;
+        let mut dacl_defaulted = 0;
+        // SAFETY: descriptor is retained and all output pointers are valid.
+        if unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut owner_defaulted) }
+            == 0
+            || unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor.0,
+                    &mut dacl_present,
+                    &mut dacl,
+                    &mut dacl_defaulted,
+                )
+            } == 0
+            || dacl_present == 0
+        {
+            return Err(last_error(
+                "could not inspect test Windows security descriptor",
+            ));
+        }
+        validate_descriptor(
+            descriptor.0,
+            owner,
+            dacl,
+            &expected_owner,
+            Path::new("<test>"),
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_path_sddl(path: &Path, sddl: &str) -> Result<()> {
+        let descriptor = descriptor_from_sddl(sddl)?;
+        let path_wide = path_wide(path)?;
+        // SAFETY: path and descriptor remain valid through the call.
+        if unsafe { SetFileSecurityW(path_wide.as_ptr(), DACL_SECURITY_INFORMATION, descriptor.0) }
+            == 0
+        {
+            return Err(last_error("could not set the test Windows DACL"));
+        }
+        Ok(())
+    }
+
+    fn last_error(context: &str) -> AppError {
+        AppError::fail(format!("{context}: {}", std::io::Error::last_os_error()))
+    }
+
+    fn status_error(context: &str, status: u32) -> AppError {
+        AppError::fail(format!(
+            "{context}: {}",
+            std::io::Error::from_raw_os_error(status as i32)
+        ))
+    }
+}
+
+fn reject_stale_state_at(dir: &Path) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(state_io_err(dir, error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| state_io_err(dir, error))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if LEGACY_FILES.contains(&name)
+            || valid_process_lease_name(name)
+            || valid_atomic_artifact_name(name)
+        {
+            let path = entry.path();
+            return Err(AppError::fail(format!(
+                "legacy or incomplete wake state found at {}; stop it with the wake binary that created it, then inspect and remove it before retrying",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn valid_process_lease_name(name: &str) -> bool {
+    name.strip_prefix("process-")
+        .and_then(|name| name.strip_suffix(".lock"))
+        .is_some_and(valid_token)
+}
+
+fn valid_atomic_artifact_name(name: &str) -> bool {
+    name.strip_prefix(".state-")
+        .and_then(|name| {
+            name.strip_suffix(".tmp")
+                .or_else(|| name.strip_suffix(".bak"))
+        })
+        .is_some_and(valid_token)
+}
+
+pub fn read() -> Result<Option<State>> {
+    read_at(&state_file())
+}
+
+fn read_at(path: &Path) -> Result<Option<State>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(state_io_err(path, error)),
+        Ok(metadata) => validate_regular_metadata(path, &metadata)?,
+    }
+    let file = open_existing_state(path)?;
+    let state: State = serde_json::from_reader(file)
+        .map_err(|error| AppError::fail(format!("invalid JSON at {}: {error}", path.display())))?;
+    state.validate()?;
+    Ok(Some(state))
+}
+
+fn open_existing_state(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| state_io_err(path, error))?;
+    let opened = file.metadata().map_err(|error| state_io_err(path, error))?;
+    validate_regular_metadata(path, &opened)?;
+    Ok(file)
+}
+
+pub fn create(_lock: &LockGuard, state: &State) -> Result<()> {
+    create_at(&state_file(), state)
+}
+
+fn create_at(path: &Path, state: &State) -> Result<()> {
+    state.validate()?;
+    if read_at(path)?.is_some() {
+        return Err(AppError::fail("session state already exists"));
+    }
+    write_atomic(path, state)
+}
+
+pub fn update(
+    _lock: &LockGuard,
+    owner: &OwnerIdentity,
+    change: impl FnOnce(&mut State) -> Result<()>,
+) -> Result<State> {
+    update_at(&state_file(), owner, change)
+}
+
+fn update_at(
+    path: &Path,
+    owner: &OwnerIdentity,
+    change: impl FnOnce(&mut State) -> Result<()>,
+) -> Result<State> {
+    let mut state =
+        read_at(path)?.ok_or_else(|| AppError::fail("active session state is missing"))?;
+    if &state.session.owner != owner {
+        return Err(AppError::fail("active session ownership changed"));
+    }
+    let before = state.clone();
+    change(&mut state)?;
+    if state.session.owner != before.session.owner || state.session.spec != before.session.spec {
+        return Err(AppError::fail(
+            "session owner and run specification are immutable",
+        ));
+    }
+    validate_transition(&before, &state)?;
+    state.validate()?;
+    write_atomic(path, &state)?;
+    Ok(state)
+}
+
+fn validate_transition(before: &State, after: &State) -> Result<()> {
+    if before.schema != after.schema {
+        return Err(AppError::fail("state schema is immutable"));
+    }
+    if before.session.stop_requested && !after.session.stop_requested {
+        return Err(AppError::fail("a session stop request cannot be cleared"));
+    }
+    if before.session.started_at.is_some()
+        && (before.session.started_at != after.session.started_at
+            || before.session.note != after.session.note)
+    {
+        return Err(AppError::fail("started session metadata is immutable"));
+    }
+    match (&before.lid, &after.lid) {
+        (None, Some(new))
+            if new.ready || before.session.stop_requested || after.session.stop_requested =>
+        {
+            return Err(AppError::fail(
+                "lid startup must publish ready=false before a stop request",
+            ));
+        }
+        (Some(_), None) => return Err(AppError::fail("lid state cannot be removed by update")),
+        (Some(old), Some(new)) => {
+            if old.restore != new.restore {
+                return Err(AppError::fail("lid restoration state is immutable"));
+            }
+            if old.ready && !new.ready {
+                return Err(AppError::fail("lid readiness cannot move backwards"));
+            }
+            if !old.ready && new.ready && after.session.stop_requested {
+                return Err(AppError::fail(
+                    "lid readiness cannot be published after a stop request",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn remove_exact(_lock: &LockGuard, expected: &State) -> Result<bool> {
+    remove_exact_at(&state_file(), expected)
+}
+
+fn remove_exact_at(path: &Path, expected: &State) -> Result<bool> {
+    let Some(actual) = read_at(path)? else {
+        return Ok(false);
+    };
+    if actual != *expected {
+        return Ok(false);
+    }
+    fs::remove_file(path).map_err(|error| state_io_err(path, error))?;
+    if let Some(dir) = path.parent() {
+        sync_parent(dir).map_err(|error| state_io_err(dir, error))?;
+    }
+    Ok(true)
+}
+
+fn write_atomic(path: &Path, state: &State) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| AppError::fail(format!("state path has no parent: {}", path.display())))?;
+    validate_existing_directory(dir)?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        validate_regular_metadata(path, &metadata)?;
+    }
+    #[cfg(windows)]
+    let expected_owner = windows_user_sid()?;
+    let data = serde_json::to_vec(state)
+        .map_err(|error| AppError::fail(format!("could not encode {}: {error}", path.display())))?;
+    let (tmp, mut file) = create_random_temp(dir)?;
+    let prepared = (|| {
+        prepare_temp_permissions(&file, dir)?;
+        file.write_all(&data)
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| state_io_err(&tmp, error))
+    })();
+    drop(file);
+    if let Err(error) = prepared {
+        return Err(remove_temp_after_failure(&tmp, error));
+    }
+    #[cfg(windows)]
+    replace_file(&tmp, path, &expected_owner, state)?;
+    #[cfg(not(windows))]
+    replace_file(&tmp, path)?;
+    sync_parent(dir).map_err(|error| state_io_err(dir, error))
+}
+
+fn create_random_temp(dir: &Path) -> Result<(PathBuf, File)> {
+    for _ in 0..8 {
+        let path = dir.join(format!(".state-{}.tmp", new_token()?));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(state_io_err(&path, error)),
+        }
+    }
+    Err(AppError::fail(
+        "could not allocate a unique state temporary file",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_temp_permissions(file: &File, dir: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let metadata = fs::metadata(dir).map_err(|error| state_io_err(dir, error))?;
+    let expected = match (
+        std::env::var("SUDO_UID").ok(),
+        std::env::var("SUDO_GID").ok(),
+    ) {
+        (Some(uid), Some(gid)) => {
+            let uid = uid
+                .parse::<u32>()
+                .map_err(|_| AppError::fail("invalid SUDO_UID"))?;
+            let gid = gid
+                .parse::<u32>()
+                .map_err(|_| AppError::fail("invalid SUDO_GID"))?;
+            if metadata.uid() != uid || metadata.gid() != gid {
+                return Err(AppError::fail(
+                    "state directory ownership does not match the sudo caller",
+                ));
+            }
+            (uid, gid)
+        }
+        (None, None) if metadata.uid() == 0 => (0, metadata.gid()),
+        _ => return Err(AppError::fail("cannot determine the sudo caller identity")),
+    };
+    // SAFETY: file owns a live descriptor; the validated IDs and mode are passed directly.
+    if unsafe { libc::fchown(file.as_raw_fd(), expected.0, expected.1) } != 0
+        || unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0
+    {
+        return Err(AppError::from(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prepare_temp_permissions(_file: &File, _dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
+    fs::rename(tmp, path).map_err(|error| remove_temp_after_failure(tmp, state_io_err(path, error)))
+}
+
+#[cfg(windows)]
+fn replace_file(tmp: &Path, path: &Path, expected_owner: &str, expected: &State) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(remove_temp_after_failure(tmp, state_io_err(path, error)));
+        }
+    };
+    let Some(metadata) = metadata else {
+        return match move_file(tmp, path) {
+            Ok(()) => validate_expected_windows_state(path, expected_owner, expected),
+            Err(error) => Err(remove_temp_after_failure(tmp, state_io_err(path, error))),
+        };
+    };
+    if let Err(error) = validate_regular_metadata(path, &metadata) {
+        return Err(remove_temp_after_failure(tmp, error));
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| AppError::fail(format!("state path has no parent: {}", path.display())))?;
+    let backup = match random_backup_path(dir) {
+        Ok(path) => path,
+        Err(error) => return Err(remove_temp_after_failure(tmp, error)),
+    };
+    let result = raw_replace_file(path, tmp, &backup);
+    finish_existing_replace(
+        tmp,
+        path,
+        &backup,
+        expected_owner,
+        expected,
+        result,
+        move_file,
+    )
+}
+
+#[cfg(windows)]
+fn raw_replace_file(path: &Path, tmp: &Path, backup: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
     let wide = |value: &Path| {
         value
@@ -509,19 +1220,178 @@ fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
             .chain(std::iter::once(0))
             .collect::<Vec<_>>()
     };
-    let (tmp, path) = (wide(tmp), wide(path));
-    // SAFETY: both paths are valid, NUL-terminated UTF-16 buffers retained for the call.
+    let tmp = wide(tmp);
+    let path = wide(path);
+    let backup = wide(backup);
+    // SAFETY: all paths are retained NUL-terminated UTF-16 buffers. Flags are zero so metadata,
+    // including the replaced file's DACL, is preserved instead of ignoring merge errors.
+    let ok = unsafe {
+        ReplaceFileW(
+            path.as_ptr(),
+            tmp.as_ptr(),
+            backup.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn move_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let wide = |value: &Path| {
+        value
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let source = wide(source);
+    let destination = wide(destination);
+    // SAFETY: both paths are retained NUL-terminated UTF-16 buffers through the call.
     if unsafe {
         MoveFileExW(
-            tmp.as_ptr(),
-            path.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
         )
     } == 0
     {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn random_backup_path(dir: &Path) -> Result<PathBuf> {
+    for _ in 0..8 {
+        let path = dir.join(format!(".state-{}.bak", new_token()?));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Ok(_) => continue,
+            Err(error) => return Err(state_io_err(&path, error)),
+        }
+    }
+    Err(AppError::fail(
+        "could not allocate a unique state backup path",
+    ))
+}
+
+fn remove_temp_after_failure(tmp: &Path, error: AppError) -> AppError {
+    match fs::remove_file(tmp) {
+        Ok(()) => error,
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup) => AppError::fail(format!(
+            "{error}; attempted state remains at {} because cleanup failed: {cleanup}",
+            tmp.display()
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn validate_complete_windows_state(path: &Path, expected_owner: &str) -> Result<State> {
+    windows_security::validate_file(path, expected_owner)?;
+    read_at(path)?.ok_or_else(|| AppError::fail("canonical state is missing"))
+}
+
+#[cfg(windows)]
+fn validate_expected_windows_state(
+    path: &Path,
+    expected_owner: &str,
+    expected: &State,
+) -> Result<()> {
+    if validate_complete_windows_state(path, expected_owner)? != *expected {
+        return Err(AppError::fail(
+            "canonical state does not match the intended state",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn finish_existing_replace(
+    tmp: &Path,
+    path: &Path,
+    backup: &Path,
+    expected_owner: &str,
+    expected: &State,
+    replace_result: std::io::Result<()>,
+    restore: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+
+    match replace_result {
+        Err(error) if error.raw_os_error() == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32) => {
+            let primary = AppError::fail(format!(
+                "state replacement failed at {}: {error}",
+                path.display()
+            ));
+            if let Err(rollback) = restore(backup, path) {
+                return Err(AppError::fail(format!(
+                    "{primary}; rollback failed: {rollback}; previous state remains at {}; attempted state remains at {}",
+                    backup.display(),
+                    tmp.display()
+                )));
+            }
+            if let Err(validation) = validate_complete_windows_state(path, expected_owner) {
+                return Err(AppError::fail(format!(
+                    "{primary}; restored state validation failed: {validation}; attempted state remains at {}",
+                    tmp.display()
+                )));
+            }
+            if let Err(cleanup) = fs::remove_file(tmp) {
+                return Err(AppError::fail(format!(
+                    "{primary}; attempted state remains at {} because cleanup failed: {cleanup}",
+                    tmp.display()
+                )));
+            }
+            Err(primary)
+        }
+        Err(error) => {
+            let primary = AppError::fail(format!(
+                "state replacement failed at {}: {error}",
+                path.display()
+            ));
+            if let Err(validation) = validate_complete_windows_state(path, expected_owner) {
+                return Err(AppError::fail(format!(
+                    "{primary}; canonical state validation failed: {validation}; attempted state remains at {}",
+                    tmp.display()
+                )));
+            }
+            if let Err(cleanup) = fs::remove_file(tmp) {
+                return Err(AppError::fail(format!(
+                    "{primary}; attempted state remains at {} because cleanup failed: {cleanup}",
+                    tmp.display()
+                )));
+            }
+            Err(primary)
+        }
+        Ok(()) => {
+            if let Err(validation) = validate_expected_windows_state(path, expected_owner, expected)
+            {
+                return Err(AppError::fail(format!(
+                    "state replacement validation failed: {validation}; attempted state is at {}; previous state remains at {}",
+                    path.display(),
+                    backup.display()
+                )));
+            }
+            fs::remove_file(backup).map_err(|cleanup| {
+                AppError::fail(format!(
+                    "state replacement committed at {}, but previous state remains at {} because cleanup failed: {cleanup}",
+                    path.display(),
+                    backup.display()
+                ))
+            })
+        }
     }
 }
 
@@ -535,327 +1405,6 @@ fn sync_parent(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn read_session_at(path: &Path) -> Result<Option<Session>> {
-    let saved: Option<Session> = read_json(path)?;
-    if let Some(saved) = saved {
-        if !saved.is_valid()? {
-            return Err(AppError::fail(format!(
-                "invalid session at {}",
-                path.display()
-            )));
-        }
-        Ok(Some(saved))
-    } else {
-        Ok(None)
-    }
-}
-
-fn write_session_at(path: &Path, session: &Session) -> Result<()> {
-    write_json(path, session)
-}
-
-fn write_stop_at(path: &Path, session: &Session) -> Result<()> {
-    write_stop_owner_at(path, &session.owner)
-}
-
-fn write_stop_owner_at(path: &Path, owner: &LeaseRef) -> Result<()> {
-    if !owner.has_valid_token() {
-        return Err(AppError::fail("invalid process lease"));
-    }
-    write_json(
-        path,
-        &StopRequest {
-            session: owner.clone(),
-        },
-    )
-}
-
-fn read_stop_at(path: &Path) -> Result<Option<StopRequest>> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(state_io_err(path, error)),
-    };
-    match serde_json::from_slice::<StopRequest>(&data) {
-        Ok(request) if request.is_valid() => Ok(Some(request)),
-        _ => {
-            remove_state_file_at(path)?;
-            Ok(None)
-        }
-    }
-}
-
-fn stop_requested_at(path: &Path, session: &Session) -> Result<bool> {
-    let request = read_stop_at(path)?;
-    Ok(request.is_some_and(|request| request.session.same_lease(&session.owner)))
-}
-
-fn clear_stop_at(path: &Path, session: &Session) -> Result<bool> {
-    if !stop_requested_at(path, session)? {
-        return Ok(false);
-    }
-    remove_state_file_at(path)?;
-    Ok(true)
-}
-
-fn reconcile_stop_at(path: &Path, is_live: impl FnOnce(&LeaseRef) -> Result<bool>) -> Result<()> {
-    let Some(request) = read_stop_at(path)? else {
-        return Ok(());
-    };
-    if is_live(&request.session)? {
-        return Err(AppError::fail(format!(
-            "stop request still targets a live process at {}",
-            path.display()
-        )));
-    }
-    remove_state_file_at(path)
-}
-
-fn remove_session_if_matches_at(path: &Path, expected: &Session) -> Result<bool> {
-    let Some(actual) = read_session_at(path)? else {
-        return Ok(false);
-    };
-    if actual.identity() != expected.identity() {
-        return Ok(false);
-    }
-    remove_state_file_at(path)?;
-    Ok(true)
-}
-
-fn remove_session_if_owner_at(path: &Path, owner: &LeaseRef) -> Result<bool> {
-    let Some(actual) = read_session_at(path)? else {
-        return Ok(false);
-    };
-    if !actual.owner.same_lease(owner) {
-        return Ok(false);
-    }
-    remove_state_file_at(path)?;
-    Ok(true)
-}
-
-fn read_lid_restore_at(path: &Path) -> Result<Option<LidRestore>> {
-    let marker: Option<LidRestore> = read_json(path)?;
-    if let Some(marker) = &marker {
-        marker.validate()?;
-    }
-    Ok(marker)
-}
-
-#[cfg(any(test, windows, target_os = "macos"))]
-fn write_lid_restore_at(path: &Path, marker: &LidRestore) -> Result<()> {
-    marker.validate()?;
-    if let Some(saved) = read_lid_restore_at(path)?
-        && saved != *marker
-    {
-        return Err(AppError::fail(format!(
-            "unresolved lid restoration marker already exists at {}",
-            path.display()
-        )));
-    }
-    write_json(path, marker)
-}
-
-fn read_watchdog_at(path: &Path) -> Result<Option<WatchdogState>> {
-    let state: Option<WatchdogState> = read_json(path)?;
-    match state {
-        Some(state) if !state.is_valid() => Err(AppError::fail(format!(
-            "invalid lid watchdog state at {}",
-            path.display()
-        ))),
-        state => Ok(state),
-    }
-}
-
-#[cfg(any(test, windows, target_os = "macos"))]
-fn write_watchdog_at(path: &Path, state: &WatchdogState) -> Result<()> {
-    if !state.is_valid() {
-        return Err(AppError::fail("invalid lid watchdog state"));
-    }
-    if let Some(saved) = read_watchdog_at(path)?
-        && (saved.owner != state.owner
-            || !saved.watchdog.same_lease(&state.watchdog)
-            || (saved.watchdog.pid != state.watchdog.pid && saved.watchdog.pid != 0)
-            || (saved.ready && !state.ready))
-    {
-        return Err(AppError::fail(format!(
-            "unresolved lid watchdog state already exists at {}",
-            path.display()
-        )));
-    }
-    write_json(path, state)
-}
-
-#[cfg(any(test, windows, target_os = "macos"))]
-fn remove_watchdog_if_owner_at(path: &Path, owner: &LeaseRef) -> Result<bool> {
-    let Some(state) = read_watchdog_at(path)? else {
-        return Ok(false);
-    };
-    if &state.owner != owner {
-        return Ok(false);
-    }
-    remove_state_file_at(path)?;
-    Ok(true)
-}
-
-#[cfg(any(test, windows, target_os = "macos"))]
-fn clear_lid_restore_at(path: &Path, expected: &LidRestore) -> Result<()> {
-    match read_lid_restore_at(path)? {
-        Some(actual) if &actual == expected => {
-            fs::remove_file(path).map_err(|error| state_io_err(path, error))?;
-            if let Some(dir) = path.parent() {
-                sync_parent(dir).map_err(|error| state_io_err(dir, error))?;
-            }
-            Ok(())
-        }
-        Some(_) => Err(AppError::fail(format!(
-            "lid restoration marker changed at {}; refusing to remove it",
-            path.display()
-        ))),
-        None => Err(AppError::fail(format!(
-            "lid restoration marker is missing at {}",
-            path.display()
-        ))),
-    }
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-pub fn read_lid_restore() -> Result<Option<LidRestore>> {
-    read_lid_restore_at(&lid_restore_file())
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-#[cfg(any(windows, target_os = "macos"))]
-pub fn write_lid_restore(marker: &LidRestore) -> Result<()> {
-    write_lid_restore_at(&lid_restore_file(), marker)
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-#[cfg(any(windows, target_os = "macos"))]
-pub fn clear_lid_restore(expected: &LidRestore) -> Result<()> {
-    clear_lid_restore_at(&lid_restore_file(), expected)
-}
-
-pub fn read_watchdog() -> Result<Option<WatchdogState>> {
-    read_watchdog_at(&lid_watchdog_file())
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-pub fn write_watchdog(state: &WatchdogState) -> Result<()> {
-    write_watchdog_at(&lid_watchdog_file(), state)
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-pub fn remove_watchdog_if_owner(owner: &LeaseRef) -> Result<bool> {
-    remove_watchdog_if_owner_at(&lid_watchdog_file(), owner)
-}
-
-pub fn remove_watchdog_file() -> Result<()> {
-    remove_state_file_at(&lid_watchdog_file())
-}
-
-pub fn read_saved_for_recovery() -> Result<Option<Session>> {
-    read_session_at(&state_file())
-}
-
-pub fn read_current() -> Result<Option<Session>> {
-    let Some(session) = read_saved_for_recovery()? else {
-        return Ok(None);
-    };
-    if session.owner_is_live()? || session.spec.even_lid {
-        Ok(Some(session))
-    } else {
-        remove_state_file()?;
-        Ok(None)
-    }
-}
-
-fn state_io_err(path: &Path, e: std::io::Error) -> AppError {
-    AppError::fail(format!(
-        "state IO failed at {}: {e}; set WAKE_STATE_DIR to a writable directory",
-        path.display()
-    ))
-}
-
-fn write_pending_at(path: &Path, session: &Session) -> Result<()> {
-    if session.owner.pid != 0 || !session.is_valid()? {
-        return Err(AppError::fail("invalid pending session"));
-    }
-    if read_session_at(path)?.is_some() {
-        return Err(AppError::fail("session state already exists"));
-    }
-    write_session_at(path, session)
-}
-
-fn write_ready_at(path: &Path, session: &Session) -> Result<()> {
-    if !session.owner.is_valid() || !session.is_valid()? {
-        return Err(AppError::fail("invalid ready session"));
-    }
-    let Some(pending) = read_session_at(path)? else {
-        return Err(AppError::fail("pending session was cancelled"));
-    };
-    if pending.owner.pid != 0
-        || !pending.owner.same_lease(&session.owner)
-        || pending.spec != session.spec
-    {
-        return Err(AppError::fail("pending session changed before readiness"));
-    }
-    write_session_at(path, session)
-}
-
-pub fn write_pending(session: &Session) -> Result<()> {
-    write_pending_at(&state_file(), session)
-}
-
-pub fn write_ready(session: &Session) -> Result<()> {
-    write_ready_at(&state_file(), session)
-}
-
-pub fn request_stop(session: &Session) -> Result<()> {
-    write_stop_at(&stop_file(), session)
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-pub fn request_stop_owner(owner: &LeaseRef) -> Result<()> {
-    write_stop_owner_at(&stop_file(), owner)
-}
-
-pub fn stop_requested(session: &Session) -> Result<bool> {
-    stop_requested_at(&stop_file(), session)
-}
-
-pub fn clear_stop(session: &Session) -> Result<bool> {
-    clear_stop_at(&stop_file(), session)
-}
-
-pub fn reconcile_stop() -> Result<()> {
-    reconcile_stop_at(&stop_file(), sysutil::lease_is_live)
-}
-
-pub fn remove_if_matches(session: &Session) -> Result<bool> {
-    remove_session_if_matches_at(&state_file(), session)
-}
-
-pub fn remove_if_owner(owner: &LeaseRef) -> Result<bool> {
-    remove_session_if_owner_at(&state_file(), owner)
-}
-
-fn remove_state_file_at(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            if let Some(dir) = path.parent() {
-                sync_parent(dir).map_err(|error| state_io_err(dir, error))?;
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(state_io_err(path, error)),
-    }
-}
-
-pub fn remove_state_file() -> Result<()> {
-    remove_state_file_at(&state_file())
-}
-
 pub struct LockGuard {
     file: File,
 }
@@ -866,42 +1415,243 @@ impl Drop for LockGuard {
     }
 }
 
-fn open_lock_file() -> Result<File> {
-    let dir = state_dir();
-    fs::create_dir_all(&dir).map_err(|e| state_io_err(&dir, e))?;
-    let path = dir.join("wake.lock");
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|e| state_io_err(&path, e))
+pub struct WatchdogLock {
+    file: File,
+}
+
+impl Drop for WatchdogLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 pub fn try_acquire_lock() -> Result<Option<LockGuard>> {
-    let file = open_lock_file()?;
+    try_acquire_lock_at(&state_dir())
+}
+
+fn try_acquire_lock_at(dir: &Path) -> Result<Option<LockGuard>> {
+    ensure_state_dir(dir)?;
+    ensure_private_lock(&dir.join(WATCHDOG_LOCK_FILE))?;
+    let file = ensure_private_lock(&dir.join(WAKE_LOCK_FILE))?;
+    #[cfg(windows)]
+    validate_windows_private_layout(dir, &windows_user_sid()?, false)?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(LockGuard { file })),
+        Ok(()) => {
+            reject_stale_state_at(dir)?;
+            Ok(Some(LockGuard { file }))
+        }
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(AppError::fail(e.to_string())),
+        Err(std::fs::TryLockError::Error(error)) => Err(state_io_err(dir, error)),
     }
 }
 
 pub fn acquire_lock() -> Result<LockGuard> {
     try_acquire_lock()?
-        .ok_or_else(|| AppError::usage("another wake invocation is in progress; try again"))
+        .ok_or_else(|| AppError::fail("another wake invocation is in progress; try again"))
 }
 
-pub fn acquire_lock_wait() -> Result<LockGuard> {
-    let file = open_lock_file()?;
+pub fn acquire_existing_lock_wait() -> Result<LockGuard> {
+    acquire_existing_lock_at(&state_dir())
+}
+
+fn acquire_existing_lock_at(dir: &Path) -> Result<LockGuard> {
+    let path = dir.join(WAKE_LOCK_FILE);
+    let file = open_existing_lock(&path)?;
     file.lock()
         .map_err(|error| AppError::fail(format!("could not acquire state lock: {error}")))?;
+    reject_stale_state_at(dir)?;
     Ok(LockGuard { file })
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn acquire_watchdog_lock() -> Result<WatchdogLock> {
+    let path = watchdog_lock_file();
+    let file = open_existing_lock(&path)?;
+    file.lock().map_err(|error| {
+        AppError::fail(format!(
+            "could not acquire lid watchdog lock at {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(WatchdogLock { file })
+}
+
+pub fn try_watchdog_lock() -> Result<Option<WatchdogLock>> {
+    try_watchdog_lock_at(&state_dir())
+}
+
+fn try_watchdog_lock_at(dir: &Path) -> Result<Option<WatchdogLock>> {
+    let path = dir.join(WATCHDOG_LOCK_FILE);
+    let file = open_existing_lock(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(WatchdogLock { file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(state_io_err(&path, error)),
+    }
+}
+
+fn ensure_state_dir(dir: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let owner = windows_user_sid()?;
+        match fs::symlink_metadata(dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let absolute = std::path::absolute(dir).map_err(AppError::from)?;
+                let parent = absolute.parent().ok_or_else(|| {
+                    AppError::fail(format!(
+                        "state directory has no parent: {}",
+                        absolute.display()
+                    ))
+                })?;
+                match fs::symlink_metadata(parent) {
+                    Ok(_) => validate_existing_directory(parent)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(AppError::fail(format!(
+                            "state directory parent must already exist: {}",
+                            parent.display()
+                        )));
+                    }
+                    Err(error) => return Err(state_io_err(parent, error)),
+                }
+                windows_security::create_private_directory(&absolute, &owner)?;
+            }
+            Err(error) => return Err(state_io_err(dir, error)),
+        }
+        validate_existing_directory(dir)?;
+        windows_security::validate_directory(dir, &owner)
+    }
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(dir).map_err(|error| state_io_err(dir, error))?;
+        validate_existing_directory(dir)?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::metadata(dir).map_err(|error| state_io_err(dir, error))?;
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(AppError::fail(format!(
+                "state directory is not owned by the current user: {}",
+                dir.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                .map_err(|error| state_io_err(dir, error))?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_existing_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| state_io_err(path, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata_is_reparse(&metadata) {
+        return Err(AppError::fail(format!(
+            "state directory is not a regular non-link directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_private_lock(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| state_io_err(path, error))?;
+    let metadata = file.metadata().map_err(|error| state_io_err(path, error))?;
+    validate_regular_metadata(path, &metadata)?;
+    #[cfg(unix)]
+    secure_foreground_lock(path, &file, &metadata)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn secure_foreground_lock(path: &Path, file: &File, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // SAFETY: geteuid has no preconditions.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(AppError::fail(format!(
+            "state lock is not owned by the current user: {}",
+            path.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| state_io_err(path, error))?;
+    }
+    Ok(())
+}
+
+fn open_existing_lock(path: &Path) -> Result<File> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| state_io_err(path, error))?;
+    validate_regular_metadata(path, &metadata)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| state_io_err(path, error))?;
+    let opened = file.metadata().map_err(|error| state_io_err(path, error))?;
+    validate_regular_metadata(path, &opened)?;
+    Ok(file)
+}
+
+fn validate_regular_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata_is_reparse(metadata) {
+        return Err(AppError::fail(format!(
+            "state path is not a regular non-link file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn state_io_err(path: &Path, error: std::io::Error) -> AppError {
+    AppError::fail(format!(
+        "state IO failed at {}: {error}; set WAKE_STATE_DIR to a writable directory",
+        path.display()
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::{Mode, Trigger};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -915,12 +1665,16 @@ mod tests {
                 std::process::id(),
                 NEXT_DIR.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir(&path).expect("create test directory");
+            ensure_state_dir(&path).unwrap();
             Self(path)
         }
 
-        fn join(&self, name: &str) -> PathBuf {
-            self.0.join(name)
+        fn state(&self) -> PathBuf {
+            self.0.join(STATE_FILE)
+        }
+
+        fn lock(&self) -> LockGuard {
+            try_acquire_lock_at(&self.0).unwrap().unwrap()
         }
     }
 
@@ -930,461 +1684,716 @@ mod tests {
         }
     }
 
-    fn sample_session() -> Session {
-        Session {
-            owner: LeaseRef {
-                pid: 4321,
-                token: "0123456789abcdef0123456789abcdef".into(),
-            },
-            spec: crate::run::RunSpec {
-                mode: crate::run::Mode::DisplaySystem,
-                trigger: crate::run::Trigger::Timed {
-                    seconds: 3600,
-                    input: "1h".into(),
+    fn sample_state() -> State {
+        State {
+            schema: STATE_SCHEMA,
+            session: SessionState {
+                owner: OwnerIdentity {
+                    token: "0123456789abcdef0123456789abcdef".into(),
+                    process: ProcessIdentity {
+                        pid: 42,
+                        native_start: 99,
+                    },
                 },
-                even_lid: false,
-            },
-            started_at: "2024-01-02T03:04:05Z".parse().unwrap(),
-            ends_at: Some("2024-01-02T04:04:05Z".parse().unwrap()),
-            note: None,
-        }
-    }
-
-    #[test]
-    fn session_json_round_trips() {
-        let dir = TestDir::new("session-round-trip");
-        let path = dir.join("session.json");
-        let expected = sample_session();
-
-        write_session_at(&path, &expected).unwrap();
-        let saved = read_session_at(&path).unwrap().unwrap();
-
-        assert_eq!(saved.owner, expected.owner);
-        assert_eq!(saved.spec, expected.spec);
-        assert_eq!(saved.started_at, expected.started_at);
-        assert_eq!(saved.ends_at, expected.ends_at);
-        assert!(!path.with_extension("json.tmp").exists());
-    }
-
-    #[test]
-    fn session_startup_transition_is_identity_bound_and_monotonic() {
-        let dir = TestDir::new("session-startup");
-        let path = dir.join("session.json");
-        let mut pending = sample_session();
-        pending.owner.pid = 0;
-        write_pending_at(&path, &pending).unwrap();
-
-        let mut ready = pending.clone();
-        ready.owner.pid = 42;
-        let mut wrong = ready.clone();
-        wrong.owner.token = "11111111111111111111111111111111".into();
-        assert!(write_ready_at(&path, &wrong).is_err());
-
-        write_ready_at(&path, &ready).unwrap();
-        assert_eq!(read_session_at(&path).unwrap().unwrap().owner, ready.owner);
-        assert!(write_ready_at(&path, &ready).is_err());
-
-        fs::remove_file(&path).unwrap();
-        assert!(write_ready_at(&path, &ready).is_err());
-    }
-
-    #[test]
-    fn atomic_write_does_not_follow_an_existing_temp_link() {
-        let dir = TestDir::new("state-temp-link");
-        let path = dir.join("session.json");
-        let victim = dir.join("victim");
-        fs::write(&victim, b"keep").unwrap();
-        fs::hard_link(&victim, path.with_extension("json.tmp")).unwrap();
-
-        write_session_at(&path, &sample_session()).unwrap();
-
-        assert_eq!(fs::read(&victim).unwrap(), b"keep");
-        assert!(read_session_at(&path).unwrap().is_some());
-    }
-
-    #[test]
-    fn missing_session_is_not_an_error() {
-        let dir = TestDir::new("session-missing");
-        assert!(
-            read_session_at(&dir.join("missing.json"))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn process_lease_is_live_only_while_held() {
-        let dir = TestDir::new("process-lease");
-        let abandoned = reserve_process_lease_at(&dir.0).unwrap();
-        let abandoned_path = process_lease_path(&dir.0, abandoned.token()).unwrap();
-        drop(abandoned);
-        assert!(!abandoned_path.exists());
-
-        let reservation = reserve_process_lease_at(&dir.0).unwrap();
-        assert!(!reservation.is_claimed().unwrap());
-        let token = reservation.token().to_owned();
-        let lease = claim_process_lease_at(&dir.0, &token, 42).unwrap();
-        assert!(reservation.is_claimed().unwrap());
-        let token = reservation.commit();
-
-        assert!(process_lease_is_held_at(&dir.0, &token).unwrap());
-        cleanup_process_leases_at(&dir.0).unwrap();
-        assert!(process_lease_path(&dir.0, &token).unwrap().exists());
-        drop(lease);
-        assert!(!process_lease_is_held_at(&dir.0, &token).unwrap());
-        assert!(!process_lease_path(&dir.0, &token).unwrap().exists());
-
-        let crashed = reserve_process_lease_at(&dir.0).unwrap().commit();
-        cleanup_process_leases_at(&dir.0).unwrap();
-        assert!(!process_lease_path(&dir.0, &crashed).unwrap().exists());
-
-        let delayed = reserve_process_lease_at(&dir.0).unwrap().commit();
-        let delayed_path = process_lease_path(&dir.0, &delayed).unwrap();
-        let delayed_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&delayed_path)
-            .unwrap();
-        assert!(!process_lease_is_held_at(&dir.0, &delayed).unwrap());
-        assert!(
-            finish_process_lease_claim(
-                delayed_file,
-                delayed_path,
-                LeaseRef {
-                    pid: 42,
-                    token: delayed,
+                spec: RunSpec {
+                    mode: Mode::SystemOnly,
+                    trigger: Trigger::Indefinite,
+                    even_lid: false,
                 },
-            )
-            .is_err()
-        );
-
-        let concurrent = reserve_process_lease_at(&dir.0).unwrap().commit();
-        let concurrent_path = process_lease_path(&dir.0, &concurrent).unwrap();
-        let probe = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&concurrent_path)
-            .unwrap();
-        probe.try_lock_shared().unwrap();
-        assert!(!process_lease_is_held_at(&dir.0, &concurrent).unwrap());
-        probe.unlock().unwrap();
-        assert!(!concurrent_path.exists());
-    }
-
-    #[test]
-    fn process_lease_rejects_unsafe_tokens() {
-        let dir = TestDir::new("process-lease-token");
-        let short = "a".repeat(31);
-        for token in ["", "../escape", "ABCDEF", short.as_str()] {
-            assert!(process_lease_path(&dir.0, token).is_err());
-            assert!(claim_process_lease_at(&dir.0, token, 42).is_err());
+                started_at: Some("2024-01-02T03:04:05Z".parse().unwrap()),
+                note: None,
+                stop_requested: false,
+            },
+            lid: None,
         }
     }
 
     #[test]
-    fn legacy_state_must_be_resolved_before_new_lifecycle_state() {
-        let dir = TestDir::new("legacy-state");
-        let path = dir.0.join("session.properties");
-
-        ensure_no_legacy_state_at(&path).unwrap();
-        fs::write(&path, b"pid=42\n").unwrap();
-        let error = ensure_no_legacy_state_at(&path).unwrap_err();
-
-        assert!(error.message().contains("legacy wake session state"));
+    fn state_json_is_strict_and_round_trips() {
+        let state = sample_state();
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(serde_json::from_str::<State>(&json).unwrap(), state);
+        let unknown = json.replacen('{', "{\"unknown\":true,", 1);
+        assert!(serde_json::from_str::<State>(&unknown).is_err());
     }
 
     #[test]
-    fn malformed_session_is_an_error_and_is_retained() {
-        let dir = TestDir::new("session-malformed");
-        let path = dir.join("session.json");
-        fs::write(&path, br#"{"pid": "not valid"}"#).unwrap();
-
-        let error = read_session_at(&path).unwrap_err();
-
-        assert!(error.message().contains("invalid JSON"));
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn semantic_session_validation_table() {
-        let dir = TestDir::new("session-invalid");
-        let path = dir.join("session.json");
-        let mut cases: [Session; 2] = std::array::from_fn(|_| sample_session());
-        cases[0].owner.token.clear();
-        cases[1].ends_at = None;
-
-        for saved in cases {
-            write_json(&path, &saved).unwrap();
-            assert!(read_session_at(&path).is_err());
+    fn validation_rejects_invalid_state_table() {
+        let mut cases: Vec<State> = Vec::new();
+        let mut schema = sample_state();
+        schema.schema = 2;
+        cases.push(schema);
+        let mut token = sample_state();
+        token.session.owner.token = "bad".into();
+        cases.push(token);
+        let mut pid = sample_state();
+        pid.session.owner.process.pid = 0;
+        cases.push(pid);
+        let mut start = sample_state();
+        start.session.owner.process.native_start = 0;
+        cases.push(start);
+        let mut note = sample_state();
+        note.session.started_at = None;
+        note.session.note = Some("early".into());
+        cases.push(note);
+        for state in cases {
+            assert!(state.validate().is_err());
         }
-    }
 
-    #[test]
-    fn session_validation_propagates_deadline_overflow() {
-        let dir = TestDir::new("session-deadline-overflow");
-        let path = dir.join("session.json");
-        let mut saved = sample_session();
-        saved.started_at = DateTime::<Utc>::MAX_UTC;
-        saved.spec.trigger = crate::run::Trigger::Timed {
+        let mut overflow = sample_state();
+        overflow.session.started_at = Some(DateTime::<Utc>::MAX_UTC);
+        overflow.session.spec.trigger = Trigger::Timed {
             seconds: 1,
             input: "1s".into(),
         };
-        saved.ends_at = None;
-        write_json(&path, &saved).unwrap();
-
-        let error = read_session_at(&path).unwrap_err();
-
-        assert_eq!(
-            error.message(),
-            "session deadline is outside the supported timestamp range"
-        );
+        assert!(overflow.validate().is_err());
     }
 
     #[test]
-    fn lid_restore_markers_round_trip() {
-        let dir = TestDir::new("lid-round-trip");
-        let markers = [
-            LidRestore::Macos { sleep_disabled: 1 },
-            LidRestore::Windows {
+    fn lid_validation_is_platform_bound() {
+        let mut state = sample_state();
+        state.lid = Some(LidState {
+            ready: false,
+            restore: LidRestore::Windows {
                 scheme_guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
                 ac_action: 1,
                 dc_action: 2,
             },
-        ];
+        });
+        assert!(state.validate().is_err());
+        state.session.spec.even_lid = true;
+        #[cfg(windows)]
+        assert!(state.validate().is_ok());
+        #[cfg(not(windows))]
+        assert!(state.validate().is_err());
+    }
 
-        for (index, marker) in markers.into_iter().enumerate() {
-            let path = dir.join(&format!("lid-restore-{index}.json"));
-            write_lid_restore_at(&path, &marker).unwrap();
-            assert_eq!(read_lid_restore_at(&path).unwrap(), Some(marker));
+    #[test]
+    fn lid_state_serializes_only_ready_and_restore() {
+        let lid = LidState {
+            ready: false,
+            restore: LidRestore::Windows {
+                scheme_guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+                ac_action: 1,
+                dc_action: 2,
+            },
+        };
+
+        let json = serde_json::to_string(&lid).unwrap();
+
+        assert!(!json.contains(r#""watchdog""#));
+        assert!(json.contains(r#""ready""#));
+        assert!(json.contains(r#""restore""#));
+    }
+
+    #[test]
+    fn lifecycle_updates_preserve_exact_owner_and_monotonic_state() {
+        let dir = TestDir::new("state-update");
+        let path = dir.state();
+        let lock = dir.lock();
+        let mut starting = sample_state();
+        starting.session.started_at = None;
+        create_at(&path, &starting).unwrap();
+        let mut wrong_owner = starting.session.owner.clone();
+        wrong_owner.token = "11111111111111111111111111111111".into();
+        assert!(update_at(&path, &wrong_owner, |_| Ok(())).is_err());
+        let ready = update_at(&path, &starting.session.owner, |current| {
+            current.session.started_at = Some("2024-01-02T03:04:05Z".parse().unwrap());
+            current.session.note = Some("ready".into());
+            Ok(())
+        })
+        .unwrap();
+        let stopped = update_at(&path, &starting.session.owner, |current| {
+            current.session.stop_requested = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            update_at(&path, &starting.session.owner, |current| {
+                current.session.owner.token = "11111111111111111111111111111111".into();
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(
+            update_at(&path, &starting.session.owner, |current| {
+                current.session.stop_requested = false;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(stopped.session.owner, ready.session.owner);
+        assert!(!remove_exact_at(&path, &ready).unwrap());
+        assert!(remove_exact_at(&path, &stopped).unwrap());
+        drop(lock);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn lid_updates_follow_the_write_ahead_transition() {
+        let dir = TestDir::new("lid-transition");
+        let path = dir.state();
+        let _lock = dir.lock();
+        let mut state = sample_state();
+        state.session.spec.even_lid = true;
+        create_at(&path, &state).unwrap();
+        #[cfg(windows)]
+        let restore = LidRestore::Windows {
+            scheme_guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+            ac_action: 1,
+            dc_action: 2,
+        };
+        #[cfg(target_os = "macos")]
+        let restore = LidRestore::Macos { sleep_disabled: 0 };
+        assert!(
+            update_at(&path, &state.session.owner, |current| {
+                current.lid = Some(LidState {
+                    ready: true,
+                    restore: restore.clone(),
+                });
+                Ok(())
+            })
+            .is_err()
+        );
+        let starting = update_at(&path, &state.session.owner, |current| {
+            current.lid = Some(LidState {
+                ready: false,
+                restore: restore.clone(),
+            });
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            update_at(&path, &state.session.owner, |current| {
+                #[cfg(windows)]
+                let changed = LidRestore::Windows {
+                    scheme_guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+                    ac_action: 3,
+                    dc_action: 2,
+                };
+                #[cfg(target_os = "macos")]
+                let changed = LidRestore::Macos { sleep_disabled: 1 };
+                current.lid.as_mut().unwrap().restore = changed;
+                Ok(())
+            })
+            .is_err()
+        );
+        let ready = update_at(&path, &state.session.owner, |current| {
+            current.lid.as_mut().unwrap().ready = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!starting.lid.unwrap().ready);
+        assert!(ready.lid.unwrap().ready);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn lid_cannot_start_after_stop() {
+        let dir = TestDir::new("lid-after-stop");
+        let path = dir.state();
+        let _lock = dir.lock();
+        let mut state = sample_state();
+        state.session.spec.even_lid = true;
+        state.session.stop_requested = true;
+        create_at(&path, &state).unwrap();
+        #[cfg(windows)]
+        let restore = LidRestore::Windows {
+            scheme_guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+            ac_action: 1,
+            dc_action: 2,
+        };
+        #[cfg(target_os = "macos")]
+        let restore = LidRestore::Macos { sleep_disabled: 0 };
+        assert!(
+            update_at(&path, &state.session.owner, |current| {
+                current.lid = Some(LidState {
+                    ready: false,
+                    restore,
+                });
+                Ok(())
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_json_is_retained() {
+        let dir = TestDir::new("state-malformed");
+        let path = dir.state();
+        fs::write(&path, b"not json").unwrap();
+        assert!(read_at(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn all_old_formats_are_rejected_after_the_writer_lock() {
+        for name in LEGACY_FILES
+            .iter()
+            .copied()
+            .chain(["process-0123456789abcdef0123456789abcdef.lock"])
+        {
+            let dir = TestDir::new("legacy");
+            fs::write(dir.0.join(name), b"old").unwrap();
+            assert!(try_acquire_lock_at(&dir.0).is_err(), "{name}");
         }
     }
 
     #[test]
-    fn watchdog_state_round_trips_and_removes_only_exact_owner() {
-        let dir = TestDir::new("watchdog-round-trip");
-        let path = dir.join("lid-watchdog.json");
-        let state = WatchdogState {
-            owner: sample_session().owner,
-            watchdog: LeaseRef {
-                pid: 0,
-                token: "fedcba9876543210fedcba9876543210".into(),
-            },
-            ready: false,
+    fn incomplete_atomic_state_is_checked_only_after_the_writer_lock() {
+        for name in [
+            ".state-0123456789abcdef0123456789abcdef.tmp",
+            ".state-0123456789abcdef0123456789abcdef.bak",
+        ] {
+            let dir = TestDir::new("incomplete-atomic-state");
+            let held = dir.lock();
+            fs::write(dir.0.join(name), b"interrupted").unwrap();
+            assert!(try_acquire_lock_at(&dir.0).unwrap().is_none());
+            drop(held);
+            let error = match try_acquire_lock_at(&dir.0) {
+                Err(error) => error,
+                Ok(_) => panic!("incomplete state was accepted"),
+            };
+            assert!(error.message().contains(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn watchdog_lock_file_is_permanent() {
+        let dir = TestDir::new("watchdog-lock");
+        let guard = dir.lock();
+        let path = dir.0.join(WATCHDOG_LOCK_FILE);
+        assert!(path.exists());
+        let first = try_watchdog_lock_at(&dir.0).unwrap().unwrap();
+        assert!(try_watchdog_lock_at(&dir.0).unwrap().is_none());
+        drop(first);
+        assert!(try_watchdog_lock_at(&dir.0).unwrap().is_some());
+        drop(guard);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn helper_lock_open_never_creates_a_missing_file() {
+        let dir = TestDir::new("existing-lock");
+        let guard = dir.lock();
+        drop(guard);
+        let path = dir.0.join(WAKE_LOCK_FILE);
+        fs::remove_file(&path).unwrap();
+        assert!(acquire_existing_lock_at(&dir.0).is_err());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_policy_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = TestDir::new("state-link");
+        let target = dir.0.join("target");
+        let link = dir.state();
+        fs::write(&target, b"keep").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(read_at(&link).is_err());
+        assert!(open_existing_state(&link).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_corrects_a_loose_existing_lock_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("lock-mode");
+        let path = dir.0.join(WAKE_LOCK_FILE);
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let guard = try_acquire_lock_at(&dir.0).unwrap().unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+
+        drop(guard);
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn tokens_are_random_lowercase_hex() {
+        let left = new_token().unwrap();
+        let right = new_token().unwrap();
+        assert!(valid_token(&left));
+        assert!(valid_token(&right));
+        assert_ne!(left, right);
+    }
+
+    #[cfg(windows)]
+    fn replacement_fixture(name: &str) -> (TestDir, PathBuf, PathBuf, PathBuf, State, State) {
+        let dir = TestDir::new(name);
+        let path = dir.state();
+        let old = sample_state();
+        create_at(&path, &old).unwrap();
+
+        let mut new = old.clone();
+        new.session.stop_requested = true;
+        let (tmp, mut file) = create_random_temp(&dir.0).unwrap();
+        serde_json::to_writer(&mut file, &new).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let backup = dir.0.join(".state-0123456789abcdef0123456789abcdef.bak");
+        (dir, path, tmp, backup, old, new)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_non_1177_replace_errors_retain_canonical_and_discard_temp() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_INVALID_PARAMETER, ERROR_UNABLE_TO_MOVE_REPLACEMENT,
+            ERROR_UNABLE_TO_REMOVE_REPLACED,
         };
 
-        write_watchdog_at(&path, &state).unwrap();
-        assert_eq!(read_watchdog_at(&path).unwrap(), Some(state.clone()));
-        let starting = WatchdogState {
-            watchdog: LeaseRef {
-                pid: 9876,
-                ..state.watchdog.clone()
-            },
-            ..state.clone()
-        };
-        write_watchdog_at(&path, &starting).unwrap();
-        let ready = WatchdogState {
-            ready: true,
-            ..starting.clone()
-        };
-        write_watchdog_at(&path, &ready).unwrap();
-        assert_eq!(read_watchdog_at(&path).unwrap(), Some(ready));
-        assert!(write_watchdog_at(&path, &starting).is_err());
-        assert!(
-            !remove_watchdog_if_owner_at(
+        for (name, code) in [
+            ("windows-replace-1175", ERROR_UNABLE_TO_REMOVE_REPLACED),
+            ("windows-replace-1176", ERROR_UNABLE_TO_MOVE_REPLACEMENT),
+            ("windows-replace-other-error", ERROR_INVALID_PARAMETER),
+        ] {
+            let (_dir, path, tmp, backup, old, new) = replacement_fixture(name);
+            let owner = windows_user_sid().unwrap();
+            let error = finish_existing_replace(
+                &tmp,
                 &path,
-                &LeaseRef {
-                    pid: 1,
-                    ..state.owner.clone()
-                }
+                &backup,
+                &owner,
+                &new,
+                Err(std::io::Error::from_raw_os_error(code as i32)),
+                |from, to| fs::rename(from, to),
             )
+            .unwrap_err();
+
+            assert!(error.message().contains("state replacement failed"));
+            assert_eq!(read_at(&path).unwrap(), Some(old));
+            assert!(!tmp.exists());
+            assert!(!backup.exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_error_preserves_and_names_temp_when_canonical_is_untrusted() {
+        use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_REMOVE_REPLACED;
+
+        let (_dir, path, tmp, backup, _old, new) =
+            replacement_fixture("windows-replace-untrusted-canonical");
+        let error = finish_existing_replace(
+            &tmp,
+            &path,
+            &backup,
+            "S-1-1-0",
+            &new,
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_UNABLE_TO_REMOVE_REPLACED as i32,
+            )),
+            |from, to| fs::rename(from, to),
+        )
+        .unwrap_err();
+
+        assert_eq!(read_at(&tmp).unwrap(), Some(new));
+        assert!(error.message().contains(&tmp.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_error_preserves_temp_when_canonical_json_is_invalid() {
+        use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_REMOVE_REPLACED;
+
+        let (_dir, path, tmp, backup, _old, new) =
+            replacement_fixture("windows-replace-invalid-canonical");
+        fs::write(&path, b"invalid json").unwrap();
+        let owner = windows_user_sid().unwrap();
+        let error = finish_existing_replace(
+            &tmp,
+            &path,
+            &backup,
+            &owner,
+            &new,
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_UNABLE_TO_REMOVE_REPLACED as i32,
+            )),
+            |from, to| fs::rename(from, to),
+        )
+        .unwrap_err();
+
+        assert_eq!(read_at(&tmp).unwrap(), Some(new));
+        assert!(error.message().contains(&tmp.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_error_1177_rolls_back_before_discarding_temp() {
+        use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+
+        let (_dir, path, tmp, backup, old, new) =
+            replacement_fixture("windows-replace-1177-rollback");
+        fs::rename(&path, &backup).unwrap();
+        let owner = windows_user_sid().unwrap();
+        let error = finish_existing_replace(
+            &tmp,
+            &path,
+            &backup,
+            &owner,
+            &new,
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32,
+            )),
+            |from, to| fs::rename(from, to),
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("state replacement failed"));
+        assert_eq!(read_at(&path).unwrap(), Some(old));
+        assert!(!tmp.exists());
+        assert!(!backup.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_error_1177_preserves_both_copies_when_rollback_fails() {
+        use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+
+        let (_dir, path, tmp, backup, old, new) =
+            replacement_fixture("windows-replace-1177-failed-rollback");
+        fs::rename(&path, &backup).unwrap();
+        let owner = windows_user_sid().unwrap();
+        let error = finish_existing_replace(
+            &tmp,
+            &path,
+            &backup,
+            &owner,
+            &new,
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32,
+            )),
+            |_, _| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+
+        assert!(!path.exists());
+        assert_eq!(read_at(&backup).unwrap(), Some(old));
+        assert_eq!(read_at(&tmp).unwrap(), Some(new));
+        assert!(error.message().contains(&backup.display().to_string()));
+        assert!(error.message().contains(&tmp.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_1177_rollback_preserves_and_names_temp_when_canonical_is_untrusted() {
+        use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+
+        let (_dir, path, tmp, backup, old, new) =
+            replacement_fixture("windows-replace-1177-untrusted-canonical");
+        fs::rename(&path, &backup).unwrap();
+        let error = finish_existing_replace(
+            &tmp,
+            &path,
+            &backup,
+            "S-1-1-0",
+            &new,
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32,
+            )),
+            |from, to| fs::rename(from, to),
+        )
+        .unwrap_err();
+
+        assert_eq!(read_at(&path).unwrap(), Some(old));
+        assert_eq!(read_at(&tmp).unwrap(), Some(new));
+        assert!(!backup.exists());
+        assert!(error.message().contains(&tmp.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_successful_replace_discards_backup_after_validation() {
+        let (_dir, path, tmp, backup, _old, new) = replacement_fixture("windows-replace-success");
+        fs::rename(&path, &backup).unwrap();
+        fs::rename(&tmp, &path).unwrap();
+        let owner = windows_user_sid().unwrap();
+
+        finish_existing_replace(&tmp, &path, &backup, &owner, &new, Ok(()), |from, to| {
+            fs::rename(from, to)
+        })
+        .unwrap();
+
+        assert_eq!(read_at(&path).unwrap(), Some(new));
+        assert!(!tmp.exists());
+        assert!(!backup.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_successful_replace_preserves_and_names_backup_when_validation_fails() {
+        let (_dir, path, tmp, backup, old, new) =
+            replacement_fixture("windows-replace-success-invalid");
+        fs::rename(&path, &backup).unwrap();
+        fs::rename(&tmp, &path).unwrap();
+
+        let error =
+            finish_existing_replace(&tmp, &path, &backup, "S-1-1-0", &new, Ok(()), |from, to| {
+                fs::rename(from, to)
+            })
+            .unwrap_err();
+
+        assert_eq!(read_at(&path).unwrap(), Some(new));
+        assert_eq!(read_at(&backup).unwrap(), Some(old));
+        assert!(error.message().contains(&backup.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_successful_replace_rejects_an_unexpected_canonical_state() {
+        let (_dir, path, tmp, backup, old, new) =
+            replacement_fixture("windows-replace-success-wrong-state");
+        fs::rename(&path, &backup).unwrap();
+        fs::rename(&tmp, &path).unwrap();
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let owner = windows_user_sid().unwrap();
+
+        let error =
+            finish_existing_replace(&tmp, &path, &backup, &owner, &new, Ok(()), |from, to| {
+                fs::rename(from, to)
+            })
+            .unwrap_err();
+
+        assert_eq!(read_at(&path).unwrap(), Some(old.clone()));
+        assert_eq!(read_at(&backup).unwrap(), Some(old));
+        assert!(error.message().contains(&backup.display().to_string()));
+        assert_ne!(read_at(&path).unwrap(), Some(new));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_layout_survives_atomic_replace() {
+        let dir = TestDir::new("windows-private-layout");
+        let path = dir.state();
+        let _lock = dir.lock();
+        let state = sample_state();
+        create_at(&path, &state).unwrap();
+        let sid = windows_user_sid().unwrap();
+
+        assert_eq!(canonical_windows_sid(&sid).unwrap(), sid);
+        assert!(canonical_windows_sid("not-a-sid").is_err());
+        validate_windows_state_dir(&dir.0, &sid).unwrap();
+        assert!(validate_windows_state_dir(&dir.0, "S-1-1-0").is_err());
+        validate_windows_private_layout(&dir.0, &sid, true).unwrap();
+        update_at(&path, &state.session.owner, |current| {
+            current.session.stop_requested = true;
+            Ok(())
+        })
+        .unwrap();
+        validate_windows_private_layout(&dir.0, &sid, true).unwrap();
+        let mut names = fs::read_dir(&dir.0)
             .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [WATCHDOG_LOCK_FILE, STATE_FILE, WAKE_LOCK_FILE]
+                .map(std::ffi::OsString::from)
+                .to_vec()
         );
-        assert!(path.exists());
-        assert!(remove_watchdog_if_owner_at(&path, &state.owner).unwrap());
-        assert!(!path.exists());
     }
 
+    #[cfg(windows)]
     #[test]
-    fn malformed_watchdog_state_is_retained() {
-        let dir = TestDir::new("watchdog-malformed");
-        let path = dir.join("lid-watchdog.json");
-        fs::write(&path, br#"{"owner":{}}"#).unwrap();
+    fn windows_extra_file_grant_is_rejected() {
+        let dir = TestDir::new("windows-extra-grant");
+        let path = dir.state();
+        let _lock = dir.lock();
+        create_at(&path, &sample_state()).unwrap();
+        let sid = windows_user_sid().unwrap();
 
-        assert!(read_watchdog_at(&path).is_err());
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn watchdog_state_does_not_replace_another_owner() {
-        let dir = TestDir::new("watchdog-owner");
-        let path = dir.join("lid-watchdog.json");
-        let mut first = WatchdogState {
-            owner: sample_session().owner,
-            watchdog: LeaseRef {
-                pid: 9876,
-                token: "fedcba9876543210fedcba9876543210".into(),
-            },
-            ready: false,
-        };
-        write_watchdog_at(&path, &first).unwrap();
-        first.owner.pid += 1;
-
-        assert!(write_watchdog_at(&path, &first).is_err());
-        assert_ne!(read_watchdog_at(&path).unwrap(), Some(first));
-    }
-
-    #[test]
-    fn write_lid_restore_does_not_replace_an_unresolved_marker() {
-        let dir = TestDir::new("lid-no-overwrite");
-        let path = dir.join("lid-restore.json");
-        let saved = LidRestore::Macos { sleep_disabled: 1 };
-        let replacement = LidRestore::Macos { sleep_disabled: 0 };
-        write_lid_restore_at(&path, &saved).unwrap();
-
-        assert!(write_lid_restore_at(&path, &replacement).is_err());
-        assert_eq!(read_lid_restore_at(&path).unwrap(), Some(saved));
-    }
-
-    #[test]
-    fn invalid_lid_restore_is_an_error_and_is_retained() {
-        let dir = TestDir::new("lid-invalid");
-        let path = dir.join("lid-restore.json");
-        fs::write(&path, br#"{"platform":"macos","sleep_disabled":2}"#).unwrap();
-
-        let error = read_lid_restore_at(&path).unwrap_err();
-
-        assert!(error.message().contains("SleepDisabled"));
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn invalid_windows_scheme_guid_is_rejected() {
-        let dir = TestDir::new("lid-invalid-guid");
-        let path = dir.join("lid-restore.json");
-        fs::write(
+        set_windows_path_sddl(
             &path,
-            br#"{"platform":"windows","scheme_guid":"not-a-guid","ac_action":1,"dc_action":1}"#,
+            &format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"),
         )
         .unwrap();
-
-        assert!(read_lid_restore_at(&path).is_err());
-        assert!(path.exists());
+        assert!(validate_windows_private_layout(&dir.0, &sid, true).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
-    fn clear_lid_restore_requires_the_exact_marker() {
-        let dir = TestDir::new("lid-retention");
-        let path = dir.join("lid-restore.json");
-        let saved = LidRestore::Macos { sleep_disabled: 1 };
-        let wrong = LidRestore::Macos { sleep_disabled: 0 };
-        write_lid_restore_at(&path, &saved).unwrap();
+    fn windows_directory_dacl_is_effective_and_protected() {
+        let sid = windows_user_sid().unwrap();
+        let entries =
+            |flags: &str| format!("(A;{flags};FA;;;{sid})(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)");
 
-        assert!(clear_lid_restore_at(&path, &wrong).is_err());
-        assert_eq!(read_lid_restore_at(&path).unwrap(), Some(saved.clone()));
-
-        clear_lid_restore_at(&path, &saved).unwrap();
-        assert!(!path.exists());
+        assert!(
+            validate_windows_directory_sddl(&format!("O:{sid}D:P{}", entries("OICIIO")), &sid,)
+                .is_err()
+        );
+        assert!(
+            validate_windows_directory_sddl(&format!("O:{sid}D:{}", entries("OICI")), &sid,)
+                .is_err()
+        );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn removing_session_is_idempotent_and_keeps_lid_marker() {
-        let dir = TestDir::new("session-remove");
-        let session = dir.join("session.json");
-        let marker = dir.join("lid-restore.json");
-        write_session_at(&session, &sample_session()).unwrap();
-        write_lid_restore_at(&marker, &LidRestore::Macos { sleep_disabled: 0 }).unwrap();
-
-        remove_state_file_at(&session).unwrap();
-        remove_state_file_at(&session).unwrap();
-
-        assert!(!session.exists());
-        assert!(marker.exists());
-    }
-
-    #[test]
-    fn stop_request_replaces_disposable_marker_and_clears_exactly() {
-        let dir = TestDir::new("stop-replace");
-        let path = dir.join("stop.json");
-        let expected = sample_session();
-        let mut other = sample_session();
-        other.owner.token = "11111111111111111111111111111111".into();
-
-        write_stop_at(&path, &other).unwrap();
-        write_stop_at(&path, &expected).unwrap();
-        assert!(stop_requested_at(&path, &expected).unwrap());
-        assert!(!stop_requested_at(&path, &other).unwrap());
-
-        assert!(!clear_stop_at(&path, &other).unwrap());
-        assert!(path.exists());
-        assert!(clear_stop_at(&path, &expected).unwrap());
-        assert!(!path.exists());
-
-        fs::write(&path, b"not json").unwrap();
-        assert!(!stop_requested_at(&path, &expected).unwrap());
-        assert!(!path.exists());
-        write_json(
+    fn windows_permissive_directory_and_wrong_owner_are_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "wake-rs-windows-permissive-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sid = windows_user_sid().unwrap();
+        windows_security::create_directory_with_sddl(
             &path,
-            &StopRequest {
-                session: LeaseRef {
-                    pid: 0,
-                    token: expected.owner.token.clone(),
-                },
-            },
+            &format!(
+                "O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)"
+            ),
         )
         .unwrap();
-        assert!(stop_requested_at(&path, &expected).unwrap());
-        assert!(clear_stop_at(&path, &expected).unwrap());
-        write_stop_at(&path, &expected).unwrap();
-        assert!(stop_requested_at(&path, &expected).unwrap());
+        assert!(validate_windows_private_layout(&path, &sid, false).is_err());
+        fs::remove_dir(&path).unwrap();
+
+        let private = TestDir::new("windows-wrong-owner");
+        private.lock();
+        assert!(validate_windows_private_layout(&private.0, "S-1-1-0", false).is_err());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn stop_marker_reconciliation_table() {
-        let dir = TestDir::new("stop-reconcile");
-        let session = sample_session();
+    fn default_runner_ancestry_passes_helper_layout_validation() {
+        use std::os::unix::fs::OpenOptionsExt;
 
-        let missing = dir.join("missing.json");
-        reconcile_stop_at(&missing, |_| Ok(false)).unwrap();
+        let parent = default_state_dir()
+            .parent()
+            .expect("default state directory has a parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent).unwrap();
+        let dir = parent.join(format!(
+            ".wake-layout-test-{}-{}",
+            std::process::id(),
+            new_token().unwrap()
+        ));
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(
+            &dir,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        for name in [WAKE_LOCK_FILE, WATCHDOG_LOCK_FILE, STATE_FILE] {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(dir.join(name))
+                .unwrap();
+        }
 
-        let dead = dir.join("dead.json");
-        write_stop_at(&dead, &session).unwrap();
-        reconcile_stop_at(&dead, |_| Ok(false)).unwrap();
-        assert!(!dead.exists());
+        // SAFETY: getuid and getgid have no preconditions.
+        let owner = unsafe { (libc::getuid(), libc::getgid()) };
+        let result = validate_macos_private_layout(&dir, owner);
+        fs::remove_dir_all(&dir).unwrap();
 
-        let live = dir.join("live.json");
-        write_stop_at(&live, &session).unwrap();
-        assert!(reconcile_stop_at(&live, |_| Ok(true)).is_err());
-        assert!(live.exists());
-
-        let unknown = dir.join("unknown.json");
-        write_stop_at(&unknown, &session).unwrap();
-        assert!(reconcile_stop_at(&unknown, |_| Err(AppError::fail("unreadable lease"))).is_err());
-        assert!(unknown.exists());
-
-        let malformed = dir.join("malformed.json");
-        fs::write(&malformed, b"not json").unwrap();
-        reconcile_stop_at(&malformed, |_| Ok(false)).unwrap();
-        assert!(!malformed.exists());
-    }
-
-    #[test]
-    fn conditional_session_removal_retains_changed_and_malformed_state() {
-        let dir = TestDir::new("conditional-remove");
-        let path = dir.join("session.json");
-        let expected = sample_session();
-        let mut changed = sample_session();
-        changed.owner.pid += 1;
-
-        write_session_at(&path, &changed).unwrap();
-        assert!(!remove_session_if_matches_at(&path, &expected).unwrap());
-        assert!(path.exists());
-
-        fs::write(&path, b"not json").unwrap();
-        assert!(remove_session_if_matches_at(&path, &expected).is_err());
-        assert!(path.exists());
-
-        write_session_at(&path, &expected).unwrap();
-        assert!(remove_session_if_matches_at(&path, &expected).unwrap());
-        assert!(!path.exists());
+        result.unwrap();
     }
 }

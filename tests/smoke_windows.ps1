@@ -6,7 +6,6 @@ $PSNativeCommandUseErrorActionPreference = $false
 $wake = if ($args.Count -ge 1) { $args[0] } else { Join-Path $PSScriptRoot '..\target\release\wake.exe' }
 $wake = (Resolve-Path $wake).Path
 $env:WAKE_STATE_DIR = Join-Path $env:TEMP ('wake-smoke-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $env:WAKE_STATE_DIR | Out-Null
 
 function Test-Wake {
   param([int] $ExpectedCode, [string] $Needle, [string[]] $WakeArgs)
@@ -27,18 +26,30 @@ function Test-Wake {
   Write-Host "ok   : wake $($WakeArgs -join ' ')  [exit $code]"
 }
 
+function Test-StateFiles {
+  param([string[]] $Expected)
+
+  $actual = @(Get-ChildItem -LiteralPath $env:WAKE_STATE_DIR -File | ForEach-Object Name | Sort-Object)
+  $expected = @($Expected | Sort-Object)
+  if (($actual -join ',') -ne ($expected -join ',')) {
+    throw "expected state files '$($expected -join ',')', found '$($actual -join ',')'"
+  }
+}
+
 $failed = $false
 try {
   Test-Wake 0 'wake '                  @('--version')
   Test-Wake 0 'wake '                  @('version')
-  Test-Wake 0 'wake --until-charge N' @('--help')
-  Test-Wake 0 'wake --until-charge N' @('forever', '--help')
+  Test-Wake 0 '--until-charge N' @('--help')
+  Test-Wake 0 '--until-charge N' @('forever', '--help')
   Test-Wake 2 'conflicting triggers'  @('--until-charge', '80', '--while-pid', '1')
   Test-Wake 2 'unknown flag'           @('--bogus')
   Test-Wake 2 'invalid duration'       @('5x')
   Test-Wake 0 'session active'         @()
+  Test-StateFiles @('lid-watchdog.lock', 'state.json', 'wake.lock')
   Test-Wake 0 'session active'         @('status')
   Test-Wake 0 'stopped'                @('stop')
+  Test-StateFiles @('lid-watchdog.lock', 'wake.lock')
 
   $ErrorActionPreference = 'Continue'
   $batteryOutput = (& $wake --until-charge 80 2>&1) -join "`n"

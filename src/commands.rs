@@ -802,7 +802,12 @@ fn exact_worker(saved: &Session, terminate: bool) -> Result<Option<sysutil::Proc
 
 #[cfg(windows)]
 fn finish_or_recover_lid(saved: &Session) -> Result<()> {
-    if lid_restored(saved)? {
+    let snapshot = platform::LidSnapshot {
+        scheme: platform::parse_guid(&saved.original_scheme)?,
+        ac: saved.original_ac,
+        dc: saved.original_dc,
+    };
+    if platform::restore_lid_snapshot(&snapshot).is_ok() {
         return session::delete_state_file();
     }
     recover_even_lid_windows(saved)
@@ -845,7 +850,7 @@ fn wait_for_guardian_exit(guardian: &sysutil::ProcessHandle, timeout: StdDuratio
             session::state_file().display()
         ))
     })?;
-    if guardian_exit_succeeded(true, Some(code)) {
+    if code == 0 {
         Ok(())
     } else {
         Err(AppError::fail(format!(
@@ -854,11 +859,6 @@ fn wait_for_guardian_exit(guardian: &sysutil::ProcessHandle, timeout: StdDuratio
             session::state_file().display()
         )))
     }
-}
-
-#[cfg(windows)]
-fn guardian_exit_succeeded(exited: bool, code: Option<u32>) -> bool {
-    exited && code == Some(0)
 }
 
 #[cfg(windows)]
@@ -1217,15 +1217,6 @@ mod tests {
             .from_local_datetime(&wall)
             .single()
             .unwrap()
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn guardian_requires_a_zero_exit_code() {
-        assert!(guardian_exit_succeeded(true, Some(0)));
-        assert!(!guardian_exit_succeeded(true, Some(1)));
-        assert!(!guardian_exit_succeeded(false, Some(0)));
-        assert!(!guardian_exit_succeeded(true, None));
     }
 
     #[cfg(not(windows))]

@@ -261,6 +261,7 @@ fn current_charge_met(target: i32, charging_up: bool) -> Option<i32> {
         .filter(|&percent| charge_target_met(target, charging_up, percent))
 }
 
+#[cfg(any(not(windows), test))]
 fn charge_target_met(target: i32, charging_up: bool, percent: i32) -> bool {
     if charging_up {
         percent >= target
@@ -510,34 +511,31 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
         ..Session::default()
     };
     let target = parsed.wait_pid.zip(parsed.wait_start);
-    let command = crate::supervisor::worker_command(
-        &saved,
-        parsed.timeout_sec,
-        target,
-        charge,
-        !parsed.even_lid,
-    )?;
+    let snapshot = if parsed.even_lid {
+        Some(platform::capture_lid_snapshot()?)
+    } else {
+        None
+    };
+    let command =
+        crate::supervisor::worker_command(&saved, parsed.timeout_sec, target, charge, true)?;
     let mut worker = sysutil::spawn_worker(&command, &session::state_dir())?;
     saved.pid = worker.id();
     let identity = sysutil::child_identity(&worker)?;
     saved.process_start = identity.start;
     saved.process_command = identity.command.clone();
-
+    let published = match wait_for_windows_worker_state(&mut worker, &saved) {
+        Ok(published) => published,
+        Err(error) => {
+            cleanup_provisional_worker(&mut worker, &saved)?;
+            return Err(error);
+        }
+    };
     if !parsed.even_lid {
-        let published = wait_for_windows_worker_state(&mut worker, &saved).inspect_err(|_| {
-            let _ = worker.kill();
-            let _ = worker.wait();
-            if let Some(session::SavedState::Valid(current)) = session::read_saved_for_recovery()
-                && current.owned_non_lid_by(saved.pid, saved.process_start)
-            {
-                let _ = session::delete_state_file();
-            }
-        })?;
         print_start_confirmation(&published, None);
         return Ok(());
     }
 
-    let snapshot = platform::capture_lid_snapshot()?;
+    let snapshot = snapshot.expect("even-lid snapshot was captured");
     let scheme = platform::format_guid(&snapshot.scheme);
     let guardian = match sysutil::spawn_elevated_guardian(
         saved.pid,
@@ -549,8 +547,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
     ) {
         Ok(guardian) => guardian,
         Err(error) => {
-            let _ = worker.kill();
-            let _ = worker.wait();
+            cleanup_provisional_worker(&mut worker, &saved)?;
             return Err(error);
         }
     };
@@ -560,21 +557,23 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
     saved.original_ac = snapshot.ac;
     saved.original_dc = snapshot.dc;
     if let Err(error) = session::write(&saved) {
-        let _ = worker.kill();
-        let _ = worker.wait();
+        cleanup_provisional_worker(&mut worker, &saved)?;
         return Err(error);
     }
     if let Err(startup_error) = wait_for_lid_ready(&mut worker, &guardian, &saved, &snapshot) {
-        let worker_exited = worker.try_wait()?.is_some();
-        if !worker_exited {
+        let worker_status = worker.try_wait()?;
+        if worker_status.is_none() {
             let _ = worker.kill();
             let _ = worker.wait();
         }
         wait_for_guardian_exit(&guardian, StdDuration::from_secs(15))?;
         verify_lid_restored(&saved)?;
         session::delete_state_file()?;
-        if worker_exited && let Some(message) = windows_condition_completed(&saved, target, charge)?
-        {
+        if let Some(message) = windows_condition_completed(
+            worker_status.is_some_and(|status| status.success()),
+            &saved,
+            charge,
+        ) {
             println!("{message}");
             return Ok(());
         }
@@ -585,37 +584,38 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn windows_condition_completed(
-    saved: &Session,
-    target: Option<(u32, u64)>,
-    charge: Option<(i32, bool)>,
-) -> Result<Option<String>> {
-    if saved.ends_at.is_some_and(|end| end <= Utc::now()) {
-        return Ok(Some(
-            "wake: requested end time passed before --even-lid became ready".into(),
-        ));
-    }
-    if let Some((pid, start)) = target {
-        let running = match sysutil::open_exact_process(pid, start, false)? {
-            Some(process) => process.is_running()?,
-            None => false,
-        };
-        if !running {
-            return Ok(Some(
-                "wake: watched process exited before --even-lid became ready".into(),
-            ));
-        }
-    }
-    if let Some((target, charging_up)) = charge
-        && let Ok(status) = platform::read_battery()
-        && charge_target_met(target, charging_up, status.percent)
+fn cleanup_provisional_worker(worker: &mut Child, expected: &Session) -> Result<()> {
+    let _ = worker.kill();
+    let _ = worker.wait();
+    if let Some(session::SavedState::Valid(current)) = session::read_saved_for_recovery()
+        && current.owned_non_lid_by(expected.pid, expected.process_start)
     {
-        return Ok(Some(format!(
-            "wake: battery already at {}%; target {target}% reached",
-            status.percent
-        )));
+        session::delete_state_file()?;
     }
-    Ok(None)
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_condition_completed(
+    worker_succeeded: bool,
+    saved: &Session,
+    charge: Option<(i32, bool)>,
+) -> Option<String> {
+    if !worker_succeeded {
+        return None;
+    }
+    match saved.trigger.as_str() {
+        "timed" | "until-time" => {
+            Some("wake: requested end time passed before --even-lid became ready".into())
+        }
+        "while-pid" | "while-app" => {
+            Some("wake: watched process exited before --even-lid became ready".into())
+        }
+        "until-charge" => charge.map(|(target, _)| {
+            format!("wake: battery target {target}% reached before --even-lid became ready")
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(windows)]
@@ -1275,14 +1275,12 @@ mod tests {
     #[test]
     fn elapsed_even_lid_condition_is_not_a_startup_failure() {
         let saved = Session {
+            trigger: "timed".into(),
             ends_at: Some(Utc::now() - Duration::seconds(1)),
             ..Session::default()
         };
-        assert!(
-            windows_condition_completed(&saved, None, None)
-                .unwrap()
-                .is_some()
-        );
+        assert!(windows_condition_completed(true, &saved, None).is_some());
+        assert!(windows_condition_completed(false, &saved, None).is_none());
     }
 
     #[test]

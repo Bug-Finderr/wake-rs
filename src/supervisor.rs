@@ -537,11 +537,12 @@ mod windows {
                 && last_battery.elapsed() >= POLL_INTERVAL
             {
                 last_battery = Instant::now();
-                if !matches!(
-                    poll_battery(target, up, &mut failures),
-                    BatteryPoll::Continue
-                ) {
-                    break;
+                match poll_battery(target, up, &mut failures) {
+                    BatteryPoll::Continue => {}
+                    BatteryPoll::Reached => break,
+                    BatteryPoll::Failed => {
+                        return Err(AppError::fail("battery status remained unavailable"));
+                    }
                 }
             }
             sleep(Duration::from_millis(250));
@@ -550,16 +551,11 @@ mod windows {
     }
 
     fn delete_owned_worker_state(worker: &Session) {
-        for _ in 0..50 {
-            if let Ok(_lock) = session::acquire_lock() {
-                if let Some(session::SavedState::Valid(saved)) = session::read_saved_for_recovery()
-                    && saved.owned_non_lid_by(worker.pid, worker.process_start)
-                {
-                    let _ = session::delete_state_file();
-                }
-                return;
-            }
-            sleep(Duration::from_millis(100));
+        if let Ok(_lock) = session::acquire_lock()
+            && let Some(session::SavedState::Valid(saved)) = session::read_saved_for_recovery()
+            && saved.owned_non_lid_by(worker.pid, worker.process_start)
+        {
+            let _ = session::delete_state_file();
         }
     }
 

@@ -47,32 +47,61 @@ pub fn keep_awake_command(
 }
 
 pub fn read_battery() -> Result<BatteryStatus> {
-    let out = capture(PMSET, &["-g", "batt"])?;
-    let percent = first_percent(&out)
-        .ok_or_else(|| AppError::fail("cannot parse battery percentage from pmset"))?;
-    let lower = out.to_lowercase();
-    let discharging = lower.contains("discharging") || lower.contains("battery power");
-    let charging = lower.contains("; charging;") || lower.contains("ac power");
+    parse_pmset_batt(&capture(PMSET, &["-g", "batt"])?)
+}
+
+fn parse_pmset_batt(out: &str) -> Result<BatteryStatus> {
+    let record = out
+        .lines()
+        .find(|line| line.contains("InternalBattery"))
+        .ok_or_else(|| AppError::fail("cannot find InternalBattery in pmset output"))?;
+    let mut fields = record.split(';');
+    let description = fields.next().unwrap_or_default();
+    let percent = description
+        .split_whitespace()
+        .find_map(|part| part.strip_suffix('%'))
+        .and_then(|part| part.parse::<i32>().ok())
+        .filter(|percent| (0..=100).contains(percent))
+        .ok_or_else(|| AppError::fail("cannot parse InternalBattery percentage from pmset"))?;
+    let state = fields
+        .next()
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| AppError::fail("cannot parse InternalBattery status from pmset"))?
+        .to_ascii_lowercase();
+    let (charging, discharging, neutral_state) = match state.as_str() {
+        "charging" | "finishing charge" => (true, false, None),
+        "discharging" => (false, true, None),
+        _ => (false, false, Some(state)),
+    };
     Ok(BatteryStatus {
         percent,
         charging,
         discharging,
-        neutral_state: None,
+        neutral_state,
     })
 }
 
 pub fn read_disable_sleep() -> Result<i32> {
-    let out = capture(PMSET, &["-g"])?;
+    parse_pmset_disable_sleep(&capture(PMSET, &["-g"])?)
+}
+
+fn parse_pmset_disable_sleep(out: &str) -> Result<i32> {
     for line in out.lines() {
         let mut parts = line.split_whitespace();
-        if let Some(first) = parts.next()
-            && first.eq_ignore_ascii_case("SleepDisabled")
-            && let (Some(num), None) = (parts.next(), parts.clone().next())
+        if parts
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case("SleepDisabled"))
         {
-            return parse_disable_sleep_value(num);
+            return match (parts.next(), parts.next()) {
+                (Some(raw), None) => parse_disable_sleep_value(raw),
+                _ => Err(AppError::fail(
+                    "cannot parse SleepDisabled value from pmset",
+                )),
+            };
         }
     }
-    Ok(0)
+    Err(AppError::fail("SleepDisabled is missing from pmset output"))
 }
 
 pub fn authenticate_sudo() -> Result<bool> {
@@ -94,25 +123,6 @@ pub fn set_disable_sleep_non_interactive(value: i32) -> Result<bool> {
 
 pub fn refresh_sudo_non_interactive() -> Result<bool> {
     Ok(run_quiet(&[SUDO, "-n", "-v"])? == 0)
-}
-
-fn first_percent(out: &str) -> Option<i32> {
-    let bytes = out.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b'%' {
-                return out[start..i].parse().ok();
-            }
-        } else {
-            i += 1;
-        }
-    }
-    None
 }
 
 fn disable_sleep_value(value: i32) -> Result<String> {
@@ -158,4 +168,64 @@ fn run_quiet(cmd: &[&str]) -> Result<i32> {
         .stderr(Stdio::null())
         .status()?;
     Ok(status.code().unwrap_or(-1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_internal_battery_status_table() {
+        for (state, charging, discharging, neutral) in [
+            ("charging", true, false, None),
+            ("finishing charge", true, false, None),
+            ("discharging", false, true, None),
+            ("charged", false, false, Some("charged")),
+            ("not charging", false, false, Some("not charging")),
+            ("calibrating", false, false, Some("calibrating")),
+        ] {
+            let fixture = format!(
+                "Now drawing from 'AC Power'\n -InternalBattery-0 (id=123)\t72%; {state}; 1:23 remaining present: true\n"
+            );
+            let parsed = parse_pmset_batt(&fixture).unwrap();
+            assert_eq!(parsed.percent, 72, "state={state}");
+            assert_eq!(parsed.charging, charging, "state={state}");
+            assert_eq!(parsed.discharging, discharging, "state={state}");
+            assert_eq!(parsed.neutral_state.as_deref(), neutral, "state={state}");
+        }
+    }
+
+    #[test]
+    fn rejects_unparseable_battery_fixtures() {
+        for fixture in [
+            "Now drawing from 'AC Power'\n",
+            "-InternalBattery-0 (id=123) 72%\n",
+            "-InternalBattery-0 (id=123) nope; charging; present: true\n",
+            "-InternalBattery-0 (id=123) 101%; charged; present: true\n",
+        ] {
+            assert!(parse_pmset_batt(fixture).is_err(), "fixture={fixture:?}");
+        }
+    }
+
+    #[test]
+    fn sleep_disabled_requires_one_exact_value() {
+        for (fixture, expected) in [
+            ("System-wide power settings:\n SleepDisabled 0\n", 0),
+            ("SleepDisabled 1\n", 1),
+        ] {
+            assert_eq!(parse_pmset_disable_sleep(fixture).unwrap(), expected);
+        }
+        for fixture in [
+            "System-wide power settings:\n",
+            "SleepDisabled\n",
+            "SleepDisabled nope\n",
+            "SleepDisabled 2\n",
+            "SleepDisabled 0 extra\n",
+        ] {
+            assert!(
+                parse_pmset_disable_sleep(fixture).is_err(),
+                "fixture={fixture:?}"
+            );
+        }
+    }
 }

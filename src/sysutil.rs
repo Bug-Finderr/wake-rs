@@ -141,6 +141,7 @@ fn is_wake_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("wake") || name.eq_ignore_ascii_case("wake.exe")
 }
 
+#[cfg(windows)]
 pub fn terminate(pid: u32) {
     {
         let system = refreshed(pid);

@@ -252,21 +252,11 @@ fn start_charge_supervisor(charge: i32, mode: &str, no_display: bool) -> Result<
         no_display.to_string(),
         mode.to_string(),
     ];
-    let _child = sysutil::spawn_named(&cmd)?;
-    wait_for_state_file();
-    let session = session::read_if_alive(false)
-        .ok_or_else(|| AppError::fail("supervisor failed to start"))?;
-    print_start_confirmation(&session, None);
+    let child = sysutil::spawn_named(&cmd)?;
+    let published = wait_for_supervisor_session(child.id(), false)
+        .ok_or_else(|| AppError::fail("supervisor failed to publish session state"))?;
+    print_start_confirmation(&published, None);
     Ok(())
-}
-
-fn wait_for_state_file() {
-    for _ in 0..30 {
-        if session::state_file().exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
 }
 
 pub fn status() -> Result<()> {
@@ -451,7 +441,7 @@ fn parse_int(s: &str, name: &str) -> Result<i32> {
 }
 
 fn even_lid_unsupported_message() -> String {
-    "--even-lid is unsupported on Linux; lid-switch inhibition is handled through systemd when privileged".into()
+    "--even-lid is unsupported on Linux".into()
 }
 
 /// Set the lid-close action to (ac, dc). Tries a direct write first (it succeeds unprivileged for
@@ -529,10 +519,9 @@ fn start_charge_supervisor_windows(
         mode.to_string(),
         prior_encoded.map(|v| v.to_string()).unwrap_or_default(),
     ];
-    let _child = sysutil::spawn_named(&cmd)?;
-    wait_for_state_file();
-    let s = session::read_if_alive(false)
-        .ok_or_else(|| AppError::fail("supervisor failed to start"))?;
+    let child = sysutil::spawn_named(&cmd)?;
+    let s = wait_for_supervisor_session(child.id(), prior_lid.is_some())
+        .ok_or_else(|| AppError::fail("supervisor failed to publish session state"))?;
     if prior_lid.is_some()
         && let Err(e) = enable_even_lid_windows()
     {
@@ -658,7 +647,6 @@ fn write_lid_startup_recovery_record(
     session::write(&s)
 }
 
-#[cfg(not(windows))]
 fn wait_for_supervisor_session(supervisor_pid: u32, even_lid: bool) -> Option<Session> {
     for _ in 0..50 {
         if let Some(s) = session::read_if_alive(false)
@@ -831,8 +819,14 @@ fn recover_crashed_even_lid_windows(saved: &Session) -> Result<()> {
 
 fn recover_malformed_lid_session_unlocked(m: &session::MalformedState) -> Result<()> {
     if m.has_lid_recovery_hints() {
+        #[cfg(target_os = "macos")]
         return Err(AppError::fail(format!(
-            "malformed lid recovery state retained at {}; refusing automatic OS changes",
+            "malformed lid recovery state retained at {}; no OS changes made; inspect SleepDisabled with 'pmset -g', restore it manually with 'sudo pmset -a disablesleep <0-or-1>', then remove the state file",
+            session::state_file().display()
+        )));
+        #[cfg(not(target_os = "macos"))]
+        return Err(AppError::fail(format!(
+            "malformed lid recovery state retained at {}; refusing automatic OS changes; restore the platform lid setting manually, then remove the state file",
             session::state_file().display()
         )));
     }

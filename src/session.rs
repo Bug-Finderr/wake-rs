@@ -17,8 +17,6 @@ pub fn state_dir() -> PathBuf {
     default_state_dir()
 }
 
-// NOTE: the Windows base moved from ~/.local/state to %LOCALAPPDATA%; any session written under the
-// old location is orphaned, but recovery is best-effort and a stale child dies on its own.
 #[cfg(windows)]
 fn default_state_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
@@ -173,6 +171,9 @@ fn build_session(p: &HashMap<String, String>) -> Option<Session> {
         Some(s) => Some(parse_ts(s)?),
     };
     let process_start = p.get("processStart")?.trim().parse().ok()?;
+    #[cfg(not(windows))]
+    let prior_disable_sleep = parse_disable_sleep(p.get("priorDisableSleep")?)?;
+    #[cfg(windows)]
     let prior_disable_sleep = parse_disable_sleep(p.get("priorDisableSleep").map_or("0", |v| v))?;
 
     Some(Session {
@@ -198,9 +199,7 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-// The `priorDisableSleep` field is reused on Windows to store the encoded prior lid action
-// (`ac | (dc << 4)`, each nibble 0..=3), so accept that range there; elsewhere it is macOS's
-// SleepDisabled which is strictly 0 or 1.
+// Unix stores SleepDisabled; Windows stores packed AC/DC lid actions.
 #[cfg(not(windows))]
 fn parse_disable_sleep(raw: &str) -> Option<i32> {
     match raw.trim().parse::<i32>().ok()? {
@@ -345,6 +344,15 @@ mod tests {
     fn missing_started_at_is_none() {
         let text = "pid=1\nprocessStart=10\n";
         assert!(build_session(&parse_properties(text)).is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn missing_prior_sleep_value_invalidates_lid_state() {
+        let text = "pid=1\nstartedAt=2024-01-02T03:04:05+00:00\nprocessStart=10\nprocessCommand=/usr/bin/wake\nevenLid=true\n";
+        let properties = parse_properties(text);
+        assert!(build_session(&properties).is_none());
+        assert!(malformed_from(&properties).has_lid_recovery_hints());
     }
 
     #[test]

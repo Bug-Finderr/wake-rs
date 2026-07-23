@@ -1,5 +1,3 @@
-//! wake - keep your machine awake from the CLI.
-
 mod commands;
 mod durations;
 mod error;
@@ -81,38 +79,35 @@ pub(crate) fn print_help() {
     println!(
         r#"wake - keep your machine awake from the CLI
 
-platforms:
-  macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;
-  Windows uses native SetThreadExecutionState
-  note: closing the lid still sleeps the mac unless you use --even-lid
-
 usage:
   wake                       stay awake indefinitely
   wake forever               stay awake indefinitely
-  wake <duration>            e.g. wake 1h, wake 30m, wake 1h30m, wake 90s
-  wake -t <duration>         same as above with explicit flag
-  wake --until HH:MM         stay awake until clock time
-  wake --until-charge N      stay awake until battery hits N% (1-100)
-  wake --while-pid PID       stay awake while PID is running
-  wake --while-app NAME      stay awake while named app/process is running
-  wake --no-display          prevent system sleep only, allow display sleep
-  wake --even-lid            stay awake with the lid closed (macOS uses sudo; Windows sets
-                             the lid-close action to Do Nothing)
-  wake status                show current session
-  wake stop                  end current session
+  wake <duration>            e.g. 90s, 30m, 1h30m, or 1d
+  wake -t, --for <duration>  stay awake for a duration
+  wake --until HH:MM         stay awake until the next local clock time
+  wake --until-charge N      stay awake until battery reaches N% (1-100)
+  wake --while-pid PID       stay awake while a process is running
+  wake --while-app NAME      stay awake while a matching app is running
+  wake --no-display          allow display sleep
+  wake --even-lid            include lid closure (macOS/Windows only)
+  wake status                show the current session
+  wake stop                  stop the current session
   wake version, -v           print version
-  wake help, -h              this message
+  wake help, -h              print help
 
-duration syntax:
-  90s, 5m, 1h, 1h30m, 2h45m30s, 1d, or plain seconds (3600)
-  maximum: 30d
+platforms:
+  macOS: caffeinate; --even-lid uses sudo
+  Linux: systemd-inhibit; --even-lid is unsupported
+  Windows: native power APIs; --even-lid uses one UAC guardian
+
+durations:
+  plain seconds or ordered d/h/m/s units; maximum 30d
 
 exit codes:
   2 usage, 1 error
 
-state file:
-  ~/.local/state/wake/session.properties (override dir with WAKE_STATE_DIR)
-  Windows: %LOCALAPPDATA%\wake\session.properties"#
+state:
+  WAKE_STATE_DIR overrides the platform state directory"#
     );
 }
 

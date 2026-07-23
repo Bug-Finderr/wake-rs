@@ -1,103 +1,99 @@
 # Architecture
 
-`wake` is a single binary with no daemon. It drives the OS's native sleep-inhibition tool, records a
-session in a state file, and reconciles that state on every invocation.
+`wake` is one CLI binary with no daemon. A foreground invocation validates arguments, reconciles durable state under an advisory lock, starts the platform sleep inhibitor, publishes the session, and exits.
 
-## Modules
+## Source layout
 
-```mermaid
-graph TD
-  main["main.rs<br/>dispatch · errors · help"] --> commands
-  main --> supervisor
-  main --> interactive["interactive.rs<br/>(unix picker)"]
-  commands["commands.rs<br/>start/status/stop · even-lid recovery"] --> session
-  commands --> platform
-  commands --> sysutil
-  commands --> durations
-  supervisor["supervisor.rs<br/>charge + lid loops"] --> platform
-  supervisor --> sysutil
-  supervisor --> session
-  session["session.rs<br/>state file · lock · identity"] --> sysutil
-  session --> platform
-  sysutil["sysutil.rs<br/>spawn · liveness · terminate · Job Object"] --> ext1(["sysinfo"])
-  platform -. cfg .-> windows["windows.rs"]
-  platform -. cfg .-> macos["macos.rs"]
-  platform -. cfg .-> linux["linux.rs"]
-```
+| File | Responsibility |
+|---|---|
+| `main.rs` | Dispatch, help, and process exit codes |
+| `commands.rs` | Public start, status, stop, and recovery flows |
+| `durations.rs` | Duration parsing |
+| `session.rs` | Strict state records, atomic writes, and advisory locking |
+| `supervisor.rs` | Conditional Unix supervisors and Windows worker/guardian commands |
+| `sysutil.rs` | Process identity, spawning, termination, and Windows handles |
+| `platform/*.rs` | Compile-time-selected OS operations |
 
-`platform` is a trait-free abstraction: each OS module exposes the same free functions, selected at
-compile time by `cfg` and re-exported from `platform/mod.rs`. Even-lid is real on macOS (sudo +
-SleepDisabled) and on Windows (the power-plan lid action via powrprof); Linux leaves it unsupported.
+Platform modules expose free functions selected with `cfg`; there is no runtime trait layer.
 
-## Command dispatch
+## Process model
 
-```mermaid
-flowchart TD
-  A["wake &lt;args&gt;"] --> B{first arg}
-  B -->|help / version| H[print and exit]
-  B -->|status / stop| L[lock to recover stale state to read session]
-  B -->|forever / duration / flags| ST[start]
-  B -->|__supervise_charge__ / __supervise_lid__| SUP[detached supervisor loop]
-  B -->|none| C{TTY and interactive?}
-  C -->|yes - macOS/Linux| P[picker]
-  C -->|no / Windows| ST
-```
+### macOS and Linux
 
-## Session lifecycle
+Ordinary indefinite, timed, and process-bound sessions use a detached native inhibitor:
 
-A session is the OS sleep-inhibitor process plus a `session.properties` record. The record stores the
-pid **and** a process-identity fingerprint (start time, exe, command line); every read verifies the pid
-is still that same live process before trusting it, so a recycled pid never looks like a live session.
+- macOS: `caffeinate`
+- Linux: `systemd-inhibit`
 
-```mermaid
-sequenceDiagram
-  participant U as user
-  participant W as wake
-  participant K as keep-awake child
-  participant F as state file
-  U->>W: wake 1h
-  W->>W: acquire lock, reconcile stale state
-  W->>K: spawn detached (caffeinate / PowerShell / systemd-inhibit)
-  W->>W: verify child alive (~300ms)
-  W->>F: write {pid, identity, ends_at}
-  W-->>U: session active
-  Note over K: blocks sleep until timeout / pid gone / stop
-```
+The inhibitor owns the session lifetime. `status` and `stop` validate its process identity before trusting or terminating it.
 
-## Supervisors
+Conditions that require polling use a detached copy of `wake` as a supervisor:
 
-`--until-charge` (all OSes) and `--even-lid` (macOS) need a process that outlives the foreground
-command, so `wake` spawns a detached copy of itself (`__supervise_*`). The supervisor owns the
-keep-awake child and polls until its condition is met. The recorded session pid is the supervisor.
+- `--until-charge` polls battery state.
+- macOS `--even-lid` owns the `SleepDisabled` change and its restoration.
 
-```mermaid
-sequenceDiagram
-  participant W as wake (foreground)
-  participant S as supervisor (detached self)
-  participant K as keep-awake child
-  W->>S: spawn __supervise_charge__
-  S->>K: spawn child
-  S->>S: write session (pid = supervisor)
-  W-->>W: read session, print, exit
-  loop poll
-    S->>S: battery / pid / clock / charge
-  end
-  Note over S,K: teardown kills K and (lid) restores SleepDisabled
-```
+The supervisor owns the native inhibitor child, publishes itself as the session process, handles termination signals, and tears down toward allowing sleep. Repeated battery-read failures also end the session rather than leaving an unbounded inhibitor.
 
-Teardown removes the keep-awake child and, for `--even-lid`, restores macOS `SleepDisabled`:
+Linux does not support `--even-lid`.
 
-- **Windows**: the child runs in a kill-on-close Job Object, so it dies with the supervisor.
-- **Unix**: a SIGTERM/SIGINT handler runs the cleanup path; `stop` also re-verifies `SleepDisabled`.
+### Windows
 
-## Key decisions
+Every session uses a detached non-elevated `wake` worker. Its main thread calls `SetThreadExecutionState`, waits for the selected condition, and clears the assertion before exiting. Timed, process-bound, and charge conditions therefore share one native lifecycle.
 
-- **No `dyn`/trait objects** for platforms: `cfg`-selected free functions; only the target OS compiles.
-- **Process identity over bare pid**: guards against pid reuse without a daemon.
-- **Native `std::fs` file locking** (Rust 1.89+) instead of a crate.
-- **Shell out to platform tools**, exactly as the original, passing values as argv (never a shell
-  string) so app/pid names can't inject commands. The one generated script (Windows PowerShell) embeds
-  only validated numerics and a base64-encoded body.
-- Minimal `unsafe`, all Windows-only via `windows-sys`: `sysutil.rs` for the Job Object, clearing
-  handle inheritance, and `ShellExecuteExW` elevation; `platform/windows.rs` for the powrprof
-  lid-action read/write (`read_lid_action`/`write_lid_action`).
+`--even-lid` additionally launches one elevated guardian through `ShellExecuteExW`:
+
+1. The foreground captures the active power-scheme GUID and raw AC/DC lid actions.
+2. The worker and guardian identities plus that exact snapshot are atomically published.
+3. The guardian accepts its write authority only from immutable launch arguments and waits for the durable record to match them.
+4. It sets the recorded scheme to Do Nothing and verifies the active scheme and values before startup succeeds.
+5. It holds an exact handle to the worker, then restores wake-owned AC/DC fields when that worker exits.
+
+The guardian never chooses privileged write targets from mutable state. It does not overwrite a third-party lid value, reactivate a scheme the user switched away from, or delete the state record. A later non-elevated invocation verifies restoration and removes the record.
+
+A guardian crash or power loss can require one later UAC-approved recovery. No user-mode process can guarantee immediate cleanup after its own forced termination without becoming a persistent service, which `wake` deliberately is not.
+
+## Session state
+
+`session.properties` is a strict, versioned record. Common fields include:
+
+- process ID, native start identity, and executable path
+- mode and trigger details
+- start and optional end timestamps
+- whether persistent lid recovery is required
+
+Windows lid sessions also record guardian identity, the exact power-scheme GUID, and raw AC/DC values. macOS lid sessions record the prior `SleepDisabled` value.
+
+State operations follow these rules:
+
+- `wake.lock` serializes foreground start, status, stop, and recovery.
+- Records are written to a new temporary file, flushed, and atomically renamed.
+- Unknown, duplicate, missing, or inconsistent fields make a record malformed.
+- Malformed lid-hinted state is retained and never authorizes an OS write.
+- A stale ordinary session is deleted only after its process identity is no longer live.
+- A valid stale lid session is deleted only after exact restoration verifies.
+
+There is no compatibility parser for older state schemas because the product has no released state-compatibility requirement.
+
+## Process identity
+
+Bare process IDs are never sufficient for managed wake processes.
+
+- Unix compares the PID, process start time, and expected executable.
+- Windows opens one process handle, verifies its creation `FILETIME`, and uses that retained handle for waiting or termination.
+- Windows process-bound sessions also retain a handle to the watched target, so PID reuse cannot extend the session.
+
+Windows temporarily clears inheritance on the parent's standard handles while spawning a detached worker. Null child stdio alone does not prevent another inherited copy of a captured pipe from keeping the caller blocked on EOF.
+
+## Time and battery conditions
+
+`--until` resolves local wall time by calendar date. During a clock fold it chooses the earliest occurrence still in the future; during a clock gap it advances to the first valid instant after the requested time.
+
+Charge sessions first determine whether the target is reachable in the current direction. Polling stops when the target is reached or after bounded consecutive read failures.
+
+- macOS parses the battery record from `pmset`.
+- Linux combines compatible energy/charge measurements, otherwise averages per-battery percentages.
+- Windows uses aggregate `GetSystemPowerStatus` values and rejects unknown battery state.
+
+## Unsafe code
+
+Unsafe code is confined to small Windows FFI boundaries. Each block documents the pointer, handle, allocation, or thread-state invariant it relies on. Owned process handles close through RAII; power-scheme allocations are copied before `LocalFree`; persistent-setting writes always use an explicit GUID and verify their result.

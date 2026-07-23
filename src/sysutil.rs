@@ -494,6 +494,7 @@ mod win {
         }
     }
 
+    // An inherited copy of a captured pipe keeps callers blocked on EOF even with null child stdio.
     fn suspend_stdio_inheritance() -> InheritGuard {
         let mut changed = Vec::new();
         for handle in [

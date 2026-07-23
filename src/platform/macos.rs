@@ -1,5 +1,3 @@
-//! macOS: `caffeinate` for sleep assertions, `pmset` for battery + SleepDisabled, `sudo` for --even-lid.
-
 use super::KeepAwake;
 use crate::error::{AppError, Result};
 use crate::supervisor::BatteryStatus;

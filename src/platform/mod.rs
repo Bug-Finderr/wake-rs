@@ -1,6 +1,3 @@
-//! Platform abstraction as free functions selected by `cfg`. Each platform module provides the
-//! full surface; even-lid functions are real on macOS and unsupported stubs elsewhere.
-
 #[cfg(not(windows))]
 use crate::error::AppError;
 use crate::error::Result;
@@ -23,7 +20,6 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::*;
 
-/// The platform command used by Unix supervisors to keep the machine awake.
 #[cfg(not(windows))]
 pub struct KeepAwake {
     pub cmd: Vec<String>,
@@ -34,7 +30,6 @@ pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
     sysutil::find_app_pid(name)
 }
 
-/// Find an executable named `executable` on PATH and return its full path.
 #[cfg(not(windows))]
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn resolve_on_path(executable: &str, missing_message: &str) -> Result<String> {

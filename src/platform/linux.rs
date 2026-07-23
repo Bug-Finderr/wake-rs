@@ -1,5 +1,3 @@
-//! Linux sleep inhibition and sysfs battery status.
-
 use super::KeepAwake;
 use crate::error::{AppError, Result};
 use crate::supervisor::BatteryStatus;

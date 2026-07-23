@@ -1,76 +1,80 @@
 # wake
 
-Keep your machine awake from the CLI on macOS, Linux, and Windows. No daemon. The binary is `wake`.
-
-Rust port of [AbhinavGupta-de/wake-cli](https://github.com/AbhinavGupta-de/wake-cli) (originally
-Java/GraalVM). Design notes: [architecture.md](architecture.md).
+Keep your machine awake from the command line on macOS, Linux, and Windows. `wake` is one executable with no daemon.
 
 ## Install
 
+Build with Rust 1.95 or newer:
+
 ```sh
-cargo build --release      # -> target/release/wake[.exe]
+cargo build --release
 ```
 
-Or download a binary from [Releases](../../releases): one self-contained executable,
-no installer. Put it on your `PATH` as `wake` (`wake.exe` on Windows).
-
-- **Linux**: `install -Dm755 wake-linux-x64 ~/.local/bin/wake`
-- **macOS**: `install -m755 wake-macos-arm64 /usr/local/bin/wake`
-- **Windows** (PowerShell, then reopen the terminal):
-
-  ```powershell
-  $dir = "$env:LOCALAPPDATA\Programs\wake"; mkdir -Force $dir
-  Move-Item wake.exe "$dir\wake.exe"
-  [Environment]::SetEnvironmentVariable("Path",
-    [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
-  ```
+The binary is `target/release/wake` (`wake.exe` on Windows). Releases also provide prebuilt binaries. Put the binary on your `PATH`.
 
 ## Usage
 
 ```sh
-wake                     # picker (macOS/Linux); indefinite (Windows)
-wake forever             # indefinite
-wake 1h | 30m | 1h30m    # timed
-wake --until 23:00       # until a clock time
-wake --until-charge 80   # until battery hits N% (1-100)
-wake --while-pid 1234    # while a pid is alive
-wake --while-app Slack   # while a process is alive
-wake --no-display        # block system sleep, allow display sleep
-wake --even-lid          # stay awake with the lid closed (macOS: sudo; Windows: sets lid-close action)
-wake status | stop | help | version
+wake                     # indefinitely
+wake forever             # indefinitely, explicitly
+wake 1h                  # for a duration
+wake --until 23:00       # until the next local clock time
+wake --until-charge 80   # until battery reaches 80%
+wake --while-pid 1234    # while this process is running
+wake --while-app Slack   # while a matching app is running
+wake --no-display        # allow display sleep
+wake --even-lid          # macOS/Windows only
+wake status
+wake stop
+wake help
+wake version
 ```
 
-State lives at `~/.local/state/wake/session.properties` (`%LOCALAPPDATA%\wake` on Windows, `$XDG_STATE_HOME` if set on Linux; override the dir with `WAKE_STATE_DIR`).
+Durations accept plain seconds or ordered `d`, `h`, `m`, and `s` units, such as `90s`, `1h30m`, or `2h45m30s`. The maximum is 30 days.
 
-| Platform | Mechanism |
-|---|---|
-| macOS | `caffeinate` + `pmset`; `--even-lid` via `sudo pmset -a disablesleep` |
-| Linux | `systemd-inhibit` (systemd ≥ 190), degrading when polkit denies lid locks; sysfs battery |
-| Windows | PowerShell `SetThreadExecutionState`; `Win32_Battery`; `tasklist` (no picker); `--even-lid` sets the power-plan lid-close action to Do Nothing (UAC only if the direct write is denied) |
+`--until-charge` follows the current battery direction. A target that cannot be reached while the battery keeps its current direction returns an error instead of creating an indefinite session.
 
-## wake-rs vs wake-cli
+Only one session can be active. `wake stop` is safe to repeat.
 
-Same commands, flags, and output. What differs:
+## Platform behavior
 
-| | wake-cli | wake-rs |
-|---|---|---|
-| Language / build | Java 21, GraalVM `native-image`, Maven | Rust 2024, `cargo` |
-| Binary size | multi-MB | ~350 KB |
-| File locking | `java.nio` `FileLock` | native `std::fs` locks (Rust 1.89+) |
-| Interactive picker | raw mode via `stty` | `crossterm` |
-| Tests | CI smoke | unit + Windows/Linux smoke + macOS compile check |
+| Platform | Sleep inhibition | Battery | `--even-lid` |
+|---|---|---|---|
+| macOS | `caffeinate` | `pmset` | Temporarily changes `SleepDisabled` through `sudo` |
+| Linux | `systemd-inhibit` | `/sys/class/power_supply` | Unsupported |
+| Windows | Native `SetThreadExecutionState` worker | `GetSystemPowerStatus` | One UAC prompt starts a narrow guardian that restores the exact power-plan values |
 
-## Tests
+Windows reports aggregate system battery percentage. macOS and Linux use the battery information exposed by their native platform interfaces.
+
+## State and recovery
+
+Session state is stored at:
+
+- macOS: `~/.local/state/wake/session.properties`
+- Linux: `$XDG_STATE_HOME/wake/session.properties`, or `~/.local/state/wake/session.properties`
+- Windows: `%LOCALAPPDATA%\wake\session.properties`
+
+Set `WAKE_STATE_DIR` to use another directory.
+
+State writes are locked and atomic. A valid stale lid record restores only the exact value recorded before `wake` changed it. Malformed lid recovery state is retained and reported without changing system settings.
+
+## Verification
 
 ```sh
-cargo test                       # unit
-pwsh tests/smoke_windows.ps1     # Windows e2e (mirrors upstream CI)
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --release --locked
+bash tests/smoke_linux.sh
+bash tests/smoke_macos.sh
+pwsh tests/smoke_windows.ps1
 ```
+
+Run the smoke test for the current platform.
 
 ## Contributing
 
-External contributions are not accepted; pull requests are closed automatically. Open an issue instead.
+External pull requests are closed automatically. Open an issue instead.
 
 ## License
 
-[MIT](LICENSE). Port of the MIT-licensed [wake-cli](https://github.com/AbhinavGupta-de/wake-cli).
+[MIT](LICENSE). This project is a Rust port of the MIT-licensed [wake-cli](https://github.com/AbhinavGupta-de/wake-cli).

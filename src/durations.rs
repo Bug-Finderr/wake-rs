@@ -1,10 +1,7 @@
-//! Duration parsing: `90s`, `5m`, `1h30m`, `2h45m30s`, `1d`, or plain seconds. Max 30 days.
-
 use crate::error::AppError;
 
 const MAX_SECONDS: i64 = 30 * 24 * 60 * 60;
 
-/// Parse a duration string into seconds, mirroring the reference `Durations.parse`.
 pub fn parse(raw: &str) -> Result<i64, AppError> {
     if raw.trim().is_empty() {
         return Err(AppError::usage("empty duration"));

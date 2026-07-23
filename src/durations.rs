@@ -74,39 +74,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plain_seconds() {
-        assert_eq!(parse("3600").unwrap(), 3600);
-        assert_eq!(parse("90").unwrap(), 90);
-    }
-
-    #[test]
-    fn units() {
-        assert_eq!(parse("90s").unwrap(), 90);
-        assert_eq!(parse("5m").unwrap(), 300);
-        assert_eq!(parse("1h").unwrap(), 3600);
-        assert_eq!(parse("1h30m").unwrap(), 5400);
-        assert_eq!(parse("2h45m30s").unwrap(), 9930);
-        assert_eq!(parse("1d").unwrap(), 86_400);
-    }
-
-    #[test]
-    fn case_and_whitespace() {
-        assert_eq!(parse("  1H30M  ").unwrap(), 5400);
-    }
-
-    #[test]
-    fn rejects_bad_input() {
-        for bad in [
-            "", "   ", "abc", "1h30", "30m1h", "1h1h", "m", "1x", "h30m", "-5",
+    fn supported_forms_and_invalid_syntax() {
+        for (raw, seconds) in [
+            ("3600", 3600),
+            ("90s", 90),
+            ("5m", 300),
+            ("1h30m", 5400),
+            ("2h45m30s", 9930),
+            ("1d", 86_400),
+            ("  1H30M  ", 5400),
         ] {
-            assert!(parse(bad).is_err(), "expected error for {bad:?}");
+            assert_eq!(parse(raw).unwrap(), seconds, "duration={raw:?}");
         }
-    }
-
-    #[test]
-    fn rejects_zero() {
-        assert!(parse("0").is_err());
-        assert!(parse("0s").is_err());
+        for raw in [
+            "", "   ", "0", "0s", "abc", "1h30", "30m1h", "1h1h", "m", "1x", "h30m", "-5",
+        ] {
+            assert!(parse(raw).is_err(), "duration={raw:?}");
+        }
     }
 
     #[test]

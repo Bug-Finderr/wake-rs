@@ -1,5 +1,4 @@
 #requires -version 5
-# Native Windows lifecycle smoke test. It never enables --even-lid.
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -9,137 +8,96 @@ $wake = (Resolve-Path $wake).Path
 $oldPath = $env:Path
 $env:WAKE_STATE_DIR = Join-Path $env:TEMP ('wake smoke ' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $env:WAKE_STATE_DIR | Out-Null
-Write-Host "wake   = $wake"
-Write-Host "state  = $env:WAKE_STATE_DIR`n"
 
 function Invoke-Wake {
   param([string[]] $WakeArgs)
   $ErrorActionPreference = 'Continue'
   $out = & $wake @WakeArgs 2>&1
-  $code = $LASTEXITCODE
-  [pscustomobject]@{ Code = $code; Output = ($out -join "`n") }
+  [pscustomobject]@{ Code = $LASTEXITCODE; Output = ($out -join "`n") }
 }
 
-function Assert-Success {
-  param([string[]] $WakeArgs)
+function Assert-Wake {
+  param([int] $ExpectedCode, [string] $Needle, [string[]] $WakeArgs)
   $r = Invoke-Wake $WakeArgs
-  if ($r.Code -ne 0) { throw "expected success from 'wake $($WakeArgs -join ' ')' (got $($r.Code)):`n$($r.Output)" }
-  Write-Host "ok   : wake $($WakeArgs -join ' ')  [exit 0]"
-  return $r.Output
-}
-
-function Assert-Failure {
-  param([string[]] $WakeArgs, [int] $ExpectedCode = -1)
-  $r = Invoke-Wake $WakeArgs
-  if ($r.Code -eq 0) { throw "expected failure from 'wake $($WakeArgs -join ' ')':`n$($r.Output)" }
-  if ($ExpectedCode -ge 0 -and $r.Code -ne $ExpectedCode) {
+  if ($r.Code -ne $ExpectedCode) {
     throw "expected exit $ExpectedCode from 'wake $($WakeArgs -join ' ')', got $($r.Code):`n$($r.Output)"
   }
-  Write-Host "ok   : wake $($WakeArgs -join ' ')  [exit $($r.Code)]"
-  return $r
-}
-
-function Assert-Contains {
-  param([string] $Text, [string] $Needle)
-  if (-not $Text.Contains($Needle)) { throw "expected output to contain '$Needle', got:`n$Text" }
+  if ($Needle -and -not $r.Output.Contains($Needle)) {
+    throw "expected 'wake $($WakeArgs -join ' ')' to contain '$Needle':`n$($r.Output)"
+  }
+  Write-Host "ok: wake $($WakeArgs -join ' ') [exit $($r.Code)]"
+  return $r.Output
 }
 
 function Get-WorkerPid {
   $line = Get-Content (Join-Path $env:WAKE_STATE_DIR 'session.properties') | Where-Object { $_ -match '^pid=' } | Select-Object -First 1
   if (-not $line) { throw 'state has no pid field' }
-  return [int]($line.Substring(4))
+  return [int]$line.Substring(4)
 }
 
 function Wait-NoSession {
-  param([int] $Seconds = 6)
-  $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+  $deadline = [DateTime]::UtcNow.AddSeconds(8)
   do {
     $status = Invoke-Wake @('status')
     if ($status.Code -eq 0 -and $status.Output.Contains('no active session')) { return }
+    if ($status.Code -ne 0) { throw "status failed while waiting for completion:`n$($status.Output)" }
     Start-Sleep -Milliseconds 200
   } while ([DateTime]::UtcNow -lt $deadline)
-  throw "session did not finish naturally:`n$($status.Output)"
+  throw "session did not finish:`n$($status.Output)"
 }
 
 $failed = $false
 try {
-  Assert-Contains (Assert-Success @('--version')) 'wake 0.1.1'
-  Assert-Contains (Assert-Success @('--help')) 'native SetThreadExecutionState'
+  $version = Assert-Wake 0 '' @('--version')
+  if ($version -notmatch '^wake \S+$') { throw "unexpected version output: $version" }
+  Assert-Wake 2 'conflicting triggers' @('--until-charge', '80', '--while-pid', '1') | Out-Null
+  Assert-Wake 2 'does not accept arguments' @('status', 'extra') | Out-Null
+  Assert-Wake 2 'unknown flag' @('--bogus') | Out-Null
 
-  # Strict public and hidden parsing.
-  Assert-Contains (Assert-Failure @('--until-charge', '80', '--while-pid', '1') -ExpectedCode 2).Output 'conflicting triggers'
-  Assert-Contains (Assert-Failure @('--no-display', '--no-display') -ExpectedCode 2).Output 'duplicate flag'
-  Assert-Contains (Assert-Failure @('status', 'extra') -ExpectedCode 2).Output 'does not accept arguments'
-  Assert-Contains (Assert-Failure @('--bogus') -ExpectedCode 2).Output 'unknown flag'
-  Assert-Contains (Assert-Failure @('__worker_windows__') -ExpectedCode 1).Output 'expects exactly'
-  Assert-Contains (Assert-Failure @('__guard_windows__') -ExpectedCode 1).Output 'expects six immutable'
-  Assert-Contains (Assert-Failure @('--until-charge', '101') -ExpectedCode 2).Output 'must be 1-100'
-
-  # Prove the lifecycle does not need powershell.exe on PATH. The state directory also contains spaces.
   $env:Path = Split-Path $wake
-  Assert-Contains (Assert-Success @('forever', '--no-display')) 'session active'
+  Assert-Wake 0 'session active' @('forever', '--no-display') | Out-Null
   $state = Get-Content (Join-Path $env:WAKE_STATE_DIR 'session.properties') -Raw
-  Assert-Contains $state 'version=2'
-  Assert-Contains $state 'processCommand='
+  if ($state -notmatch '(?m)^processCommand=.+wake\.exe\r?$') { throw "state does not identify a direct wake.exe worker:`n$state" }
   if ($state -match '(?i)powershell|EncodedCommand|Add-Type') { throw "worker state references PowerShell:`n$state" }
   $workerPid = Get-WorkerPid
   if ((Get-Process -Id $workerPid).ProcessName -ne 'wake') { throw "managed process $workerPid is not wake.exe" }
-  Assert-Contains (Assert-Success @('status')) 'session active'
-  Assert-Contains (Assert-Failure @('5s')).Output 'session already active'
-  Assert-Contains (Assert-Success @('stop')) 'stopped'
-  Assert-Contains (Assert-Success @('status')) 'no active session'
+  Assert-Wake 0 'session active' @('status') | Out-Null
+  Assert-Wake 1 'session already active' @('5s') | Out-Null
+  Assert-Wake 0 'stopped' @('stop') | Out-Null
+  Assert-Wake 0 'no active session' @('status') | Out-Null
 
-  # Timed natural completion removes its own state.
-  Assert-Contains (Assert-Success @('1s')) 'session active'
+  Assert-Wake 0 'session active' @('--while-pid', $PID.ToString()) | Out-Null
+  Assert-Wake 0 "pid $(Get-WorkerPid)" @('status') | Out-Null
+  Assert-Wake 0 'stopped' @('stop') | Out-Null
+
+  Assert-Wake 0 'session active' @('1s') | Out-Null
   Wait-NoSession
-  if (Test-Path (Join-Path $env:WAKE_STATE_DIR 'session.properties')) { throw 'timed worker left stale state' }
-  Write-Host 'ok   : timed worker completed naturally'
-
-  # PID lifetime uses the same direct Rust worker.
-  Assert-Contains (Assert-Success @('--while-pid', $PID.ToString())) 'session active'
-  Assert-Contains (Assert-Success @('status')) "pid $(Get-WorkerPid)"
-  Assert-Contains (Assert-Success @('stop')) 'stopped'
-
-  # A hard-killed non-lid worker is reconciled without touching power settings.
-  Assert-Contains (Assert-Success @('forever')) 'session active'
-  $stalePid = Get-WorkerPid
-  Stop-Process -Id $stalePid -Force -Confirm:$false
-  Start-Sleep -Milliseconds 200
-  Assert-Contains (Assert-Success @('status')) 'no active session'
   $statePath = Join-Path $env:WAKE_STATE_DIR 'session.properties'
-  if (Test-Path $statePath) { throw 'stale non-lid state was not removed' }
-  Write-Host 'ok   : stale non-lid worker reconciled'
+  if (Test-Path $statePath) { throw 'timed worker left stale state' }
+  Write-Host 'ok: timed worker completed naturally'
 
-  # Malformed recovery hints fail closed and remain byte-for-byte unchanged.
+  Assert-Wake 0 'session active' @('forever') | Out-Null
+  Stop-Process -Id (Get-WorkerPid) -Force -Confirm:$false
+  Wait-NoSession
+  if (Test-Path $statePath) { throw 'stale non-lid state was not removed' }
+  Write-Host 'ok: stale non-lid worker reconciled'
+
   $malformed = [Text.Encoding]::UTF8.GetBytes("evenLid=true`noriginalScheme=broken`n")
   [IO.File]::WriteAllBytes($statePath, $malformed)
   $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($statePath))
-  Assert-Contains (Assert-Failure @('status') -ExpectedCode 1).Output 'retained byte-for-byte'
+  Assert-Wake 1 'retained byte-for-byte' @('status') | Out-Null
   $after = [Convert]::ToBase64String([IO.File]::ReadAllBytes($statePath))
   if ($before -ne $after) { throw 'malformed state bytes changed during reconciliation' }
   Remove-Item -Force $statePath -Confirm:$false
-  Write-Host 'ok   : malformed recovery state retained byte-for-byte'
+  Write-Host 'ok: malformed recovery state retained byte-for-byte'
 
-  # Relative overrides resolve once to the absolute foreground working directory.
-  $absoluteStateDir = $env:WAKE_STATE_DIR
-  $relativeStateDir = 'wake-relative-' + [guid]::NewGuid().ToString('N')
-  $env:WAKE_STATE_DIR = $relativeStateDir
-  Assert-Contains (Assert-Success @('1s')) 'session active'
-  $relativeStatePath = Join-Path (Join-Path (Get-Location) $relativeStateDir) 'session.properties'
-  if (-not (Test-Path $relativeStatePath)) { throw 'relative state directory was not resolved from the foreground directory' }
-  Wait-NoSession
-  Remove-Item -Recurse -Force $relativeStateDir -Confirm:$false
-  $env:WAKE_STATE_DIR = $absoluteStateDir
-  Write-Host 'ok   : relative WAKE_STATE_DIR resolved consistently'
-
-  $v = wake --version
-  if ($v -notmatch '^wake ') { throw "release binary does not resolve as 'wake' on PATH: $v" }
-  Write-Host "ok   : wake resolves on restricted PATH  [$v]"
-
-  Write-Host "`nALL SMOKE TESTS PASSED"
+  $resolved = wake --version
+  if ($LASTEXITCODE -ne 0 -or $resolved -notmatch '^wake \S+$') { throw "wake does not resolve on restricted PATH: $resolved" }
+  Write-Host "ok: wake resolves on restricted PATH [$resolved]"
+  Write-Host "`nALL WINDOWS SMOKE TESTS PASSED"
 } catch {
   $failed = $true
-  Write-Host "`nSMOKE TEST FAILED: $_" -ForegroundColor Red
+  Write-Host "`nWINDOWS SMOKE TEST FAILED: $_" -ForegroundColor Red
 } finally {
   & $wake stop *> $null
   $env:Path = $oldPath

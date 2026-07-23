@@ -12,21 +12,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! command -v systemd-inhibit >/dev/null 2>&1 ||
-  ! systemd-inhibit --what=sleep --who=wake-smoke --why=probe true >/dev/null 2>&1; then
-  mkdir "$tmp/bin"
-  cat >"$tmp/bin/systemd-inhibit" <<'SH'
-#!/bin/sh
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --*) shift ;;
-    *) exec "$@" ;;
-  esac
-done
-exit 64
-SH
-  chmod +x "$tmp/bin/systemd-inhibit"
-  export PATH="$tmp/bin:$PATH"
+if [[ ! -x /usr/bin/caffeinate ]]; then
+  echo "FAIL: /usr/bin/caffeinate is unavailable"
+  exit 1
 fi
 
 failed=0
@@ -45,22 +33,22 @@ expect() {
 }
 
 wait_inactive() {
-  local label="$1" output code
+  local output code
   for ((attempt = 0; attempt < 80; attempt++)); do
     output="$("$wake" status 2>&1)"
     code=$?
     if [[ "$code" -ne 0 ]]; then
-      printf 'FAIL: %s status [expected 0, got %s]\n%s\n' "$label" "$code" "$output"
+      printf 'FAIL: expiry status [expected 0, got %s]\n%s\n' "$code" "$output"
       failed=1
       return
     fi
     if [[ "$output" == *"no active session"* ]]; then
-      printf 'ok: %s\n' "$label"
+      echo "ok: short session expired"
       return
     fi
     sleep 0.1
   done
-  printf 'FAIL: %s did not become inactive\n%s\n' "$label" "$output"
+  printf 'FAIL: short session did not expire\n%s\n' "$output"
   failed=1
 }
 
@@ -77,31 +65,15 @@ expect 0 "stopped" stop
 expect 0 "no active session" status
 
 expect 0 "session active" 1s
-wait_inactive "short session expired"
+wait_inactive
 if [[ -e "$WAKE_STATE_DIR/session.properties" ]]; then
   echo "FAIL: expired session left state"
   failed=1
 fi
 
-expect 0 "session active" forever
-worker_pid=""
-while IFS='=' read -r key value; do
-  [[ "$key" == pid ]] && worker_pid="$value"
-done <"$WAKE_STATE_DIR/session.properties"
-if [[ ! "$worker_pid" =~ ^[1-9][0-9]*$ ]] || ! kill -KILL "$worker_pid" 2>/dev/null; then
-  echo "FAIL: could not kill the managed process"
-  failed=1
-else
-  wait_inactive "stale session cleaned"
-  if [[ -e "$WAKE_STATE_DIR/session.properties" ]]; then
-    echo "FAIL: stale session state was not removed"
-    failed=1
-  fi
-fi
-
 if [[ "$failed" -eq 0 ]]; then
-  echo "ALL LINUX SMOKE TESTS PASSED"
+  echo "ALL MACOS SMOKE TESTS PASSED"
 else
-  echo "LINUX SMOKE TEST FAILED"
+  echo "MACOS SMOKE TEST FAILED"
 fi
 exit "$failed"

@@ -261,7 +261,6 @@ fn current_charge_met(target: i32, charging_up: bool) -> Option<i32> {
         .filter(|&percent| charge_target_met(target, charging_up, percent))
 }
 
-#[cfg(not(windows))]
 fn charge_target_met(target: i32, charging_up: bool, percent: i32) -> bool {
     if charging_up {
         percent >= target
@@ -270,7 +269,6 @@ fn charge_target_met(target: i32, charging_up: bool, percent: i32) -> bool {
     }
 }
 
-#[cfg(not(windows))]
 fn print_charge_met(percent: i32, target: i32) {
     println!("wake: battery already at {percent}%; target {target}% reached");
 }
@@ -483,7 +481,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
     let charge = match parsed.charge_target {
         Some(target) => match prepare_charge(target)? {
             ChargePreparation::AlreadyMet(percent) => {
-                println!("wake: battery already at {percent}%; target {target}% reached");
+                print_charge_met(percent, target);
                 return Ok(());
             }
             ChargePreparation::Wait(charge) => {
@@ -566,14 +564,58 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
         let _ = worker.wait();
         return Err(error);
     }
-    if let Err(error) = wait_for_lid_ready(&mut worker, &guardian, &saved, &snapshot) {
-        let _ = worker.kill();
-        let _ = worker.wait();
-        let _ = guardian.wait(StdDuration::from_secs(10));
-        return Err(error);
+    if let Err(startup_error) = wait_for_lid_ready(&mut worker, &guardian, &saved, &snapshot) {
+        let worker_exited = worker.try_wait()?.is_some();
+        if !worker_exited {
+            let _ = worker.kill();
+            let _ = worker.wait();
+        }
+        wait_for_guardian_exit(&guardian, StdDuration::from_secs(15))?;
+        verify_lid_restored(&saved)?;
+        session::delete_state_file()?;
+        if worker_exited && let Some(message) = windows_condition_completed(&saved, target, charge)?
+        {
+            println!("{message}");
+            return Ok(());
+        }
+        return Err(startup_error);
     }
     print_start_confirmation(&saved, None);
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_condition_completed(
+    saved: &Session,
+    target: Option<(u32, u64)>,
+    charge: Option<(i32, bool)>,
+) -> Result<Option<String>> {
+    if saved.ends_at.is_some_and(|end| end <= Utc::now()) {
+        return Ok(Some(
+            "wake: requested end time passed before --even-lid became ready".into(),
+        ));
+    }
+    if let Some((pid, start)) = target {
+        let running = match sysutil::open_exact_process(pid, start, false)? {
+            Some(process) => process.is_running()?,
+            None => false,
+        };
+        if !running {
+            return Ok(Some(
+                "wake: watched process exited before --even-lid became ready".into(),
+            ));
+        }
+    }
+    if let Some((target, charging_up)) = charge
+        && let Ok(status) = platform::read_battery()
+        && charge_target_met(target, charging_up, status.percent)
+    {
+        return Ok(Some(format!(
+            "wake: battery already at {}%; target {target}% reached",
+            status.percent
+        )));
+    }
+    Ok(None)
 }
 
 #[cfg(windows)]
@@ -1219,7 +1261,6 @@ mod tests {
             .unwrap()
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn startup_charge_race_uses_the_original_direction() {
         assert!(charge_target_met(80, true, 80));
@@ -1228,6 +1269,20 @@ mod tests {
         assert!(charge_target_met(80, false, 80));
         assert!(charge_target_met(80, false, 79));
         assert!(!charge_target_met(80, false, 81));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elapsed_even_lid_condition_is_not_a_startup_failure() {
+        let saved = Session {
+            ends_at: Some(Utc::now() - Duration::seconds(1)),
+            ..Session::default()
+        };
+        assert!(
+            windows_condition_completed(&saved, None, None)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

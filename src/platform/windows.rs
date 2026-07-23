@@ -237,14 +237,12 @@ pub fn restore_lid_snapshot(snapshot: &LidSnapshot) -> Result<()> {
     }
     let after = read_lid_values(&snapshot.scheme)?;
     let original = (snapshot.ac, snapshot.dc);
-    if (wrote_any || after == original)
-        && should_reactivate_lid(
-            wrote_any,
-            after,
-            original,
-            scheme_is_active(&snapshot.scheme)?,
-        )
-    {
+    if should_reactivate_lid(
+        wrote_any,
+        after,
+        original,
+        scheme_is_active(&snapshot.scheme)?,
+    ) {
         reactivate_if_active(&snapshot.scheme)?;
     }
     if after == original {

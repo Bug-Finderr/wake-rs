@@ -1,9 +1,9 @@
 [package]
 name = "wake-rs"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Keep your machine awake from the CLI (Rust port of wake-cli)"
+description = "Keep your machine awake from the command line"
 license = "MIT"
 
 [[bin]]

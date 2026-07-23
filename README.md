@@ -4,7 +4,7 @@ Keep your machine awake from the command line on macOS, Linux, and Windows. `wak
 
 ## Install
 
-Build with Rust 1.95 or newer:
+Build with Cargo:
 
 ```sh
 cargo build --release

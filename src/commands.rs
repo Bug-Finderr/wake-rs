@@ -199,17 +199,18 @@ fn start_unix(p: Parsed) -> Result<()> {
 
     let keep_awake = platform::keep_awake_command(p.no_display, p.timeout_sec, p.wait_pid)?;
     let now = Utc::now();
-    let mut saved = Session::default();
-    saved.mode = mode;
-    saved.trigger = p.trigger;
-    saved.detail = p.trigger_detail;
-    saved.started_at = Some(now);
-    saved.ends_at = p
-        .timeout_sec
-        .map(|timeout| now + Duration::seconds(timeout));
-
     let mut child = sysutil::spawn_named(&keep_awake.cmd)?;
-    saved.pid = child.id();
+    let mut saved = Session {
+        pid: child.id(),
+        mode,
+        trigger: p.trigger,
+        detail: p.trigger_detail,
+        started_at: Some(now),
+        ends_at: p
+            .timeout_sec
+            .map(|timeout| now + Duration::seconds(timeout)),
+        ..Session::default()
+    };
     sysutil::require_child_alive(saved.pid, &keep_awake.cmd)?;
     if let Err(error) = saved
         .capture_process_identity()
@@ -223,23 +224,55 @@ fn start_unix(p: Parsed) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn start_charge_supervisor(charge: i32, mode: &str, no_display: bool) -> Result<()> {
-    if let ChargePreparation::AlreadyMet(percent) = prepare_charge(charge)? {
-        println!("wake: battery already at {percent}%; target {charge}% reached");
-        return Ok(());
-    }
+fn start_charge_supervisor(target: i32, mode: &str, no_display: bool) -> Result<()> {
+    let charge = match prepare_charge(target)? {
+        ChargePreparation::AlreadyMet(percent) => {
+            print_charge_met(percent, target);
+            return Ok(());
+        }
+        ChargePreparation::Wait(charge) => charge,
+    };
     let cmd = vec![
         sysutil::self_exe()?,
         "__supervise_charge__".into(),
-        charge.to_string(),
+        target.to_string(),
         no_display.to_string(),
         mode.to_string(),
     ];
-    let child = sysutil::spawn_named(&cmd)?;
-    let published = wait_for_supervisor_session(child.id(), false)
-        .ok_or_else(|| AppError::fail("supervisor failed to publish session state"))?;
-    print_start_confirmation(&published, None);
-    Ok(())
+    let mut child = sysutil::spawn_named(&cmd)?;
+    if let Some(published) = wait_for_supervisor_session(child.id(), false) {
+        print_start_confirmation(&published, None);
+        return Ok(());
+    }
+    if child.try_wait()?.is_some()
+        && let Some(percent) = current_charge_met(target, charge.charging_up)
+    {
+        print_charge_met(percent, target);
+        return Ok(());
+    }
+    Err(AppError::fail("supervisor failed to publish session state"))
+}
+
+#[cfg(not(windows))]
+fn current_charge_met(target: i32, charging_up: bool) -> Option<i32> {
+    platform::read_battery()
+        .ok()
+        .map(|status| status.percent)
+        .filter(|&percent| charge_target_met(target, charging_up, percent))
+}
+
+#[cfg(not(windows))]
+fn charge_target_met(target: i32, charging_up: bool, percent: i32) -> bool {
+    if charging_up {
+        percent >= target
+    } else {
+        percent <= target
+    }
+}
+
+#[cfg(not(windows))]
+fn print_charge_met(percent: i32, target: i32) {
+    println!("wake: battery already at {percent}%; target {target}% reached");
 }
 
 pub fn status() -> Result<()> {
@@ -799,15 +832,33 @@ fn recover_even_lid_windows(saved: &Session) -> Result<()> {
 
 #[cfg(windows)]
 fn wait_for_guardian_exit(guardian: &sysutil::ProcessHandle, timeout: StdDuration) -> Result<()> {
-    if guardian.wait(timeout)? {
+    if !guardian.wait(timeout)? {
+        return Err(AppError::fail(format!(
+            "guardian {} did not exit; it was not terminated and state remains at {}",
+            guardian.pid(),
+            session::state_file().display()
+        )));
+    }
+    let code = guardian.exit_code().map_err(|error| {
+        AppError::fail(format!(
+            "{error}; guardian result is unknown and state remains at {}",
+            session::state_file().display()
+        ))
+    })?;
+    if guardian_exit_succeeded(true, Some(code)) {
         Ok(())
     } else {
         Err(AppError::fail(format!(
-            "guardian {} did not exit; it was not terminated and state remains at {}",
+            "guardian {} exited with code {code}; state remains at {}",
             guardian.pid(),
             session::state_file().display()
         )))
     }
+}
+
+#[cfg(windows)]
+fn guardian_exit_succeeded(exited: bool, code: Option<u32>) -> bool {
+    exited && code == Some(0)
 }
 
 #[cfg(windows)]
@@ -855,16 +906,24 @@ fn ensure_sudo_for_even_lid() -> Result<()> {
 }
 
 #[cfg(not(windows))]
+enum LidLaunch {
+    Published(Session),
+    ChargeMet { target: i32, percent: i32 },
+}
+
+#[cfg(not(windows))]
 fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> Result<()> {
     let mut supervisor_detail = p.trigger_detail.clone();
+    let mut charging_up = None;
     if let Some(target) = charge_target {
         match prepare_charge(target)? {
             ChargePreparation::AlreadyMet(percent) => {
-                println!("wake: battery already at {percent}%; target {target}% reached");
+                print_charge_met(percent, target);
                 return Ok(());
             }
             ChargePreparation::Wait(charge) => {
                 supervisor_detail = charge_detail(target, &charge);
+                charging_up = Some(charge.charging_up);
             }
         }
     }
@@ -873,9 +932,21 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
     ensure_sudo_for_even_lid()?;
     write_lid_startup_recovery_record(&p.trigger, &supervisor_detail, mode, p.timeout_sec, prior)?;
 
-    match lid_enable_and_launch(p, mode, &supervisor_detail, charge_target, prior) {
-        Ok(s) => {
+    match lid_enable_and_launch(
+        p,
+        mode,
+        &supervisor_detail,
+        charge_target,
+        charging_up,
+        prior,
+    ) {
+        Ok(LidLaunch::Published(s)) => {
             print_start_confirmation(&s, None);
+            Ok(())
+        }
+        Ok(LidLaunch::ChargeMet { target, percent }) => {
+            restore_lid_startup_state(prior)?;
+            print_charge_met(percent, target);
             Ok(())
         }
         Err(e) => {
@@ -893,8 +964,9 @@ fn lid_enable_and_launch(
     _mode: &str,
     supervisor_detail: &str,
     charge_target: Option<i32>,
+    charging_up: Option<bool>,
     prior: i32,
-) -> Result<Session> {
+) -> Result<LidLaunch> {
     platform::set_disable_sleep_foreground(1)?;
     let current = platform::read_disable_sleep()?;
     if current != 1 {
@@ -914,9 +986,27 @@ fn lid_enable_and_launch(
         supervisor_detail.to_string(),
         charge_target.map(|c| c.to_string()).unwrap_or_default(),
     ];
-    let child = sysutil::spawn_named(&cmd)?;
-    wait_for_supervisor_session(child.id(), true)
-        .ok_or_else(|| AppError::fail("lid supervisor failed to publish session state"))
+    let mut child = sysutil::spawn_named(&cmd)?;
+    if let Some(session) = wait_for_supervisor_session(child.id(), true) {
+        return Ok(LidLaunch::Published(session));
+    }
+    if child.try_wait()?.is_some()
+        && let Some((target, up)) = charge_target.zip(charging_up)
+        && let Some(percent) = current_charge_met(target, up)
+    {
+        return Ok(LidLaunch::ChargeMet { target, percent });
+    }
+    Err(AppError::fail(
+        "lid supervisor failed to publish session state",
+    ))
+}
+
+#[cfg(not(windows))]
+fn restore_lid_startup_state(prior: i32) -> Result<()> {
+    if platform::read_disable_sleep()? != prior {
+        restore_disable_sleep_foreground(prior)?;
+    }
+    session::delete_state_file()
 }
 
 #[cfg(not(windows))]
@@ -928,15 +1018,17 @@ fn write_lid_startup_recovery_record(
     prior: i32,
 ) -> Result<()> {
     let now = Utc::now();
-    let mut s = Session::default();
-    s.pid = std::process::id();
-    s.mode = mode.to_string();
-    s.trigger = trigger.to_string();
-    s.detail = detail.to_string();
-    s.started_at = Some(now);
-    s.ends_at = timeout_sec.map(|t| now + Duration::seconds(t));
-    s.even_lid = true;
-    s.prior_disable_sleep = prior;
+    let mut s = Session {
+        pid: std::process::id(),
+        mode: mode.to_string(),
+        trigger: trigger.to_string(),
+        detail: detail.to_string(),
+        started_at: Some(now),
+        ends_at: timeout_sec.map(|timeout| now + Duration::seconds(timeout)),
+        even_lid: true,
+        prior_disable_sleep: prior,
+        ..Session::default()
+    };
     s.capture_process_identity()?;
     session::write(&s)
 }
@@ -1094,10 +1186,10 @@ fn recover_crashed_even_lid_unix(saved: &Session) -> Result<()> {
 
 #[cfg(not(windows))]
 fn recover_malformed_lid_session_unlocked(lid_hints: bool) -> Result<()> {
-    if lid_hints {
+    if session::retain_malformed_state(lid_hints) {
         #[cfg(target_os = "macos")]
         return Err(AppError::fail(format!(
-            "malformed lid recovery state retained at {}; no OS changes made; inspect SleepDisabled with 'pmset -g', restore it manually with 'sudo pmset -a disablesleep <0-or-1>', then remove the state file",
+            "malformed wake state retained byte-for-byte at {}; no OS changes made; inspect SleepDisabled with 'pmset -g', restore it manually with 'sudo pmset -a disablesleep <0-or-1>', then remove the state file",
             session::state_file().display()
         )));
         #[cfg(not(target_os = "macos"))]
@@ -1125,6 +1217,26 @@ mod tests {
             .from_local_datetime(&wall)
             .single()
             .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guardian_requires_a_zero_exit_code() {
+        assert!(guardian_exit_succeeded(true, Some(0)));
+        assert!(!guardian_exit_succeeded(true, Some(1)));
+        assert!(!guardian_exit_succeeded(false, Some(0)));
+        assert!(!guardian_exit_succeeded(true, None));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn startup_charge_race_uses_the_original_direction() {
+        assert!(charge_target_met(80, true, 80));
+        assert!(charge_target_met(80, true, 81));
+        assert!(!charge_target_met(80, true, 79));
+        assert!(charge_target_met(80, false, 80));
+        assert!(charge_target_met(80, false, 79));
+        assert!(!charge_target_met(80, false, 81));
     }
 
     #[test]

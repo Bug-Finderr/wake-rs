@@ -10,7 +10,7 @@ Build with Cargo:
 cargo build --release
 ```
 
-The binary is `target/release/wake` (`wake.exe` on Windows). Releases also provide prebuilt binaries. Put the binary on your `PATH`.
+The binary is `target/release/wake` (`wake.exe` on Windows). Releases provide Unix binaries in `.tar.gz` archives and Windows as `.exe`. On Linux or macOS, extract the archive before putting `wake` on your `PATH`.
 
 ## Usage
 

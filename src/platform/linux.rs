@@ -6,6 +6,8 @@ use std::process::{Command, Stdio};
 
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
 const EXPECTED: &[&str] = &["systemd-inhibit", "sleep", "tail", "wake"];
+const DISPLAY_INHIBITORS: &[&str] = &["idle:sleep:handle-lid-switch", "idle:sleep", "sleep"];
+const SYSTEM_INHIBITORS: &[&str] = &["sleep:handle-lid-switch", "sleep"];
 
 pub fn expected_command_basenames() -> &'static [&'static str] {
     EXPECTED
@@ -28,34 +30,42 @@ pub fn keep_awake_command(
         "systemd-inhibit",
         "systemd-inhibit not found on PATH; wake requires systemd on Linux",
     )?;
-    let (what, note) = if no_display || probe_inhibitor(&systemd_inhibit, "idle:sleep") {
-        (if no_display { "sleep" } else { "idle:sleep" }, None)
-    } else {
-        (
-            "sleep",
-            Some("note: idle inhibition unavailable; sleep inhibition active".into()),
-        )
-    };
+    let (what, note) =
+        select_inhibitor(no_display, |what| probe_inhibitor(&systemd_inhibit, what))?;
+    Ok(KeepAwake {
+        cmd: inhibitor_command(systemd_inhibit, what, timeout_sec, wait_pid),
+        note,
+    })
+}
+
+fn inhibitor_command(
+    systemd_inhibit: String,
+    what: &str,
+    timeout_sec: Option<i64>,
+    wait_pid: Option<u32>,
+) -> Vec<String> {
     let mut cmd = vec![
         systemd_inhibit,
         format!("--what={what}"),
         "--who=wake".into(),
         "--why=wake CLI".into(),
     ];
-    if let Some(p) = wait_pid {
-        cmd.push("tail".into());
-        cmd.push(format!("--pid={p}"));
-        cmd.push("-f".into());
-        cmd.push("/dev/null".into());
+    if let Some(pid) = wait_pid {
+        cmd.extend([
+            "tail".into(),
+            format!("--pid={pid}"),
+            "-f".into(),
+            "/dev/null".into(),
+        ]);
     } else {
-        cmd.push("sleep".into());
-        cmd.push(
+        cmd.extend([
+            "sleep".into(),
             timeout_sec
-                .map(|t| t.to_string())
+                .map(|timeout| timeout.to_string())
                 .unwrap_or_else(|| "infinity".into()),
-        );
+        ]);
     }
-    Ok(KeepAwake { cmd, note })
+    cmd
 }
 
 pub fn read_battery() -> Result<BatteryStatus> {
@@ -115,6 +125,24 @@ pub fn set_disable_sleep_non_interactive(_value: i32) -> Result<bool> {
 
 pub fn refresh_sudo_non_interactive() -> Result<bool> {
     unsupported()
+}
+
+fn select_inhibitor(
+    no_display: bool,
+    mut probe: impl FnMut(&str) -> bool,
+) -> Result<(&'static str, Option<String>)> {
+    let candidates = if no_display {
+        SYSTEM_INHIBITORS
+    } else {
+        DISPLAY_INHIBITORS
+    };
+    for (index, &what) in candidates.iter().enumerate() {
+        if probe(what) {
+            let note = (index > 0).then(|| format!("note: inhibitor degraded to {what}"));
+            return Ok((what, note));
+        }
+    }
+    Err(AppError::fail("no supported systemd inhibitor scope"))
 }
 
 fn probe_inhibitor(systemd_inhibit: &str, what: &str) -> bool {
@@ -237,6 +265,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn inhibitor_wait_command_tracks_the_supervisor_pid() {
+        let command = inhibitor_command("systemd-inhibit".into(), "sleep", None, Some(42));
+        assert_eq!(&command[4..], ["tail", "--pid=42", "-f", "/dev/null"]);
+    }
+
+    #[test]
+    fn inhibitor_probes_are_ordered_and_choose_first_success() {
+        let mut probed = Vec::new();
+        let selected = select_inhibitor(false, |what| {
+            probed.push(what.to_string());
+            what == "idle:sleep"
+        })
+        .unwrap();
+        assert_eq!(probed, ["idle:sleep:handle-lid-switch", "idle:sleep"]);
+        assert_eq!(selected.0, "idle:sleep");
+        assert_eq!(
+            selected.1.as_deref(),
+            Some("note: inhibitor degraded to idle:sleep")
+        );
+
+        let mut probed = Vec::new();
+        let selected = select_inhibitor(true, |what| {
+            probed.push(what.to_string());
+            what == "sleep"
+        })
+        .unwrap();
+        assert_eq!(probed, ["sleep:handle-lid-switch", "sleep"]);
+        assert_eq!(selected.0, "sleep");
+        assert!(selected.1.is_some());
     }
 
     #[test]

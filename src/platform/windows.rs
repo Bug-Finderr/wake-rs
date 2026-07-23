@@ -207,30 +207,43 @@ fn restore_field(current: u32, original: u32) -> RestoreField {
     }
 }
 
+fn should_reactivate_lid(
+    current: (u32, u32),
+    original: (u32, u32),
+    recorded_scheme_is_active: bool,
+) -> bool {
+    current == original && recorded_scheme_is_active
+}
+
 pub fn restore_lid_snapshot(snapshot: &LidSnapshot) -> Result<()> {
     let mut issues = Vec::new();
-    let mut wrote = false;
     match restore_field(read_lid_values(&snapshot.scheme)?.0, snapshot.ac) {
-        RestoreField::Write => match write_ac(&snapshot.scheme, snapshot.ac) {
-            Ok(()) => wrote = true,
-            Err(error) => issues.push(format!("AC write failed: {error}")),
-        },
+        RestoreField::Write => {
+            if let Err(error) = write_ac(&snapshot.scheme, snapshot.ac) {
+                issues.push(format!("AC write failed: {error}"));
+            }
+        }
         RestoreField::Conflict => issues.push("AC has a third-party value".into()),
         RestoreField::Keep => {}
     }
     match restore_field(read_lid_values(&snapshot.scheme)?.1, snapshot.dc) {
-        RestoreField::Write => match write_dc(&snapshot.scheme, snapshot.dc) {
-            Ok(()) => wrote = true,
-            Err(error) => issues.push(format!("DC write failed: {error}")),
-        },
+        RestoreField::Write => {
+            if let Err(error) = write_dc(&snapshot.scheme, snapshot.dc) {
+                issues.push(format!("DC write failed: {error}"));
+            }
+        }
         RestoreField::Conflict => issues.push("DC has a third-party value".into()),
         RestoreField::Keep => {}
     }
-    if wrote {
-        reactivate_if_active(&snapshot.scheme)?;
-    }
     let after = read_lid_values(&snapshot.scheme)?;
     if after == (snapshot.ac, snapshot.dc) {
+        if should_reactivate_lid(
+            after,
+            (snapshot.ac, snapshot.dc),
+            scheme_is_active(&snapshot.scheme)?,
+        ) {
+            reactivate_if_active(&snapshot.scheme)?;
+        }
         return Ok(());
     }
     let detail = if issues.is_empty() {
@@ -425,6 +438,13 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn restored_values_reactivate_only_the_still_active_scheme() {
+        assert!(should_reactivate_lid((1, 2), (1, 2), true));
+        assert!(!should_reactivate_lid((1, 2), (1, 2), false));
+        assert!(!should_reactivate_lid((0, 2), (1, 2), true));
     }
 
     #[test]

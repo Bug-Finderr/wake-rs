@@ -28,7 +28,7 @@ pub fn keep_awake_command(
 ) -> Result<KeepAwake> {
     let mut cmd = vec![
         CAFFEINATE.to_string(),
-        format!("-{}", if no_display { 'i' } else { 'd' }),
+        if no_display { "-i" } else { "-di" }.into(),
     ];
     if let Some(t) = timeout_sec {
         cmd.push("-t".into());
@@ -171,6 +171,22 @@ fn run_quiet(cmd: &[&str]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caffeinate_assertions_match_display_mode() {
+        assert_eq!(
+            keep_awake_command(false, None, None).unwrap().cmd,
+            [CAFFEINATE, "-di"]
+        );
+        assert_eq!(
+            keep_awake_command(true, None, None).unwrap().cmd,
+            [CAFFEINATE, "-i"]
+        );
+        assert_eq!(
+            keep_awake_command(false, None, Some(42)).unwrap().cmd,
+            [CAFFEINATE, "-di", "-w", "42"]
+        );
+    }
 
     #[test]
     fn parses_internal_battery_status_table() {

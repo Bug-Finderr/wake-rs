@@ -161,6 +161,10 @@ mod unix {
         flag
     }
 
+    fn supervisor_inhibitor_lifetime() -> (Option<i64>, Option<u32>) {
+        (None, Some(std::process::id()))
+    }
+
     pub fn run_charge(args: &[String]) -> Result<()> {
         if args.len() != 4 {
             return Err(AppError::fail("charge supervisor expects 3 arguments"));
@@ -176,17 +180,20 @@ mod unix {
                 return Ok(());
             }
         };
-        let keep_awake = platform::keep_awake_command(no_display, None, None)?;
+        let (child_timeout, child_wait_pid) = supervisor_inhibitor_lifetime();
+        let keep_awake = platform::keep_awake_command(no_display, child_timeout, child_wait_pid)?;
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         let child_pid = child.id();
         sysutil::require_child_alive(child_pid, &keep_awake.cmd)?;
 
-        let mut session = Session::default();
-        session.pid = std::process::id();
-        session.mode = mode;
-        session.trigger = "until-charge".into();
-        session.detail = charge_detail(target, &charge);
-        session.started_at = Some(Utc::now());
+        let mut session = Session {
+            pid: std::process::id(),
+            mode,
+            trigger: "until-charge".into(),
+            detail: charge_detail(target, &charge),
+            started_at: Some(Utc::now()),
+            ..Session::default()
+        };
         session.capture_process_identity()?;
         if let Err(error) = session::write(&session) {
             let _ = child.kill();
@@ -251,27 +258,30 @@ mod unix {
             None => None,
         };
 
-        let keep_awake = platform::keep_awake_command(no_display, timeout_sec, wait_pid)?;
+        let (child_timeout, child_wait_pid) = supervisor_inhibitor_lifetime();
+        let keep_awake = platform::keep_awake_command(no_display, child_timeout, child_wait_pid)?;
         let child = sysutil::spawn_detached(&keep_awake.cmd)?;
         let child_pid = child.id();
         cleanup.child = Some(child);
         sysutil::require_child_alive(child_pid, &keep_awake.cmd)?;
 
         let now = Utc::now();
-        let mut session = Session::default();
-        session.pid = std::process::id();
-        session.mode = if no_display {
-            "system-only"
-        } else {
-            "display+system"
-        }
-        .into();
-        session.trigger = trigger;
-        session.detail = detail;
-        session.started_at = Some(now);
-        session.ends_at = timeout_sec.map(|timeout| now + chrono::Duration::seconds(timeout));
-        session.even_lid = true;
-        session.prior_disable_sleep = prior_disable_sleep;
+        let mut session = Session {
+            pid: std::process::id(),
+            mode: if no_display {
+                "system-only"
+            } else {
+                "display+system"
+            }
+            .into(),
+            trigger,
+            detail,
+            started_at: Some(now),
+            ends_at: timeout_sec.map(|timeout| now + chrono::Duration::seconds(timeout)),
+            even_lid: true,
+            prior_disable_sleep,
+            ..Session::default()
+        };
         session.capture_process_identity()?;
         session::write(&session)?;
 
@@ -338,6 +348,19 @@ mod unix {
         match session::parse_u32(raw, "priorDisableSleep")? {
             value @ (0 | 1) => Ok(value as i32),
             _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn supervisor_owns_native_inhibitor_lifetime() {
+            assert_eq!(
+                supervisor_inhibitor_lifetime(),
+                (None, Some(std::process::id()))
+            );
         }
     }
 }

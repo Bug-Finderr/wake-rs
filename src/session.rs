@@ -170,7 +170,7 @@ pub fn read_if_alive(delete_unhinted_malformed: bool) -> Option<Session> {
             None
         }
         Some(SavedState::Malformed(lid_hints)) => {
-            if delete_unhinted_malformed && !lid_hints {
+            if delete_unhinted_malformed && !retain_malformed_state(lid_hints) {
                 let _ = delete_state_file();
             }
             None
@@ -426,6 +426,11 @@ fn disable_sleep(raw: &str) -> Result<i32> {
         _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
     }
 }
+#[cfg(not(windows))]
+pub(crate) fn retain_malformed_state(lid_hints: bool) -> bool {
+    cfg!(target_os = "macos") || lid_hints
+}
+
 fn lid_hints(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     [
@@ -591,5 +596,12 @@ mod tests {
         assert!(delete_path(&path).is_err());
         assert!(path.is_dir());
         fs::remove_dir(path).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn malformed_retention_is_platform_aware() {
+        assert!(retain_malformed_state(true));
+        assert_eq!(retain_malformed_state(false), cfg!(target_os = "macos"));
     }
 }

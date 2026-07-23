@@ -69,7 +69,7 @@ enum AppMatch {
 }
 
 pub fn find_app_pid(raw: &str) -> Result<Option<u32>> {
-    let query = raw.trim().to_lowercase();
+    let query = raw.trim();
     if query.is_empty() {
         return Err(AppError::usage("app/process name cannot be empty"));
     }
@@ -85,7 +85,7 @@ pub fn find_app_pid(raw: &str) -> Result<Option<u32>> {
             if pid == self_pid || Some(pid) == parent_pid || is_wake_process(process) {
                 return None;
             }
-            app_match(&query, process).map(|rank| (rank, pid))
+            app_match(query, process).map(|rank| (rank, pid))
         },
     )))
 }
@@ -104,16 +104,31 @@ fn app_match(query: &str, process: &Process) -> Option<AppMatch> {
         .and_then(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    match_names(query, &name, &exe)
+    let command = process
+        .cmd()
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+    match_process(query, &name, &exe, command.iter().map(|arg| arg.as_ref()))
 }
 
-fn match_names(query: &str, process_name: &str, exe_basename: &str) -> Option<AppMatch> {
+fn match_process<'a>(
+    query: &str,
+    process_name: &str,
+    exe_basename: &str,
+    command: impl IntoIterator<Item = &'a str>,
+) -> Option<AppMatch> {
     let query = query.to_lowercase();
     let process_name = process_name.to_lowercase();
     let exe_basename = exe_basename.to_lowercase();
     if process_name == query || exe_basename == query {
         Some(AppMatch::Exact)
-    } else if process_name.contains(&query) || exe_basename.contains(&query) {
+    } else if process_name.contains(&query)
+        || exe_basename.contains(&query)
+        || command
+            .into_iter()
+            .any(|arg| arg.to_lowercase().contains(&query))
+    {
         Some(AppMatch::Substring)
     } else {
         None
@@ -259,9 +274,9 @@ mod win {
         WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, DETACHED_PROCESS, GetCurrentProcess, GetProcessId, GetProcessTimes,
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+        CREATE_NO_WINDOW, DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, GetProcessId,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -341,6 +356,16 @@ mod win {
                 WAIT_OBJECT_0 => Ok(true),
                 WAIT_TIMEOUT => Ok(false),
                 _ => unreachable!("wait_raw accepts only successful wait results"),
+            }
+        }
+
+        pub fn exit_code(&self) -> Result<u32> {
+            let mut code = 0;
+            // SAFETY: `code` is writable and the retained process handle is valid.
+            if unsafe { GetExitCodeProcess(self.handle.raw(), &mut code) } == 0 {
+                Err(last_error("could not read process exit code"))
+            } else {
+                Ok(code)
             }
         }
 
@@ -618,16 +643,21 @@ mod tests {
     }
 
     #[test]
-    fn app_match_prefers_exact_then_literal_substring() {
+    fn app_match_prefers_exact_then_literal_command_substring() {
         assert_eq!(
-            match_names("SLACK.EXE", "slack", "slack.exe"),
+            match_process("SLACK.EXE", "slack", "slack.exe", []),
             Some(AppMatch::Exact)
         );
         assert_eq!(
-            match_names("app[1]", "my-app[1]-helper", "helper"),
+            match_process(
+                "Project[1]",
+                "node",
+                "node",
+                ["node", "--workspace=C:\\PROJECT[1]\\app"]
+            ),
             Some(AppMatch::Substring)
         );
-        assert_eq!(match_names("app.", "appx", "other"), None);
+        assert_eq!(match_process("app.", "appx", "other", ["--app=x"]), None);
     }
 
     #[test]

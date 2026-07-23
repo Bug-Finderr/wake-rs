@@ -299,18 +299,25 @@ mod win {
     }
 
     impl ProcessHandle {
-        fn from_owned(handle: OwnedHandle) -> Result<Self> {
+        fn from_owned(handle: OwnedHandle) -> Result<Option<Self>> {
+            if wait_raw(handle.raw(), 0)? == WAIT_OBJECT_0 {
+                return Ok(None);
+            }
             // SAFETY: `handle` remains valid throughout both queries.
             let pid = unsafe { GetProcessId(handle.raw()) };
             if pid == 0 {
                 return Err(last_error("could not read process id"));
             }
-            let identity = identity_from_raw(handle.raw())?;
-            Ok(Self {
+            let identity = match identity_from_raw(handle.raw()) {
+                Ok(identity) => identity,
+                Err(_) if wait_raw(handle.raw(), 0)? == WAIT_OBJECT_0 => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            Ok(Some(Self {
                 handle,
                 pid,
                 identity,
-            })
+            }))
         }
 
         pub fn pid(&self) -> u32 {
@@ -372,7 +379,7 @@ mod win {
                 "could not open process {pid} (error {code})"
             )));
         }
-        ProcessHandle::from_owned(OwnedHandle::new(raw)?).map(Some)
+        ProcessHandle::from_owned(OwnedHandle::new(raw)?)
     }
 
     pub fn open_exact_process(
@@ -588,7 +595,9 @@ mod win {
                     "could not launch the elevated guardian (error {code})"
                 )));
             }
-            ProcessHandle::from_owned(OwnedHandle::new(info.hProcess)?)
+            ProcessHandle::from_owned(OwnedHandle::new(info.hProcess)?)?.ok_or_else(|| {
+                AppError::fail("elevated guardian exited before publishing its identity")
+            })
         }
     }
 

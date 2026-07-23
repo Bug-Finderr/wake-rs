@@ -24,7 +24,8 @@ fn main() {
 }
 
 fn dispatch(args: &[String]) -> Result<(), AppError> {
-    if args.len() > 1 && args.iter().any(|arg| is_help_or_version(arg)) {
+    let internal = args.first().is_some_and(|arg| arg.starts_with("__"));
+    if !internal && args.len() > 1 && args.iter().any(|arg| is_help_or_version(arg)) {
         return Err(AppError::usage("help and version must be used alone"));
     }
     let Some((first, rest)) = args.split_first() else {
@@ -47,10 +48,14 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
             reject_trailing(first, rest)?;
             commands::stop()
         }
+        #[cfg(not(windows))]
         "__supervise_charge__" => supervisor::run_charge(args),
+        #[cfg(not(windows))]
         "__supervise_lid__" => supervisor::run_lid(args),
         #[cfg(windows)]
-        "__set_lid__" => set_lid(rest),
+        "__worker_windows__" => supervisor::run_worker(args),
+        #[cfg(windows)]
+        "__guard_windows__" => supervisor::run_guardian(args),
         _ => commands::start(args),
     }
 }
@@ -72,29 +77,13 @@ fn reject_trailing(command: &str, args: &[String]) -> Result<(), AppError> {
     }
 }
 
-#[cfg(windows)]
-fn set_lid(args: &[String]) -> Result<(), AppError> {
-    fn parse(raw: &str) -> Result<u32, AppError> {
-        match raw.trim().parse::<u32>() {
-            Ok(v @ 0..=3) => Ok(v),
-            _ => Err(AppError::fail(
-                "__set_lid__ expects two lid actions in 0..=3",
-            )),
-        }
-    }
-    let (Some(ac), Some(dc)) = (args.first(), args.get(1)) else {
-        return Err(AppError::fail("__set_lid__ expects <ac> <dc>"));
-    };
-    platform::write_lid_action(parse(ac)?, parse(dc)?)
-}
-
 pub(crate) fn print_help() {
     println!(
         r#"wake - keep your machine awake from the CLI
 
 platforms:
   macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;
-  Windows uses PowerShell + SetThreadExecutionState
+  Windows uses native SetThreadExecutionState
   note: closing the lid still sleeps the mac unless you use --even-lid
 
 usage:

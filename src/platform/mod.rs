@@ -1,8 +1,11 @@
 //! Platform abstraction as free functions selected by `cfg`. Each platform module provides the
 //! full surface; even-lid functions are real on macOS and unsupported stubs elsewhere.
 
-use crate::error::{AppError, Result};
+#[cfg(not(windows))]
+use crate::error::AppError;
+use crate::error::Result;
 use crate::sysutil;
+#[cfg(not(windows))]
 use std::path::Path;
 
 #[cfg(windows)]
@@ -20,7 +23,8 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::*;
 
-/// The command to keep the machine awake plus an optional one-line note to show at start.
+/// The platform command used by Unix supervisors to keep the machine awake.
+#[cfg(not(windows))]
 pub struct KeepAwake {
     pub cmd: Vec<String>,
     pub note: Option<String>,
@@ -31,7 +35,7 @@ pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
 }
 
 /// Find an executable named `executable` on PATH and return its full path.
-/// Used by Windows (powershell) and Linux (systemd-inhibit); macOS uses absolute tool paths.
+#[cfg(not(windows))]
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn resolve_on_path(executable: &str, missing_message: &str) -> Result<String> {
     if let Some(path) = std::env::var_os("PATH") {
@@ -56,9 +60,4 @@ fn is_runnable_file(p: &Path) -> bool {
         && std::fs::metadata(p)
             .map(|m| m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn is_runnable_file(p: &Path) -> bool {
-    p.is_file()
 }

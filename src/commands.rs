@@ -9,6 +9,8 @@ use crate::{durations, platform};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
 #[cfg(not(windows))]
 use std::io::IsTerminal;
+#[cfg(windows)]
+use std::time::{Duration as StdDuration, Instant};
 
 #[cfg(not(windows))]
 pub fn is_console() -> bool {
@@ -147,12 +149,18 @@ fn claim_boolean(value: &mut bool, flag: &str) -> Result<()> {
 }
 
 pub fn start(args: &[String]) -> Result<()> {
-    let p = parse_start_args(args)?;
-
-    if p.even_lid && !platform::supports_even_lid() {
+    let parsed = parse_start_args(args)?;
+    if parsed.even_lid && !platform::supports_even_lid() {
         return Err(AppError::usage(even_lid_unsupported_message()));
     }
+    #[cfg(windows)]
+    return start_windows(parsed);
+    #[cfg(not(windows))]
+    start_unix(parsed)
+}
 
+#[cfg(not(windows))]
+fn start_unix(p: Parsed) -> Result<()> {
     let _lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
     if let Some(existing) = session::read_if_alive(true) {
@@ -161,76 +169,44 @@ pub fn start(args: &[String]) -> Result<()> {
             existing.pid, existing.trigger, existing.detail
         )));
     }
-
     let mode = if p.no_display {
         "system-only"
     } else {
         "display+system"
     }
     .to_string();
-
-    #[cfg(not(windows))]
-    {
-        if let Some(charge) = p.charge_target {
-            if p.even_lid {
-                return start_lid_supervisor(&p, &mode, Some(charge));
-            }
-            return start_charge_supervisor(charge, &mode, p.no_display);
-        }
-        if p.even_lid {
-            return start_lid_supervisor(&p, &mode, None);
-        }
-    }
-
-    #[cfg(windows)]
-    let prior_lid = if p.even_lid {
-        Some(platform::read_lid_action()?)
-    } else {
-        None
-    };
-
     if let Some(charge) = p.charge_target {
-        #[cfg(windows)]
-        return start_charge_supervisor_windows(charge, &mode, p.no_display, prior_lid);
-        #[cfg(not(windows))]
+        if p.even_lid {
+            return start_lid_supervisor(&p, &mode, Some(charge));
+        }
         return start_charge_supervisor(charge, &mode, p.no_display);
     }
+    if p.even_lid {
+        return start_lid_supervisor(&p, &mode, None);
+    }
 
-    let ka = platform::keep_awake_command(p.no_display, p.timeout_sec, p.wait_pid)?;
+    let keep_awake = platform::keep_awake_command(p.no_display, p.timeout_sec, p.wait_pid)?;
     let now = Utc::now();
-    let mut s = Session::new();
-    s.mode = mode;
-    s.trigger = p.trigger.clone();
-    s.detail = p.trigger_detail.clone();
-    s.started_at = Some(now);
-    s.ends_at = p.timeout_sec.map(|t| now + Duration::seconds(t));
-    #[cfg(windows)]
-    if let Some((ac, dc)) = prior_lid {
-        s.even_lid = true;
-        s.prior_disable_sleep = platform::encode_lid(ac, dc);
-    }
+    let mut saved = Session::new();
+    saved.mode = mode;
+    saved.trigger = p.trigger;
+    saved.detail = p.trigger_detail;
+    saved.started_at = Some(now);
+    saved.ends_at = p
+        .timeout_sec
+        .map(|timeout| now + Duration::seconds(timeout));
 
-    let mut child = sysutil::spawn_named(&ka.cmd)?;
-    s.pid = child.id();
-    sysutil::require_child_alive(s.pid, &ka.cmd)?;
-    if let Err(e) = s
+    let mut child = sysutil::spawn_named(&keep_awake.cmd)?;
+    saved.pid = child.id();
+    sysutil::require_child_alive(saved.pid, &keep_awake.cmd)?;
+    if let Err(error) = saved
         .capture_process_identity()
-        .and_then(|_| session::write(&s))
+        .and_then(|()| session::write(&saved))
     {
         let _ = child.kill();
-        return Err(e);
+        return Err(error);
     }
-
-    #[cfg(windows)]
-    if s.even_lid
-        && let Err(e) = enable_even_lid_windows()
-    {
-        let _ = child.kill();
-        session::delete_state_file();
-        return Err(e);
-    }
-
-    print_start_confirmation(&s, ka.note.as_deref());
+    print_start_confirmation(&saved, keep_awake.note.as_deref());
     Ok(())
 }
 
@@ -260,65 +236,82 @@ fn start_charge_supervisor(charge: i32, mode: &str, no_display: bool) -> Result<
 }
 
 pub fn status() -> Result<()> {
+    #[cfg(windows)]
+    return status_windows();
+    #[cfg(not(windows))]
+    status_unix()
+}
+
+#[cfg(not(windows))]
+fn status_unix() -> Result<()> {
     let _lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
-    let Some(s) = session::read_if_alive(false) else {
+    let Some(saved) = session::read_if_alive(false) else {
         println!("wake: no active session");
         return Ok(());
     };
-    let now = Utc::now();
-    let started = s.started_at.unwrap_or(now);
-    let elapsed = (now - started).num_seconds();
-    let remaining = match s.ends_at {
-        None => "-".to_string(),
-        Some(e) => pretty_duration((e - now).num_seconds().max(0)),
+    print_status(&saved);
+    Ok(())
+}
+
+pub fn stop() -> Result<()> {
+    #[cfg(windows)]
+    return stop_windows();
+    #[cfg(not(windows))]
+    stop_unix()
+}
+
+#[cfg(not(windows))]
+fn stop_unix() -> Result<()> {
+    let _lock = session::acquire_lock()?;
+    recover_stale_lid_session_unlocked()?;
+    let Some(saved) = session::read_if_alive(false) else {
+        println!("wake: no active session");
+        session::delete_state_file();
+        return Ok(());
     };
-    println!("wake: session active (pid {})", s.pid);
-    println!("  mode      : {}", s.mode);
-    println!("  trigger   : {} ({})", s.trigger, s.detail);
+    sysutil::terminate_session(&saved)?;
+    if saved.even_lid {
+        verify_disable_sleep_restored_after_stop(&saved)?;
+    }
+    session::delete_state_file();
+    println!("wake: stopped (pid {}, {})", saved.pid, saved.trigger);
+    Ok(())
+}
+
+fn print_status(saved: &Session) {
+    let now = Utc::now();
+    let started = saved.started_at.unwrap_or(now);
+    let elapsed = (now - started).num_seconds();
+    let remaining = match saved.ends_at {
+        None => "-".to_string(),
+        Some(end) => pretty_duration((end - now).num_seconds().max(0)),
+    };
+    println!("wake: session active (pid {})", saved.pid);
+    println!("  mode      : {}", saved.mode);
+    println!("  trigger   : {} ({})", saved.trigger, saved.detail);
     println!(
         "  started   : {} ({} ago)",
         hms(started),
         pretty_duration(elapsed)
     );
     println!("  remaining : {remaining}");
-    if s.even_lid {
+    if saved.even_lid {
         #[cfg(windows)]
-        {
-            let (ac, dc) = platform::decode_lid(s.prior_disable_sleep);
-            println!(
-                "  even lid  : active (restore lid action AC={ac} DC={dc}, state {})",
-                session::state_file().display()
-            );
-        }
+        println!(
+            "  even lid  : active (restore scheme {} AC={} DC={}, state {})",
+            saved.original_scheme,
+            saved.original_ac,
+            saved.original_dc,
+            session::state_file().display()
+        );
         #[cfg(not(windows))]
         println!(
             "  even lid  : active (restore SleepDisabled={}, state {})",
-            s.prior_disable_sleep,
+            saved.prior_disable_sleep,
             session::state_file().display()
         );
     }
-    Ok(())
-}
-
-pub fn stop() -> Result<()> {
-    let _lock = session::acquire_lock()?;
-    recover_stale_lid_session_unlocked()?;
-    let Some(s) = session::read_if_alive(false) else {
-        println!("wake: no active session");
-        session::delete_state_file();
-        return Ok(());
-    };
-    sysutil::terminate_session(&s)?;
-    if s.even_lid {
-        #[cfg(windows)]
-        restore_even_lid_windows(&s)?;
-        #[cfg(not(windows))]
-        verify_disable_sleep_restored_after_stop(&s)?;
-    }
-    session::delete_state_file();
-    println!("wake: stopped (pid {}, {})", s.pid, s.trigger);
-    Ok(())
 }
 
 fn print_start_confirmation(s: &Session, note: Option<&str>) {
@@ -444,93 +437,428 @@ fn even_lid_unsupported_message() -> String {
     "--even-lid is unsupported on Linux".into()
 }
 
-/// Set the lid-close action to (ac, dc). Tries a direct write first (it succeeds unprivileged for
-/// admin accounts); only if the OS denies it does it retry via the elevated `__set_lid__` helper (UAC).
 #[cfg(windows)]
-fn set_lid(ac: u32, dc: u32) -> Result<()> {
-    if platform::write_lid_action(ac, dc).is_ok() {
-        return Ok(());
-    }
-    let (a, d) = (ac.to_string(), dc.to_string());
-    if sysutil::run_elevated_self(&["__set_lid__", &a, &d])? != 0 {
-        return Err(AppError::fail("could not set the lid-close action"));
-    }
-    Ok(())
+enum WindowsState {
+    None,
+    Active {
+        saved: Session,
+        worker: sysutil::ProcessHandle,
+        guardian: Option<sysutil::ProcessHandle>,
+    },
+    BrokenGuardian {
+        saved: Session,
+        worker: sysutil::ProcessHandle,
+    },
 }
 
-/// Set the lid-close action to "Do nothing" (0,0) for a freshly recorded Windows even-lid session.
 #[cfg(windows)]
-fn enable_even_lid_windows() -> Result<()> {
-    set_lid(0, 0)?;
-    let after = platform::read_lid_action()?;
-    if after != (0, 0) {
-        return Err(AppError::fail(format!(
-            "failed to enable --even-lid; lid action is AC={} DC={}",
-            after.0, after.1
-        )));
+fn start_windows(mut parsed: Parsed) -> Result<()> {
+    let _lock = session::acquire_lock()?;
+    match reconcile_windows(false)? {
+        WindowsState::None => {}
+        WindowsState::Active { saved, .. } => {
+            return Err(AppError::fail(format!(
+                "session already active (pid {}, {} {}); run 'wake stop' first",
+                saved.pid, saved.trigger, saved.detail
+            )));
+        }
+        WindowsState::BrokenGuardian { saved, .. } => {
+            return Err(broken_guardian_error(&saved));
+        }
     }
-    Ok(())
-}
 
-/// Restore the prior lid action recorded in `s` when stopping a Windows even-lid session.
-#[cfg(windows)]
-fn restore_even_lid_windows(s: &Session) -> Result<()> {
-    let (ac, dc) = platform::decode_lid(s.prior_disable_sleep);
-    if (ac, dc) == (0, 0) {
-        // Prior action was already "do nothing"; nothing to restore.
-        return Ok(());
-    }
-    set_lid(ac, dc)?;
-    let after = platform::read_lid_action()?;
-    if after != (ac, dc) {
-        return Err(AppError::fail(format!(
-            "failed to restore the lid action to AC={ac} DC={dc}; current is AC={} DC={}",
-            after.0, after.1
-        )));
-    }
-    eprintln!("wake: restored the lid action to AC={ac} DC={dc}");
-    Ok(())
-}
-
-/// Windows charge + even-lid: spawn the normal charge supervisor (carrying the encoded prior lid
-/// action so teardown can restore it), then set the lid action once the session is published.
-#[cfg(windows)]
-fn start_charge_supervisor_windows(
-    charge: i32,
-    mode: &str,
-    no_display: bool,
-    prior_lid: Option<(u32, u32)>,
-) -> Result<()> {
-    let status = read_battery_status()?;
-    let plan = plan_charge(charge, &status)?;
-    if plan.already_met {
-        println!(
-            "wake: battery already at {}%; target {charge}% reached",
-            status.percent
+    let charge = if let Some(target) = parsed.charge_target {
+        let status = read_battery_status()?;
+        let plan = plan_charge(target, &status)?;
+        if plan.already_met {
+            println!(
+                "wake: battery already at {}%; target {target}% reached",
+                status.percent
+            );
+            return Ok(());
+        }
+        parsed.trigger_detail = format!(
+            "{target}% (was {}%, {})",
+            status.percent,
+            if plan.charging_up {
+                "charging up"
+            } else {
+                "discharging down"
+            }
         );
+        Some((target, plan.charging_up))
+    } else {
+        None
+    };
+
+    let now = Utc::now();
+    let mut template = Session::new();
+    template.mode = if parsed.no_display {
+        "system-only".into()
+    } else {
+        "display+system".into()
+    };
+    template.trigger = parsed.trigger;
+    template.detail = parsed.trigger_detail;
+    template.started_at = Some(now);
+    template.ends_at = parsed
+        .timeout_sec
+        .map(|timeout| now + Duration::seconds(timeout));
+    template.even_lid = parsed.even_lid;
+
+    let command = crate::supervisor::worker_command(
+        &template,
+        parsed.timeout_sec,
+        parsed.wait_pid,
+        charge,
+        !parsed.even_lid,
+    )?;
+    let worker = sysutil::spawn_worker(&command)?;
+    template.pid = worker.pid();
+    let identity = worker.identity().clone();
+    template.process_start = identity.start;
+    template.process_command = identity.command.clone();
+
+    if !parsed.even_lid {
+        let saved = wait_for_windows_worker_state(&worker, &template).inspect_err(|_| {
+            let _ = worker.terminate_and_wait(StdDuration::from_secs(6));
+            delete_matching_windows_state(&template);
+        })?;
+        print_start_confirmation(&saved, None);
         return Ok(());
     }
-    let prior_encoded = prior_lid.map(|(ac, dc)| platform::encode_lid(ac, dc));
-    let cmd = vec![
-        sysutil::self_exe()?,
-        "__supervise_charge__".into(),
-        charge.to_string(),
-        no_display.to_string(),
-        mode.to_string(),
-        prior_encoded.map(|v| v.to_string()).unwrap_or_default(),
-    ];
-    let child = sysutil::spawn_named(&cmd)?;
-    let s = wait_for_supervisor_session(child.id(), prior_lid.is_some())
-        .ok_or_else(|| AppError::fail("supervisor failed to publish session state"))?;
-    if prior_lid.is_some()
-        && let Err(e) = enable_even_lid_windows()
-    {
-        sysutil::terminate(s.pid);
-        session::delete_state_file();
-        return Err(e);
+
+    let request = session::GuardianRequest {
+        mode: session::GuardianMode::Start,
+        session: template.clone(),
+        expected_state: None,
+    };
+    let paths = session::write_guardian_request(&request)?;
+    let guardian = match sysutil::spawn_elevated_guardian(&paths.request) {
+        Ok(guardian) => guardian,
+        Err(error) => {
+            let _ = worker.terminate_and_wait(StdDuration::from_secs(6));
+            session::remove_guardian_artifacts(&paths);
+            return Err(error);
+        }
+    };
+    if let Err(error) = wait_for_guardian_marker(&guardian, &paths, StdDuration::from_secs(30)) {
+        let _ = worker.terminate_and_wait(StdDuration::from_secs(6));
+        if guardian.wait(StdDuration::from_secs(10)).unwrap_or(false) {
+            session::remove_guardian_artifacts(&paths);
+        }
+        return Err(error);
     }
-    print_start_confirmation(&s, None);
+
+    let saved = match session::read_saved_for_recovery() {
+        Some(session::SavedState::Valid(saved))
+            if saved.even_lid
+                && saved.pid == template.pid
+                && saved.process_start == template.process_start
+                && saved.guardian_pid == guardian.pid()
+                && saved.guardian_start == guardian.identity().start
+                && saved.matches_identity(&identity) =>
+        {
+            saved
+        }
+        _ => {
+            let _ = worker.terminate_and_wait(StdDuration::from_secs(6));
+            let _ = guardian.wait(StdDuration::from_secs(10));
+            return Err(AppError::fail(
+                "guardian readiness did not match the durable recovery state; state retained",
+            ));
+        }
+    };
+    if !worker.is_running()? || !guardian.is_running()? {
+        let _ = guardian.wait(StdDuration::from_secs(10));
+        return Err(AppError::fail(
+            "the even-lid session ended during startup; verify recovery state before retrying",
+        ));
+    }
+    session::remove_guardian_artifacts(&paths);
+    print_start_confirmation(&saved, None);
     Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_windows_worker_state(
+    worker: &sysutil::ProcessHandle,
+    expected: &Session,
+) -> Result<Session> {
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while Instant::now() < deadline {
+        match session::read_saved_for_recovery() {
+            Some(session::SavedState::Valid(saved))
+                if !saved.even_lid
+                    && saved.pid == expected.pid
+                    && saved.process_start == expected.process_start
+                    && saved
+                        .process_command
+                        .eq_ignore_ascii_case(&expected.process_command) =>
+            {
+                return Ok(saved);
+            }
+            Some(session::SavedState::Malformed(_)) => {
+                return Err(AppError::fail(
+                    "Windows worker published malformed state; state retained",
+                ));
+            }
+            _ => {}
+        }
+        if !worker.is_running()? {
+            break;
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+    }
+    Err(AppError::fail(
+        "Windows worker failed to publish session state",
+    ))
+}
+
+#[cfg(windows)]
+fn delete_matching_windows_state(expected: &Session) {
+    if let Some(session::SavedState::Valid(saved)) = session::read_saved_for_recovery()
+        && !saved.even_lid
+        && saved.pid == expected.pid
+        && saved.process_start == expected.process_start
+    {
+        session::delete_state_file();
+    }
+}
+
+#[cfg(windows)]
+fn status_windows() -> Result<()> {
+    let _lock = session::acquire_lock()?;
+    match reconcile_windows(false)? {
+        WindowsState::None => println!("wake: no active session"),
+        WindowsState::Active { saved, .. } => print_status(&saved),
+        WindowsState::BrokenGuardian { saved, .. } => return Err(broken_guardian_error(&saved)),
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn stop_windows() -> Result<()> {
+    let _lock = session::acquire_lock()?;
+    match reconcile_windows(true)? {
+        WindowsState::None => {
+            println!("wake: no active session");
+            Ok(())
+        }
+        WindowsState::BrokenGuardian { saved, worker } => {
+            worker.terminate_and_wait(StdDuration::from_secs(6))?;
+            Err(AppError::fail(format!(
+                "guardian for worker {} is not running; the exact worker was stopped, but recovery state was retained at {}; run 'wake stop' again to start elevated recovery",
+                saved.pid,
+                session::state_file().display()
+            )))
+        }
+        WindowsState::Active {
+            saved,
+            worker,
+            guardian,
+        } => {
+            worker.terminate_and_wait(StdDuration::from_secs(6))?;
+            if let Some(guardian) = guardian {
+                wait_for_guardian_cleanup(&guardian)?;
+            } else {
+                session::delete_state_file();
+            }
+            println!("wake: stopped (pid {}, {})", saved.pid, saved.trigger);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn reconcile_windows(for_stop: bool) -> Result<WindowsState> {
+    let saved = match session::read_saved_for_recovery() {
+        None => return Ok(WindowsState::None),
+        Some(session::SavedState::Malformed(malformed)) => {
+            let hint = if malformed.has_lid_recovery_hints() {
+                " with lid-recovery fields"
+            } else {
+                ""
+            };
+            return Err(AppError::fail(format!(
+                "malformed wake state{hint} retained byte-for-byte at {}; no power write was attempted",
+                session::state_file().display()
+            )));
+        }
+        Some(session::SavedState::Valid(saved)) => saved,
+    };
+
+    let worker = exact_worker(&saved, for_stop)?;
+    if !saved.even_lid {
+        if let Some(worker) = worker {
+            return Ok(WindowsState::Active {
+                saved,
+                worker,
+                guardian: None,
+            });
+        }
+        session::delete_state_file();
+        return Ok(WindowsState::None);
+    }
+
+    let guardian = exact_guardian(&saved)?;
+    match (worker, guardian) {
+        (Some(worker), Some(guardian)) => Ok(WindowsState::Active {
+            saved,
+            worker,
+            guardian: Some(guardian),
+        }),
+        (Some(worker), None) => Ok(WindowsState::BrokenGuardian { saved, worker }),
+        (None, Some(guardian)) => {
+            let deadline = Instant::now() + StdDuration::from_secs(5);
+            while Instant::now() < deadline {
+                if !session::state_file().exists() {
+                    return Ok(WindowsState::None);
+                }
+                if !guardian.is_running()? {
+                    break;
+                }
+                std::thread::sleep(StdDuration::from_millis(100));
+            }
+            if guardian.is_running()? {
+                return Err(AppError::fail(format!(
+                    "worker exited, but guardian {} did not finish cleanup; recovery state retained at {}",
+                    saved.guardian_pid,
+                    session::state_file().display()
+                )));
+            }
+            recover_even_lid_windows(&saved)?;
+            Ok(WindowsState::None)
+        }
+        (None, None) => {
+            recover_even_lid_windows(&saved)?;
+            Ok(WindowsState::None)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn exact_worker(saved: &Session, terminate: bool) -> Result<Option<sysutil::ProcessHandle>> {
+    let Some(process) = sysutil::open_exact_process(saved.pid, saved.process_start, terminate)?
+    else {
+        return Ok(None);
+    };
+    if !process.is_running()? {
+        return Ok(None);
+    }
+    if !saved.matches_identity(process.identity()) {
+        return Err(AppError::fail(format!(
+            "worker {} has an unexpected executable identity; state retained",
+            saved.pid
+        )));
+    }
+    Ok(Some(process))
+}
+
+#[cfg(windows)]
+fn exact_guardian(saved: &Session) -> Result<Option<sysutil::ProcessHandle>> {
+    let Some(process) =
+        sysutil::open_exact_process(saved.guardian_pid, saved.guardian_start, false)?
+    else {
+        return Ok(None);
+    };
+    if process.is_running()? {
+        Ok(Some(process))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(windows)]
+fn recover_even_lid_windows(saved: &Session) -> Result<()> {
+    let request = session::GuardianRequest {
+        mode: session::GuardianMode::Recover,
+        session: saved.clone(),
+        expected_state: Some(session::read_state_bytes()?),
+    };
+    let paths = session::write_guardian_request(&request)?;
+    let guardian = match sysutil::spawn_elevated_guardian(&paths.request) {
+        Ok(guardian) => guardian,
+        Err(error) => {
+            session::remove_guardian_artifacts(&paths);
+            return Err(error);
+        }
+    };
+    let result = wait_for_guardian_marker(&guardian, &paths, StdDuration::from_secs(30));
+    if result.is_ok() || guardian.wait(StdDuration::from_secs(2)).unwrap_or(false) {
+        session::remove_guardian_artifacts(&paths);
+    }
+    result?;
+    if session::state_file().exists() {
+        return Err(AppError::fail(format!(
+            "elevated recovery reported success but state remains at {}",
+            session::state_file().display()
+        )));
+    }
+    eprintln!(
+        "wake: recovered a crashed even-lid session and restored its exact power-scheme values"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_guardian_marker(
+    guardian: &sysutil::ProcessHandle,
+    paths: &session::GuardianPaths,
+    timeout: StdDuration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if paths.error.exists() {
+            let message = std::fs::read_to_string(&paths.error).map_err(|error| {
+                AppError::fail(format!("could not read guardian error: {error}"))
+            })?;
+            return Err(AppError::fail(message.trim().to_string()));
+        }
+        if paths.ready.exists() {
+            return Ok(());
+        }
+        if !guardian.is_running()? {
+            return Err(AppError::fail(
+                "elevated guardian exited without a readiness or error marker; recovery state was retained if any power write occurred",
+            ));
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+    }
+    Err(AppError::fail(format!(
+        "timed out waiting for elevated guardian {}; it was not terminated and recovery state was retained",
+        guardian.pid()
+    )))
+}
+
+#[cfg(windows)]
+fn wait_for_guardian_cleanup(guardian: &sysutil::ProcessHandle) -> Result<()> {
+    let deadline = Instant::now() + StdDuration::from_secs(15);
+    while Instant::now() < deadline {
+        if !session::state_file().exists() {
+            return Ok(());
+        }
+        if !guardian.is_running()? {
+            break;
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+    }
+    if session::state_file().exists() {
+        Err(AppError::fail(format!(
+            "guardian cleanup did not verify restoration; state retained at {}; never terminate the guardian, and run 'wake stop' again after it exits",
+            session::state_file().display()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn broken_guardian_error(saved: &Session) -> AppError {
+    AppError::fail(format!(
+        "even-lid worker {} is live but guardian {} is not; run 'wake stop' to stop the worker while retaining recovery state",
+        saved.pid, saved.guardian_pid
+    ))
 }
 
 #[cfg(not(windows))]
@@ -647,6 +975,7 @@ fn write_lid_startup_recovery_record(
     session::write(&s)
 }
 
+#[cfg(not(windows))]
 fn wait_for_supervisor_session(supervisor_pid: u32, even_lid: bool) -> Option<Session> {
     for _ in 0..50 {
         if let Some(s) = session::read_if_alive(false)
@@ -746,6 +1075,7 @@ fn print_sleep_state_path() {
     eprintln!("wake: recovery state: {}", session::state_file().display());
 }
 
+#[cfg(not(windows))]
 pub fn recover_stale_lid_session_unlocked() -> Result<()> {
     let state = match session::read_saved_for_recovery() {
         None => return Ok(()),
@@ -764,9 +1094,6 @@ pub fn recover_stale_lid_session_unlocked() -> Result<()> {
                 "stale --even-lid session found, but this platform cannot restore the lid action",
             ));
         }
-        #[cfg(windows)]
-        recover_crashed_even_lid_windows(&saved)?;
-        #[cfg(not(windows))]
         recover_crashed_even_lid_unix(&saved)?;
     }
     session::delete_state_file();
@@ -797,26 +1124,7 @@ fn recover_crashed_even_lid_unix(saved: &Session) -> Result<()> {
     Ok(())
 }
 
-/// Crash recovery for a stale Windows even-lid session: re-elevate and restore the prior lid action.
-#[cfg(windows)]
-fn recover_crashed_even_lid_windows(saved: &Session) -> Result<()> {
-    let (ac, dc) = platform::decode_lid(saved.prior_disable_sleep);
-    let current = platform::read_lid_action()?;
-    if current == (ac, dc) {
-        return Ok(());
-    }
-    set_lid(ac, dc)?;
-    let after = platform::read_lid_action()?;
-    if after != (ac, dc) {
-        return Err(AppError::fail(format!(
-            "failed to recover crashed lid session; lid action is AC={} DC={}",
-            after.0, after.1
-        )));
-    }
-    eprintln!("wake: recovered a crashed lid session; restored the prior lid action");
-    Ok(())
-}
-
+#[cfg(not(windows))]
 fn recover_malformed_lid_session_unlocked(m: &session::MalformedState) -> Result<()> {
     if m.has_lid_recovery_hints() {
         #[cfg(target_os = "macos")]

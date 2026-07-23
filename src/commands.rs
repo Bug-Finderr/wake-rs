@@ -10,6 +10,8 @@ use chrono::{DateTime, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc}
 #[cfg(not(windows))]
 use std::io::IsTerminal;
 #[cfg(windows)]
+use std::process::Child;
+#[cfg(windows)]
 use std::time::{Duration as StdDuration, Instant};
 
 #[cfg(not(windows))]
@@ -21,6 +23,8 @@ struct Parsed {
     timeout_sec: Option<i64>,
     charge_target: Option<i32>,
     wait_pid: Option<u32>,
+    #[cfg(windows)]
+    wait_start: Option<u64>,
     trigger: String,
     trigger_detail: String,
     no_display: bool,
@@ -32,6 +36,8 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
         timeout_sec: None,
         charge_target: None,
         wait_pid: None,
+        #[cfg(windows)]
+        wait_start: None,
         trigger: "indefinite".into(),
         trigger_detail: "indefinite".into(),
         no_display: false,
@@ -79,6 +85,11 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
                     .trim()
                     .parse()
                     .map_err(|_| AppError::usage(format!("invalid pid: '{v}'")))?;
+                #[cfg(windows)]
+                {
+                    p.wait_start = Some(sysutil::open_process_for_wait(pid)?.identity().start);
+                }
+                #[cfg(not(windows))]
                 if !sysutil::is_alive(pid) {
                     return Err(AppError::usage(format!("pid {pid} is not running")));
                 }
@@ -92,6 +103,10 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
                 trigger_flag = claim_trigger(trigger_flag, a)?;
                 let pid = platform::find_app_pid(v)?
                     .ok_or_else(|| AppError::usage(format!("no running process matching '{v}'")))?;
+                #[cfg(windows)]
+                {
+                    p.wait_start = Some(sysutil::open_process_for_wait(pid)?.identity().start);
+                }
                 p.wait_pid = Some(pid);
                 p.trigger_detail = format!("app '{v}' (pid {pid})");
                 p.trigger = "while-app".into();
@@ -267,14 +282,14 @@ fn stop_unix() -> Result<()> {
     recover_stale_lid_session_unlocked()?;
     let Some(saved) = session::read_if_alive(false) else {
         println!("wake: no active session");
-        session::delete_state_file();
+        session::delete_state_file()?;
         return Ok(());
     };
     sysutil::terminate_session(&saved)?;
     if saved.even_lid {
         verify_disable_sleep_restored_after_stop(&saved)?;
     }
-    session::delete_state_file();
+    session::delete_state_file()?;
     println!("wake: stopped (pid {}, {})", saved.pid, saved.trigger);
     Ok(())
 }
@@ -296,16 +311,8 @@ fn print_status(saved: &Session) {
         pretty_duration(elapsed)
     );
     println!("  remaining : {remaining}");
+    #[cfg(not(windows))]
     if saved.even_lid {
-        #[cfg(windows)]
-        println!(
-            "  even lid  : active (restore scheme {} AC={} DC={}, state {})",
-            saved.original_scheme,
-            saved.original_ac,
-            saved.original_dc,
-            session::state_file().display()
-        );
-        #[cfg(not(windows))]
         println!(
             "  even lid  : active (restore SleepDisabled={}, state {})",
             saved.prior_disable_sleep,
@@ -324,7 +331,9 @@ fn print_start_confirmation(s: &Session, note: Option<&str>) {
     println!("  ends    : {ends}");
     if s.even_lid {
         #[cfg(windows)]
-        println!("note: --even-lid active; lid close will not sleep until this session ends");
+        println!(
+            "note: --even-lid override verified; use 'wake status' to detect later power changes"
+        );
         #[cfg(not(windows))]
         println!(
             "note: --even-lid is active; this Mac should stay awake with the lid closed until the session ends"
@@ -453,6 +462,7 @@ enum WindowsState {
 
 #[cfg(windows)]
 fn start_windows(mut parsed: Parsed) -> Result<()> {
+    let state_path = session::state_file();
     let _lock = session::acquire_lock()?;
     match reconcile_windows(false)? {
         WindowsState::None => {}
@@ -462,9 +472,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
                 saved.pid, saved.trigger, saved.detail
             )));
         }
-        WindowsState::BrokenGuardian { saved, .. } => {
-            return Err(broken_guardian_error(&saved));
-        }
+        WindowsState::BrokenGuardian { saved, .. } => return Err(broken_guardian_error(&saved)),
     }
 
     let charge = if let Some(target) = parsed.charge_target {
@@ -492,99 +500,83 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
     };
 
     let now = Utc::now();
-    let mut template = Session::new();
-    template.mode = if parsed.no_display {
-        "system-only".into()
+    let mut saved = Session::new();
+    saved.mode = if parsed.no_display {
+        "system-only"
     } else {
-        "display+system".into()
-    };
-    template.trigger = parsed.trigger;
-    template.detail = parsed.trigger_detail;
-    template.started_at = Some(now);
-    template.ends_at = parsed
+        "display+system"
+    }
+    .into();
+    saved.trigger = parsed.trigger;
+    saved.detail = parsed.trigger_detail;
+    saved.started_at = Some(now);
+    saved.ends_at = parsed
         .timeout_sec
         .map(|timeout| now + Duration::seconds(timeout));
-    template.even_lid = parsed.even_lid;
-
+    saved.even_lid = parsed.even_lid;
+    let target = parsed.wait_pid.zip(parsed.wait_start);
     let command = crate::supervisor::worker_command(
-        &template,
+        &saved,
         parsed.timeout_sec,
-        parsed.wait_pid,
+        target,
         charge,
         !parsed.even_lid,
     )?;
-    let worker = sysutil::spawn_worker(&command)?;
-    template.pid = worker.pid();
-    let identity = worker.identity().clone();
-    template.process_start = identity.start;
-    template.process_command = identity.command.clone();
+    let mut worker = sysutil::spawn_worker(&command, &session::state_dir())?;
+    saved.pid = worker.id();
+    let identity = sysutil::child_identity(&worker)?;
+    saved.process_start = identity.start;
+    saved.process_command = identity.command.clone();
 
     if !parsed.even_lid {
-        let saved = wait_for_windows_worker_state(&worker, &template).inspect_err(|_| {
-            let _ = worker.terminate_and_wait(StdDuration::from_secs(6));
-            delete_matching_windows_state(&template);
+        let published = wait_for_windows_worker_state(&mut worker, &saved).inspect_err(|_| {
+            let _ = worker.kill();
+            let _ = worker.wait();
+            let _ = delete_matching_windows_state(&saved);
         })?;
-        print_start_confirmation(&saved, None);
+        print_start_confirmation(&published, None);
         return Ok(());
     }
 
-    let request = session::GuardianRequest {
-        mode: session::GuardianMode::Start,
-        session: template.clone(),
-        expected_state: None,
-    };
-    let paths = session::write_guardian_request(&request)?;
-    let guardian = match sysutil::spawn_elevated_guardian(&paths.request) {
+    let snapshot = platform::capture_lid_snapshot()?;
+    let scheme = platform::format_guid(&snapshot.scheme);
+    let guardian = match sysutil::spawn_elevated_guardian(
+        saved.pid,
+        saved.process_start,
+        &scheme,
+        snapshot.ac,
+        snapshot.dc,
+        &state_path,
+    ) {
         Ok(guardian) => guardian,
         Err(error) => {
-            let _ = worker.terminate_and_wait(StdDuration::from_secs(6));
-            session::remove_guardian_artifacts(&paths);
+            let _ = worker.kill();
+            let _ = worker.wait();
             return Err(error);
         }
     };
-    if let Err(error) = wait_for_guardian_marker(&guardian, &paths, StdDuration::from_secs(30)) {
-        let _ = worker.terminate_and_wait(StdDuration::from_secs(6));
-        if guardian.wait(StdDuration::from_secs(10)).unwrap_or(false) {
-            session::remove_guardian_artifacts(&paths);
-        }
+    saved.guardian_pid = guardian.pid();
+    saved.guardian_start = guardian.identity().start;
+    saved.original_scheme = scheme;
+    saved.original_ac = snapshot.ac;
+    saved.original_dc = snapshot.dc;
+    if let Err(error) = session::write(&saved) {
+        let _ = worker.kill();
+        let _ = worker.wait();
         return Err(error);
     }
-
-    let saved = match session::read_saved_for_recovery() {
-        Some(session::SavedState::Valid(saved))
-            if saved.even_lid
-                && saved.pid == template.pid
-                && saved.process_start == template.process_start
-                && saved.guardian_pid == guardian.pid()
-                && saved.guardian_start == guardian.identity().start
-                && saved.matches_identity(&identity) =>
-        {
-            saved
-        }
-        _ => {
-            let _ = worker.terminate_and_wait(StdDuration::from_secs(6));
-            let _ = guardian.wait(StdDuration::from_secs(10));
-            return Err(AppError::fail(
-                "guardian readiness did not match the durable recovery state; state retained",
-            ));
-        }
-    };
-    if !worker.is_running()? || !guardian.is_running()? {
+    if let Err(error) = wait_for_lid_ready(&mut worker, &guardian, &saved, &snapshot) {
+        let _ = worker.kill();
+        let _ = worker.wait();
         let _ = guardian.wait(StdDuration::from_secs(10));
-        return Err(AppError::fail(
-            "the even-lid session ended during startup; verify recovery state before retrying",
-        ));
+        return Err(error);
     }
-    session::remove_guardian_artifacts(&paths);
     print_start_confirmation(&saved, None);
     Ok(())
 }
 
 #[cfg(windows)]
-fn wait_for_windows_worker_state(
-    worker: &sysutil::ProcessHandle,
-    expected: &Session,
-) -> Result<Session> {
+fn wait_for_windows_worker_state(worker: &mut Child, expected: &Session) -> Result<Session> {
     let deadline = Instant::now() + StdDuration::from_secs(5);
     while Instant::now() < deadline {
         match session::read_saved_for_recovery() {
@@ -605,7 +597,7 @@ fn wait_for_windows_worker_state(
             }
             _ => {}
         }
-        if !worker.is_running()? {
+        if worker.try_wait()?.is_some() {
             break;
         }
         std::thread::sleep(StdDuration::from_millis(100));
@@ -616,14 +608,70 @@ fn wait_for_windows_worker_state(
 }
 
 #[cfg(windows)]
-fn delete_matching_windows_state(expected: &Session) {
+fn wait_for_lid_ready(
+    worker: &mut Child,
+    guardian: &sysutil::ProcessHandle,
+    expected: &Session,
+    snapshot: &platform::LidSnapshot,
+) -> Result<()> {
+    let deadline = Instant::now() + StdDuration::from_secs(30);
+    while Instant::now() < deadline {
+        if worker.try_wait()?.is_some() {
+            return Err(AppError::fail("worker exited during even-lid startup"));
+        }
+        if !guardian.is_running()? {
+            return Err(AppError::fail(format!(
+                "elevated guardian exited before readiness; recovery state retained at {}",
+                session::state_file().display()
+            )));
+        }
+        if let Some(session::SavedState::Valid(saved)) = session::read_saved_for_recovery() {
+            let health = platform::lid_health(
+                platform::scheme_is_active(&snapshot.scheme)?,
+                platform::read_lid_values(&snapshot.scheme)?,
+            );
+            if lid_override_ready(lid_session_matches(&saved, expected), health) {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+    }
+    Err(AppError::fail(format!(
+        "timed out waiting for even-lid readiness; guardian was not terminated and state remains at {}",
+        session::state_file().display()
+    )))
+}
+
+#[cfg(windows)]
+fn lid_override_ready(state_matches: bool, health: platform::LidHealth) -> bool {
+    state_matches && health == platform::LidHealth::Healthy
+}
+
+#[cfg(windows)]
+fn lid_session_matches(saved: &Session, expected: &Session) -> bool {
+    saved.even_lid
+        && saved.pid == expected.pid
+        && saved.process_start == expected.process_start
+        && saved.guardian_pid == expected.guardian_pid
+        && saved.guardian_start == expected.guardian_start
+        && saved
+            .process_command
+            .eq_ignore_ascii_case(&expected.process_command)
+        && saved.original_scheme == expected.original_scheme
+        && saved.original_ac == expected.original_ac
+        && saved.original_dc == expected.original_dc
+}
+
+#[cfg(windows)]
+fn delete_matching_windows_state(expected: &Session) -> Result<()> {
     if let Some(session::SavedState::Valid(saved)) = session::read_saved_for_recovery()
         && !saved.even_lid
         && saved.pid == expected.pid
         && saved.process_start == expected.process_start
     {
-        session::delete_state_file();
+        session::delete_state_file()?;
     }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -631,8 +679,34 @@ fn status_windows() -> Result<()> {
     let _lock = session::acquire_lock()?;
     match reconcile_windows(false)? {
         WindowsState::None => println!("wake: no active session"),
-        WindowsState::Active { saved, .. } => print_status(&saved),
+        WindowsState::Active { saved, .. } => {
+            print_status(&saved);
+            if saved.even_lid {
+                print_lid_health(&saved)?;
+            }
+        }
         WindowsState::BrokenGuardian { saved, .. } => return Err(broken_guardian_error(&saved)),
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn print_lid_health(saved: &Session) -> Result<()> {
+    let scheme = platform::parse_guid(&saved.original_scheme)?;
+    let values = platform::read_lid_values(&scheme)?;
+    match platform::lid_health(platform::scheme_is_active(&scheme)?, values) {
+        platform::LidHealth::Healthy => println!(
+            "  even lid  : healthy (scheme {}, AC=0 DC=0)",
+            saved.original_scheme
+        ),
+        platform::LidHealth::DegradedScheme => println!(
+            "  even lid  : degraded (active scheme changed; recorded scheme {} is AC={} DC={})",
+            saved.original_scheme, values.0, values.1
+        ),
+        platform::LidHealth::DegradedValues => println!(
+            "  even lid  : degraded (recorded scheme {} is AC={} DC={})",
+            saved.original_scheme, values.0, values.1
+        ),
     }
     Ok(())
 }
@@ -660,10 +734,10 @@ fn stop_windows() -> Result<()> {
         } => {
             worker.terminate_and_wait(StdDuration::from_secs(6))?;
             if let Some(guardian) = guardian {
-                wait_for_guardian_cleanup(&guardian)?;
-            } else {
-                session::delete_state_file();
+                wait_for_guardian_exit(&guardian, StdDuration::from_secs(15))?;
+                verify_lid_restored(&saved)?;
             }
+            session::delete_state_file()?;
             println!("wake: stopped (pid {}, {})", saved.pid, saved.trigger);
             Ok(())
         }
@@ -697,7 +771,7 @@ fn reconcile_windows(for_stop: bool) -> Result<WindowsState> {
                 guardian: None,
             });
         }
-        session::delete_state_file();
+        session::delete_state_file()?;
         return Ok(WindowsState::None);
     }
 
@@ -710,28 +784,12 @@ fn reconcile_windows(for_stop: bool) -> Result<WindowsState> {
         }),
         (Some(worker), None) => Ok(WindowsState::BrokenGuardian { saved, worker }),
         (None, Some(guardian)) => {
-            let deadline = Instant::now() + StdDuration::from_secs(5);
-            while Instant::now() < deadline {
-                if !session::state_file().exists() {
-                    return Ok(WindowsState::None);
-                }
-                if !guardian.is_running()? {
-                    break;
-                }
-                std::thread::sleep(StdDuration::from_millis(100));
-            }
-            if guardian.is_running()? {
-                return Err(AppError::fail(format!(
-                    "worker exited, but guardian {} did not finish cleanup; recovery state retained at {}",
-                    saved.guardian_pid,
-                    session::state_file().display()
-                )));
-            }
-            recover_even_lid_windows(&saved)?;
+            wait_for_guardian_exit(&guardian, StdDuration::from_secs(15))?;
+            finish_or_recover_lid(&saved)?;
             Ok(WindowsState::None)
         }
         (None, None) => {
-            recover_even_lid_windows(&saved)?;
+            finish_or_recover_lid(&saved)?;
             Ok(WindowsState::None)
         }
     }
@@ -770,86 +828,63 @@ fn exact_guardian(saved: &Session) -> Result<Option<sysutil::ProcessHandle>> {
 }
 
 #[cfg(windows)]
+fn finish_or_recover_lid(saved: &Session) -> Result<()> {
+    if lid_restored(saved)? {
+        return session::delete_state_file();
+    }
+    recover_even_lid_windows(saved)
+}
+
+#[cfg(windows)]
 fn recover_even_lid_windows(saved: &Session) -> Result<()> {
-    let request = session::GuardianRequest {
-        mode: session::GuardianMode::Recover,
-        session: saved.clone(),
-        expected_state: Some(session::read_state_bytes()?),
-    };
-    let paths = session::write_guardian_request(&request)?;
-    let guardian = match sysutil::spawn_elevated_guardian(&paths.request) {
-        Ok(guardian) => guardian,
-        Err(error) => {
-            session::remove_guardian_artifacts(&paths);
-            return Err(error);
-        }
-    };
-    let result = wait_for_guardian_marker(&guardian, &paths, StdDuration::from_secs(30));
-    if result.is_ok() || guardian.wait(StdDuration::from_secs(2)).unwrap_or(false) {
-        session::remove_guardian_artifacts(&paths);
-    }
-    result?;
-    if session::state_file().exists() {
-        return Err(AppError::fail(format!(
-            "elevated recovery reported success but state remains at {}",
-            session::state_file().display()
-        )));
-    }
-    eprintln!(
-        "wake: recovered a crashed even-lid session and restored its exact power-scheme values"
-    );
+    let state_path = session::state_file();
+    let guardian = sysutil::spawn_elevated_guardian(
+        saved.pid,
+        saved.process_start,
+        &saved.original_scheme,
+        saved.original_ac,
+        saved.original_dc,
+        &state_path,
+    )?;
+    let mut authorized = saved.clone();
+    authorized.guardian_pid = guardian.pid();
+    authorized.guardian_start = guardian.identity().start;
+    session::write(&authorized)?;
+    wait_for_guardian_exit(&guardian, StdDuration::from_secs(30))?;
+    verify_lid_restored(&authorized)?;
+    session::delete_state_file()?;
+    eprintln!("wake: recovered the recorded lid values");
     Ok(())
 }
 
 #[cfg(windows)]
-fn wait_for_guardian_marker(
-    guardian: &sysutil::ProcessHandle,
-    paths: &session::GuardianPaths,
-    timeout: StdDuration,
-) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if paths.error.exists() {
-            let message = std::fs::read_to_string(&paths.error).map_err(|error| {
-                AppError::fail(format!("could not read guardian error: {error}"))
-            })?;
-            return Err(AppError::fail(message.trim().to_string()));
-        }
-        if paths.ready.exists() {
-            return Ok(());
-        }
-        if !guardian.is_running()? {
-            return Err(AppError::fail(
-                "elevated guardian exited without a readiness or error marker; recovery state was retained if any power write occurred",
-            ));
-        }
-        std::thread::sleep(StdDuration::from_millis(100));
+fn wait_for_guardian_exit(guardian: &sysutil::ProcessHandle, timeout: StdDuration) -> Result<()> {
+    if guardian.wait(timeout)? {
+        Ok(())
+    } else {
+        Err(AppError::fail(format!(
+            "guardian {} did not exit; it was not terminated and state remains at {}",
+            guardian.pid(),
+            session::state_file().display()
+        )))
     }
-    Err(AppError::fail(format!(
-        "timed out waiting for elevated guardian {}; it was not terminated and recovery state was retained",
-        guardian.pid()
-    )))
 }
 
 #[cfg(windows)]
-fn wait_for_guardian_cleanup(guardian: &sysutil::ProcessHandle) -> Result<()> {
-    let deadline = Instant::now() + StdDuration::from_secs(15);
-    while Instant::now() < deadline {
-        if !session::state_file().exists() {
-            return Ok(());
-        }
-        if !guardian.is_running()? {
-            break;
-        }
-        std::thread::sleep(StdDuration::from_millis(100));
-    }
-    if session::state_file().exists() {
+fn lid_restored(saved: &Session) -> Result<bool> {
+    let scheme = platform::parse_guid(&saved.original_scheme)?;
+    Ok(platform::read_lid_values(&scheme)? == (saved.original_ac, saved.original_dc))
+}
+
+#[cfg(windows)]
+fn verify_lid_restored(saved: &Session) -> Result<()> {
+    if lid_restored(saved)? {
+        Ok(())
+    } else {
         Err(AppError::fail(format!(
-            "guardian cleanup did not verify restoration; state retained at {}; never terminate the guardian, and run 'wake stop' again after it exits",
+            "lid restoration did not verify; state retained at {}",
             session::state_file().display()
         )))
-    } else {
-        Ok(())
     }
 }
 
@@ -914,7 +949,7 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
         }
         Err(e) => {
             if restore_disable_sleep_best_effort(prior) {
-                session::delete_state_file();
+                session::delete_state_file()?;
             }
             Err(e)
         }
@@ -1096,7 +1131,7 @@ pub fn recover_stale_lid_session_unlocked() -> Result<()> {
         }
         recover_crashed_even_lid_unix(&saved)?;
     }
-    session::delete_state_file();
+    session::delete_state_file()?;
     Ok(())
 }
 
@@ -1138,7 +1173,7 @@ fn recover_malformed_lid_session_unlocked(m: &session::MalformedState) -> Result
             session::state_file().display()
         )));
     }
-    session::delete_state_file();
+    session::delete_state_file()?;
     Ok(())
 }
 
@@ -1232,5 +1267,19 @@ mod tests {
         .unwrap();
         assert_eq!(target.date_naive(), tomorrow);
         assert_eq!(target.offset().local_minus_utc(), -4 * 3600);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scheme_switch_prevents_startup_readiness() {
+        assert!(lid_override_ready(true, platform::LidHealth::Healthy));
+        assert!(!lid_override_ready(
+            true,
+            platform::LidHealth::DegradedScheme
+        ));
+        assert!(!lid_override_ready(
+            true,
+            platform::LidHealth::DegradedValues
+        ));
     }
 }

@@ -72,7 +72,7 @@ try {
   Assert-Contains (Assert-Failure @('status', 'extra') -ExpectedCode 2).Output 'does not accept arguments'
   Assert-Contains (Assert-Failure @('--bogus') -ExpectedCode 2).Output 'unknown flag'
   Assert-Contains (Assert-Failure @('__worker_windows__') -ExpectedCode 1).Output 'expects exactly'
-  Assert-Contains (Assert-Failure @('__guard_windows__') -ExpectedCode 1).Output 'expects one absolute'
+  Assert-Contains (Assert-Failure @('__guard_windows__') -ExpectedCode 1).Output 'expects six immutable'
   Assert-Contains (Assert-Failure @('--until-charge', '101') -ExpectedCode 2).Output 'must be 1-100'
 
   # Prove the lifecycle does not need powershell.exe on PATH. The state directory also contains spaces.
@@ -119,6 +119,18 @@ try {
   if ($before -ne $after) { throw 'malformed state bytes changed during reconciliation' }
   Remove-Item -Force $statePath -Confirm:$false
   Write-Host 'ok   : malformed recovery state retained byte-for-byte'
+
+  # Relative overrides resolve once to the absolute foreground working directory.
+  $absoluteStateDir = $env:WAKE_STATE_DIR
+  $relativeStateDir = 'wake-relative-' + [guid]::NewGuid().ToString('N')
+  $env:WAKE_STATE_DIR = $relativeStateDir
+  Assert-Contains (Assert-Success @('1s')) 'session active'
+  $relativeStatePath = Join-Path (Join-Path (Get-Location) $relativeStateDir) 'session.properties'
+  if (-not (Test-Path $relativeStatePath)) { throw 'relative state directory was not resolved from the foreground directory' }
+  Wait-NoSession
+  Remove-Item -Recurse -Force $relativeStateDir -Confirm:$false
+  $env:WAKE_STATE_DIR = $absoluteStateDir
+  Write-Host 'ok   : relative WAKE_STATE_DIR resolved consistently'
 
   $v = wake --version
   if ($v -notmatch '^wake ') { throw "release binary does not resolve as 'wake' on PATH: $v" }

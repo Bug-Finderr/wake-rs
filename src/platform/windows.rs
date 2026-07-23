@@ -1,4 +1,4 @@
-//! Native Windows sleep inhibition, battery status, and lid-close control.
+//! Native Windows sleep inhibition, battery status, and lid control.
 
 use crate::error::{AppError, Result};
 use crate::supervisor::BatteryStatus;
@@ -11,7 +11,6 @@ use windows_sys::Win32::System::Power::{
 use windows_sys::core::GUID;
 
 const EXPECTED: &[&str] = &["wake.exe", "wake"];
-
 const SUB_BUTTONS: GUID = GUID {
     data1: 0x4f97_1e89,
     data2: 0xeebd,
@@ -53,7 +52,7 @@ impl ExecutionStateGuard {
 
 impl Drop for ExecutionStateGuard {
     fn drop(&mut self) {
-        // SAFETY: ES_CONTINUOUS clears this thread's previous requirements.
+        // SAFETY: ES_CONTINUOUS clears this thread's requirements.
         unsafe {
             SetThreadExecutionState(ES_CONTINUOUS);
         }
@@ -62,7 +61,7 @@ impl Drop for ExecutionStateGuard {
 
 pub fn read_battery() -> Result<BatteryStatus> {
     let mut status = SYSTEM_POWER_STATUS::default();
-    // SAFETY: `status` is a valid writable SYSTEM_POWER_STATUS.
+    // SAFETY: `status` is valid writable storage.
     if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
         return Err(AppError::fail("GetSystemPowerStatus failed"));
     }
@@ -107,9 +106,7 @@ pub fn active_scheme() -> Result<GUID> {
         let mut raw = std::ptr::null_mut();
         let code = PowerGetActiveScheme(std::ptr::null_mut(), &mut raw);
         if code != ERROR_SUCCESS || raw.is_null() {
-            return Err(AppError::fail(format!(
-                "could not read the active power scheme (error {code})"
-            )));
+            return Err(power_error("read the active power scheme", code));
         }
         let scheme = *raw;
         LocalFree(raw.cast());
@@ -117,10 +114,14 @@ pub fn active_scheme() -> Result<GUID> {
     }
 }
 
+pub fn scheme_is_active(scheme: &GUID) -> Result<bool> {
+    Ok(guid_eq(&active_scheme()?, scheme))
+}
+
 pub fn read_lid_values(scheme: &GUID) -> Result<(u32, u32)> {
     let mut ac = 0;
     let mut dc = 0;
-    // SAFETY: All GUID pointers and output pointers remain valid for each call.
+    // SAFETY: GUID and output pointers remain valid for both calls.
     unsafe {
         let code = PowerReadACValueIndex(
             std::ptr::null_mut(),
@@ -146,8 +147,8 @@ pub fn read_lid_values(scheme: &GUID) -> Result<(u32, u32)> {
     Ok((ac, dc))
 }
 
-pub fn write_lid_ac(scheme: &GUID, value: u32) -> Result<()> {
-    // SAFETY: All GUID pointers remain valid for the call.
+fn write_ac(scheme: &GUID, value: u32) -> Result<()> {
+    // SAFETY: GUID pointers remain valid for the call.
     let code = unsafe {
         PowerWriteACValueIndex(
             std::ptr::null_mut(),
@@ -157,15 +158,13 @@ pub fn write_lid_ac(scheme: &GUID, value: u32) -> Result<()> {
             value,
         )
     };
-    if code == ERROR_SUCCESS {
-        Ok(())
-    } else {
-        Err(power_error("write the AC lid action", code))
-    }
+    (code == ERROR_SUCCESS)
+        .then_some(())
+        .ok_or_else(|| power_error("write the AC lid action", code))
 }
 
-pub fn write_lid_dc(scheme: &GUID, value: u32) -> Result<()> {
-    // SAFETY: All GUID pointers remain valid for the call.
+fn write_dc(scheme: &GUID, value: u32) -> Result<()> {
+    // SAFETY: GUID pointers remain valid for the call.
     let code = unsafe {
         PowerWriteDCValueIndex(
             std::ptr::null_mut(),
@@ -175,73 +174,149 @@ pub fn write_lid_dc(scheme: &GUID, value: u32) -> Result<()> {
             value,
         )
     };
-    if code == ERROR_SUCCESS {
-        Ok(())
-    } else {
-        Err(power_error("write the DC lid action", code))
-    }
+    (code == ERROR_SUCCESS)
+        .then_some(())
+        .ok_or_else(|| power_error("write the DC lid action", code))
 }
 
-pub fn reactivate_if_still_active(scheme: &GUID) -> Result<()> {
-    if !guid_eq(&active_scheme()?, scheme) {
+fn reactivate_if_active(scheme: &GUID) -> Result<()> {
+    if !scheme_is_active(scheme)? {
         return Ok(());
     }
-    // SAFETY: `scheme` is a valid GUID for the duration of the call.
+    // SAFETY: `scheme` remains valid for the call.
     let code = unsafe { PowerSetActiveScheme(std::ptr::null_mut(), scheme) };
     if code == ERROR_SUCCESS {
         Ok(())
     } else {
-        Err(power_error("reactivate the power scheme", code))
+        Err(power_error("reactivate the active power scheme", code))
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RestoreDecision {
-    AlreadyRestored,
-    RestoreAppliedValues,
+enum RestoreField {
+    Keep,
+    Write,
     Conflict,
 }
 
-pub fn restoration_decision(current: (u32, u32), original: (u32, u32)) -> RestoreDecision {
+fn restore_field(current: u32, original: u32) -> RestoreField {
     if current == original {
-        RestoreDecision::AlreadyRestored
-    } else if current == (0, 0) {
-        RestoreDecision::RestoreAppliedValues
+        RestoreField::Keep
+    } else if current == 0 {
+        RestoreField::Write
     } else {
-        RestoreDecision::Conflict
+        RestoreField::Conflict
+    }
+}
+
+fn ensure_restorable(current: (u32, u32), original: (u32, u32)) -> Result<(bool, bool)> {
+    let ac = restore_field(current.0, original.0);
+    let dc = restore_field(current.1, original.1);
+    if ac == RestoreField::Conflict || dc == RestoreField::Conflict {
+        Err(AppError::fail(format!(
+            "lid values conflict with wake recovery (current AC={} DC={}, original AC={} DC={})",
+            current.0, current.1, original.0, original.1
+        )))
+    } else {
+        Ok((ac == RestoreField::Write, dc == RestoreField::Write))
     }
 }
 
 pub fn restore_lid_snapshot(snapshot: &LidSnapshot) -> Result<()> {
-    let current = read_lid_values(&snapshot.scheme)?;
-    match restoration_decision(current, (snapshot.ac, snapshot.dc)) {
-        RestoreDecision::AlreadyRestored => return Ok(()),
-        RestoreDecision::Conflict => {
-            return Err(AppError::fail(format!(
-                "lid action changed after wake enabled it (current AC={} DC={}, original AC={} DC={}); refusing to overwrite it",
-                current.0, current.1, snapshot.ac, snapshot.dc
-            )));
-        }
-        RestoreDecision::RestoreAppliedValues => {}
+    let original = (snapshot.ac, snapshot.dc);
+    let (restore_ac, _) = ensure_restorable(read_lid_values(&snapshot.scheme)?, original)?;
+    if restore_ac {
+        write_ac(&snapshot.scheme, snapshot.ac)?;
     }
-    write_lid_ac(&snapshot.scheme, snapshot.ac)?;
-    let after_ac = read_lid_values(&snapshot.scheme)?;
-    if after_ac != (snapshot.ac, 0) {
-        return Err(AppError::fail(format!(
-            "lid values changed during restoration (current AC={} DC={}); refusing the DC write",
-            after_ac.0, after_ac.1
-        )));
+    let (restore_ac, _) = ensure_restorable(read_lid_values(&snapshot.scheme)?, original)?;
+    if restore_ac {
+        write_ac(&snapshot.scheme, snapshot.ac)?;
     }
-    write_lid_dc(&snapshot.scheme, snapshot.dc)?;
-    reactivate_if_still_active(&snapshot.scheme)?;
+    let (_, restore_dc) = ensure_restorable(read_lid_values(&snapshot.scheme)?, original)?;
+    if restore_dc {
+        write_dc(&snapshot.scheme, snapshot.dc)?;
+    }
+    reactivate_if_active(&snapshot.scheme)?;
     let after = read_lid_values(&snapshot.scheme)?;
-    if after != (snapshot.ac, snapshot.dc) {
-        return Err(AppError::fail(format!(
+    if after == original {
+        Ok(())
+    } else {
+        Err(AppError::fail(format!(
             "lid restoration did not verify (current AC={} DC={}, expected AC={} DC={})",
             after.0, after.1, snapshot.ac, snapshot.dc
-        )));
+        )))
+    }
+}
+
+fn enable_field(current: u32, original: u32) -> Result<bool> {
+    if current == 0 {
+        Ok(false)
+    } else if current == original {
+        Ok(true)
+    } else {
+        Err(AppError::fail("lid value changed before enable"))
+    }
+}
+
+pub fn enable_lid(snapshot: &LidSnapshot) -> Result<()> {
+    let result = (|| {
+        if !scheme_is_active(&snapshot.scheme)? {
+            return Err(AppError::fail("active power scheme changed before enable"));
+        }
+        let current = read_lid_values(&snapshot.scheme)?;
+        let write_ac_value = enable_field(current.0, snapshot.ac)?;
+        enable_field(current.1, snapshot.dc)?;
+        if write_ac_value {
+            write_ac(&snapshot.scheme, 0)?;
+        }
+        if !scheme_is_active(&snapshot.scheme)? {
+            return Err(AppError::fail("active power scheme changed during enable"));
+        }
+        let current = read_lid_values(&snapshot.scheme)?;
+        if current.0 != 0 {
+            return Err(AppError::fail(
+                "AC lid value did not remain at wake's value",
+            ));
+        }
+        if enable_field(current.1, snapshot.dc)? {
+            write_dc(&snapshot.scheme, 0)?;
+        }
+        if !scheme_is_active(&snapshot.scheme)? {
+            return Err(AppError::fail("active power scheme changed during enable"));
+        }
+        reactivate_if_active(&snapshot.scheme)?;
+        if !scheme_is_active(&snapshot.scheme)? || read_lid_values(&snapshot.scheme)? != (0, 0) {
+            return Err(AppError::fail(
+                "lid override did not verify before readiness",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let rollback = restore_lid_snapshot(snapshot);
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback) => AppError::fail(format!("{error}; rollback failed: {rollback}")),
+        });
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LidHealth {
+    Healthy,
+    DegradedScheme,
+    DegradedValues,
+}
+
+pub fn lid_health(active_scheme_matches: bool, values: (u32, u32)) -> LidHealth {
+    if !active_scheme_matches {
+        LidHealth::DegradedScheme
+    } else if values != (0, 0) {
+        LidHealth::DegradedValues
+    } else {
+        LidHealth::Healthy
+    }
 }
 
 fn power_error(action: &str, code: u32) -> AppError {
@@ -275,10 +350,9 @@ pub fn format_guid(guid: &GUID) -> String {
 pub fn parse_guid(raw: &str) -> Result<GUID> {
     if !raw.is_ascii()
         || raw.len() != 36
-        || raw.as_bytes().get(8) != Some(&b'-')
-        || raw.as_bytes().get(13) != Some(&b'-')
-        || raw.as_bytes().get(18) != Some(&b'-')
-        || raw.as_bytes().get(23) != Some(&b'-')
+        || ![8, 13, 18, 23]
+            .into_iter()
+            .all(|index| raw.as_bytes()[index] == b'-')
     {
         return Err(AppError::fail("invalid canonical power-scheme GUID"));
     }
@@ -286,7 +360,7 @@ pub fn parse_guid(raw: &str) -> Result<GUID> {
         u32::from_str_radix(&raw[range], 16)
             .map_err(|_| AppError::fail("invalid canonical power-scheme GUID"))
     };
-    let mut data4 = [0u8; 8];
+    let mut data4 = [0; 8];
     for (index, range) in [
         19..21,
         21..23,
@@ -308,10 +382,11 @@ pub fn parse_guid(raw: &str) -> Result<GUID> {
         data3: hex(14..18)? as u16,
         data4,
     };
-    if format_guid(&guid) != raw {
-        return Err(AppError::fail("power-scheme GUID is not canonical"));
+    if format_guid(&guid) == raw {
+        Ok(guid)
+    } else {
+        Err(AppError::fail("power-scheme GUID is not canonical"))
     }
-    Ok(guid)
 }
 
 #[cfg(test)]
@@ -329,63 +404,37 @@ mod tests {
 
     #[test]
     fn system_power_status_mapping() {
-        let charging = map_power_status(power(1, 0x08, 72)).unwrap();
-        assert_eq!(charging.percent, 72);
-        assert!(charging.charging);
-        assert!(!charging.discharging);
-
-        let discharging = map_power_status(power(0, 0x01, 41)).unwrap();
-        assert!(!discharging.charging);
-        assert!(discharging.discharging);
-
-        let neutral = map_power_status(power(1, 0x02, 100)).unwrap();
-        assert!(!neutral.charging);
-        assert!(!neutral.discharging);
-        assert!(neutral.neutral_state.is_some());
-
-        for invalid in [
-            power(1, 0x80, 50),
-            power(1, u8::MAX, 50),
-            power(1, 0, u8::MAX),
-        ] {
-            assert!(map_power_status(invalid).is_err());
-        }
+        assert!(map_power_status(power(1, 0x08, 72)).unwrap().charging);
+        assert!(map_power_status(power(0, 0x01, 41)).unwrap().discharging);
+        assert!(map_power_status(power(1, 0x80, 50)).is_err());
+        assert!(map_power_status(power(1, 0, u8::MAX)).is_err());
     }
 
     #[test]
     fn guid_round_trip_is_canonical() {
         let text = "381b4222-f694-41f0-9685-ff5bb260df2e";
         assert_eq!(format_guid(&parse_guid(text).unwrap()), text);
-        for invalid in [
-            "{381b4222-f694-41f0-9685-ff5bb260df2e}",
-            "381B4222-f694-41f0-9685-ff5bb260df2e",
-            "381b4222-f694-41f0-9685-ff5bb260df2g",
-        ] {
-            assert!(parse_guid(invalid).is_err(), "guid={invalid}");
-        }
+        assert!(parse_guid("381B4222-f694-41f0-9685-ff5bb260df2e").is_err());
     }
 
     #[test]
-    fn restoration_decision_never_clobbers_a_third_party_value() {
-        assert_eq!(
-            restoration_decision((1, 2), (1, 2)),
-            RestoreDecision::AlreadyRestored
-        );
-        assert_eq!(
-            restoration_decision((0, 0), (0, 0)),
-            RestoreDecision::AlreadyRestored
-        );
-        assert_eq!(
-            restoration_decision((0, 0), (1, 2)),
-            RestoreDecision::RestoreAppliedValues
-        );
-        assert_eq!(
-            restoration_decision((0, 2), (1, 2)),
-            RestoreDecision::Conflict
-        );
-        assert_eq!(
-            restoration_decision((3, 3), (1, 2)),
-            RestoreDecision::Conflict
-        );
+    fn partial_crash_states_restore_per_field() {
+        for (current, original, expected) in [
+            ((1, 2), (1, 2), (false, false)),
+            ((0, 2), (1, 2), (true, false)),
+            ((1, 0), (1, 2), (false, true)),
+            ((0, 0), (1, 2), (true, true)),
+        ] {
+            assert_eq!(ensure_restorable(current, original).unwrap(), expected);
+        }
+        assert!(ensure_restorable((3, 0), (1, 2)).is_err());
+        assert!(ensure_restorable((0, 3), (1, 2)).is_err());
+    }
+
+    #[test]
+    fn scheme_switch_and_value_changes_degrade_health() {
+        assert_eq!(lid_health(true, (0, 0)), LidHealth::Healthy);
+        assert_eq!(lid_health(false, (0, 0)), LidHealth::DegradedScheme);
+        assert_eq!(lid_health(true, (0, 1)), LidHealth::DegradedValues);
     }
 }

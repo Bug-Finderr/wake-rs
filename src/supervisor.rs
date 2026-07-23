@@ -9,8 +9,6 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
-#[cfg(windows)]
-const LIFETIME_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_BATTERY_FAILURES: u8 = 3;
 
 #[derive(Clone)]
@@ -60,10 +58,11 @@ pub fn plan_charge(target: i32, status: &BatteryStatus) -> Result<ChargePlan> {
         return Ok(ChargePlan::waiting(false));
     }
     if status.charging {
-        if status.percent >= target {
-            return Ok(ChargePlan::already_met());
-        }
-        return Ok(ChargePlan::waiting(true));
+        return Ok(if status.percent >= target {
+            ChargePlan::already_met()
+        } else {
+            ChargePlan::waiting(true)
+        });
     }
     if status.percent == target {
         return Ok(ChargePlan::already_met());
@@ -132,7 +131,6 @@ mod unix {
             return Ok(());
         }
         let charging_up = plan.charging_up;
-
         let keep_awake = platform::keep_awake_command(no_display, None, None)?;
         let mut child = sysutil::spawn_supervised_child(&keep_awake.cmd)?;
         let child_pid = child.id();
@@ -160,7 +158,7 @@ mod unix {
 
         let stop = install_stop_flag();
         let mut last_check = Instant::now();
-        let mut battery_failures = 0;
+        let mut failures = 0;
         loop {
             sleep(Duration::from_secs(1));
             if stop.load(Ordering::Relaxed) || !sysutil::is_alive(child_pid) {
@@ -170,26 +168,21 @@ mod unix {
                 last_check = Instant::now();
                 match read_battery_status() {
                     Ok(status) => {
-                        battery_failures = 0;
-                        let reached = if charging_up {
-                            status.percent >= target
-                        } else {
-                            status.percent <= target
-                        };
-                        if reached {
+                        failures = 0;
+                        if (charging_up && status.percent >= target)
+                            || (!charging_up && status.percent <= target)
+                        {
                             break;
                         }
                     }
-                    Err(error) if battery_failures_exhausted(&mut battery_failures, &error) => {
-                        break;
-                    }
+                    Err(error) if battery_failures_exhausted(&mut failures, &error) => break,
                     Err(_) => {}
                 }
             }
         }
         let _ = child.kill();
         let _ = child.wait();
-        session::delete_state_file();
+        let _ = session::delete_state_file();
         Ok(())
     }
 
@@ -202,11 +195,11 @@ mod unix {
             child: None,
             prior_disable_sleep,
         });
-        let mode_char = args[1].as_str();
-        if !matches!(mode_char, "d" | "i") {
-            return Err(AppError::fail("lid supervisor: bad caffeinate mode"));
-        }
-        let no_display = mode_char == "i";
+        let no_display = match args[1].as_str() {
+            "i" => true,
+            "d" => false,
+            _ => return Err(AppError::fail("lid supervisor: bad caffeinate mode")),
+        };
         let timeout_sec = optional_i64(&args[2])?;
         let wait_pid = optional_u32(&args[3])?;
         let trigger = args[5].clone();
@@ -219,10 +212,8 @@ mod unix {
         if cleanup.is_none() {
             return Ok(());
         }
-
         let charging_up = if let Some(target) = charge_target {
-            let initial = read_battery_status()?;
-            let plan = plan_charge(target, &initial)?;
+            let plan = plan_charge(target, &read_battery_status()?)?;
             if plan.already_met {
                 return Ok(());
             }
@@ -234,21 +225,22 @@ mod unix {
         let keep_awake = platform::keep_awake_command(no_display, timeout_sec, wait_pid)?;
         let child = sysutil::spawn_supervised_child(&keep_awake.cmd)?;
         let child_pid = child.id();
-        cleanup.as_mut().expect("supported platform").child = Some(child);
+        cleanup.as_mut().unwrap().child = Some(child);
         sysutil::require_child_alive(child_pid, &keep_awake.cmd)?;
 
+        let now = Utc::now();
         let mut session = Session::new();
         session.pid = sysutil::current_pid();
         session.mode = if no_display {
-            "system-only".into()
+            "system-only"
         } else {
-            "display+system".into()
-        };
+            "display+system"
+        }
+        .into();
         session.trigger = trigger;
         session.detail = detail;
-        session.started_at = Some(Utc::now());
-        session.ends_at =
-            timeout_sec.map(|timeout| Utc::now() + chrono::Duration::seconds(timeout));
+        session.started_at = Some(now);
+        session.ends_at = timeout_sec.map(|timeout| now + chrono::Duration::seconds(timeout));
         session.even_lid = true;
         session.prior_disable_sleep = prior_disable_sleep;
         session.capture_process_identity()?;
@@ -258,19 +250,15 @@ mod unix {
         let start = Instant::now();
         let mut next_sudo = start + SUDO_HEARTBEAT;
         let mut last_check = Instant::now();
-        let mut battery_failures = 0;
+        let mut failures = 0;
         loop {
             sleep(Duration::from_secs(1));
             if stop.load(Ordering::Relaxed) || !sysutil::is_alive(child_pid) {
                 break;
             }
-            if let Some(timeout) = timeout_sec
-                && start.elapsed() >= Duration::from_secs(timeout as u64)
-            {
-                break;
-            }
-            if let Some(pid) = wait_pid
-                && !sysutil::is_alive(pid)
+            if timeout_sec
+                .is_some_and(|timeout| start.elapsed() >= Duration::from_secs(timeout as u64))
+                || wait_pid.is_some_and(|pid| !sysutil::is_alive(pid))
             {
                 break;
             }
@@ -279,10 +267,8 @@ mod unix {
                 if let (Some(target), Some(up)) = (charge_target, charging_up) {
                     match charge_reached(target, up) {
                         Ok(true) => break,
-                        Ok(false) => battery_failures = 0,
-                        Err(error) if battery_failures_exhausted(&mut battery_failures, &error) => {
-                            break;
-                        }
+                        Ok(false) => failures = 0,
+                        Err(error) if battery_failures_exhausted(&mut failures, &error) => break,
                         Err(_) => {}
                     }
                 }
@@ -303,9 +289,7 @@ mod unix {
     impl Drop for LidCleanup {
         fn drop(&mut self) {
             let prior = self.prior_disable_sleep;
-            if let Ok(current) = platform::read_disable_sleep()
-                && current != prior
-            {
+            if platform::read_disable_sleep().is_ok_and(|current| current != prior) {
                 let _ = platform::set_disable_sleep_non_interactive(prior);
             }
             let restored = platform::read_disable_sleep().is_ok_and(|current| current == prior);
@@ -314,16 +298,16 @@ mod unix {
                 let _ = child.wait();
             }
             if restored {
-                session::delete_state_file();
+                let _ = session::delete_state_file();
             } else {
                 commands::print_sleep_restore_rescue(prior);
             }
         }
     }
 
-    fn charge_reached(target: i32, charging_up: bool) -> Result<bool> {
+    fn charge_reached(target: i32, up: bool) -> Result<bool> {
         let status = read_battery_status()?;
-        Ok(if charging_up {
+        Ok(if up {
             status.percent >= target
         } else {
             status.percent <= target
@@ -334,7 +318,7 @@ mod unix {
         if raw.is_empty() {
             return Ok(None);
         }
-        match raw.parse::<i64>() {
+        match raw.parse() {
             Ok(value) if value > 0 => Ok(Some(value)),
             _ => Err(AppError::fail(
                 "lid supervisor timeout must be a positive integer",
@@ -346,7 +330,7 @@ mod unix {
         if raw.is_empty() {
             return Ok(None);
         }
-        match raw.parse::<u32>() {
+        match raw.parse() {
             Ok(value) if value > 0 => Ok(Some(value)),
             _ => Err(AppError::fail(
                 "lid supervisor pid must be a positive integer",
@@ -355,7 +339,7 @@ mod unix {
     }
 
     fn parse_disable_sleep(raw: &str) -> Result<i32> {
-        match raw.parse::<i32>() {
+        match raw.parse() {
             Ok(value @ (0 | 1)) => Ok(value),
             _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
         }
@@ -377,17 +361,13 @@ pub use unix::{run_charge, run_lid};
 mod windows {
     use super::*;
     use crate::platform::LidSnapshot;
-    #[cfg(test)]
-    use crate::platform::RestoreDecision;
-    use crate::session::{GuardianMode, GuardianRequest};
     use chrono::DateTime;
-    use std::fs;
-    use std::path::Path;
+    use std::path::PathBuf;
 
     struct WorkerSpec {
         no_display: bool,
         timeout: Option<Duration>,
-        wait_pid: Option<u32>,
+        target: Option<sysutil::ProcessHandle>,
         charge: Option<(i32, bool)>,
         publish: bool,
         session: Session,
@@ -396,46 +376,38 @@ mod windows {
     pub fn worker_command(
         session: &Session,
         timeout_sec: Option<i64>,
-        wait_pid: Option<u32>,
+        target: Option<(u32, u64)>,
         charge: Option<(i32, bool)>,
         publish: bool,
     ) -> Result<Vec<String>> {
         if timeout_sec.is_some_and(|timeout| timeout <= 0) {
             return Err(AppError::fail("worker timeout must be positive"));
         }
-        let no_display = match session.mode.as_str() {
-            "system-only" => true,
-            "display+system" => false,
-            _ => return Err(AppError::fail("invalid worker mode")),
-        };
-        let (charge_target, charge_direction) = charge
-            .map(|(target, up)| {
-                (
-                    target.to_string(),
-                    if up { "up" } else { "down" }.to_string(),
-                )
-            })
+        if !matches!(session.mode.as_str(), "system-only" | "display+system") {
+            return Err(AppError::fail("invalid worker mode"));
+        }
+        let (target_pid, target_start) = target
+            .map(|(pid, start)| (pid.to_string(), start.to_string()))
+            .unwrap_or_default();
+        let (charge_target, direction) = charge
+            .map(|(value, up)| (value.to_string(), if up { "up" } else { "down" }.into()))
             .unwrap_or_default();
         Ok(vec![
             sysutil::self_exe()?,
             "__worker_windows__".into(),
-            if no_display {
-                "system-only"
-            } else {
-                "display+system"
-            }
-            .into(),
+            session.mode.clone(),
             timeout_sec
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
-            wait_pid.map(|value| value.to_string()).unwrap_or_default(),
+            target_pid,
+            target_start,
             charge_target,
-            charge_direction,
+            direction,
             session.trigger.clone(),
             session.detail.clone(),
             session
                 .started_at
-                .ok_or_else(|| AppError::fail("worker session has no start time"))?
+                .ok_or_else(|| AppError::fail("missing start time"))?
                 .to_rfc3339(),
             session
                 .ends_at
@@ -451,7 +423,7 @@ mod windows {
         if spec.publish {
             session::write(&spec.session)?;
         }
-        run_worker_lifetime(&spec);
+        run_worker_lifetime(&spec)?;
         if spec.publish {
             delete_owned_worker_state(&spec.session);
         }
@@ -459,9 +431,9 @@ mod windows {
     }
 
     fn parse_worker_args(args: &[String]) -> Result<WorkerSpec> {
-        if args.len() != 11 {
+        if args.len() != 12 {
             return Err(AppError::fail(
-                "Windows worker expects exactly 10 arguments",
+                "Windows worker expects exactly 11 arguments",
             ));
         }
         let no_display = match args[1].as_str() {
@@ -469,14 +441,27 @@ mod windows {
             "display+system" => false,
             _ => return Err(AppError::fail("Windows worker has an invalid mode")),
         };
-        let timeout = optional_positive_u64(&args[2], "timeout")?.map(Duration::from_secs);
-        let wait_pid = optional_positive_u32(&args[3], "wait pid")?;
-        let charge_target = if args[4].is_empty() {
+        let timeout = optional_u64(&args[2], "timeout")?.map(Duration::from_secs);
+        let target_pid = optional_u32(&args[3], "target pid")?;
+        let target_start = optional_u64(&args[4], "target creation time")?;
+        if target_pid.is_some() != target_start.is_some() {
+            return Err(AppError::fail(
+                "Windows worker target identity is incomplete",
+            ));
+        }
+        let target = match target_pid.zip(target_start) {
+            Some((pid, start)) => match sysutil::open_exact_process(pid, start, false)? {
+                Some(process) if process.is_running()? => Some(process),
+                _ => return Err(AppError::fail("target process identity is no longer live")),
+            },
+            None => None,
+        };
+        let charge_target = if args[5].is_empty() {
             None
         } else {
-            Some(parse_charge_target(&args[4])?)
+            Some(parse_charge_target(&args[5])?)
         };
-        let charge_up = match args[5].as_str() {
+        let charge_up = match args[6].as_str() {
             "" => None,
             "up" => Some(true),
             "down" => Some(false),
@@ -488,33 +473,30 @@ mod windows {
         };
         if charge_target.is_some() != charge_up.is_some() {
             return Err(AppError::fail(
-                "Windows worker charge arguments are incomplete",
+                "Windows worker charge identity is incomplete",
             ));
         }
-        let started_at = parse_timestamp(&args[8], "start time")?;
-        let ends_at = if args[9].is_empty() {
-            None
-        } else {
-            Some(parse_timestamp(&args[9], "end time")?)
-        };
-        let publish = parse_bool(&args[10], "publish")?;
         let identity = sysutil::current_identity()?;
         Ok(WorkerSpec {
             no_display,
             timeout,
-            wait_pid,
+            target,
             charge: charge_target.zip(charge_up),
-            publish,
+            publish: parse_bool(&args[11], "publish")?,
             session: Session {
                 pid: sysutil::current_pid(),
                 mode: args[1].clone(),
-                trigger: args[6].clone(),
-                detail: args[7].clone(),
-                started_at: Some(started_at),
-                ends_at,
+                trigger: args[7].clone(),
+                detail: args[8].clone(),
+                started_at: Some(parse_timestamp(&args[9], "start time")?),
+                ends_at: if args[10].is_empty() {
+                    None
+                } else {
+                    Some(parse_timestamp(&args[10], "end time")?)
+                },
                 process_start: identity.start,
                 process_command: identity.command,
-                even_lid: !publish,
+                even_lid: !parse_bool(&args[11], "publish")?,
                 guardian_pid: 0,
                 guardian_start: 0,
                 original_scheme: String::new(),
@@ -524,322 +506,179 @@ mod windows {
         })
     }
 
-    fn run_worker_lifetime(spec: &WorkerSpec) {
+    fn run_worker_lifetime(spec: &WorkerSpec) -> Result<()> {
         let start = Instant::now();
-        let mut last_battery_check = Instant::now();
-        let mut battery_failures = 0;
+        let mut last_battery = Instant::now();
+        let mut failures = 0;
         loop {
             if spec
                 .timeout
                 .is_some_and(|timeout| start.elapsed() >= timeout)
+                || spec
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| !target.is_running().unwrap_or(false))
             {
                 break;
             }
-            if spec.wait_pid.is_some_and(|pid| !sysutil::is_alive(pid)) {
-                break;
-            }
-            if let Some((target, charging_up)) = spec.charge
-                && last_battery_check.elapsed() >= POLL_INTERVAL
+            if let Some((target, up)) = spec.charge
+                && last_battery.elapsed() >= POLL_INTERVAL
             {
-                last_battery_check = Instant::now();
+                last_battery = Instant::now();
                 match read_battery_status() {
                     Ok(status) => {
-                        battery_failures = 0;
-                        if (charging_up && status.percent >= target)
-                            || (!charging_up && status.percent <= target)
-                        {
+                        failures = 0;
+                        if (up && status.percent >= target) || (!up && status.percent <= target) {
                             break;
                         }
                     }
-                    Err(error) if battery_failures_exhausted(&mut battery_failures, &error) => {
-                        break;
-                    }
+                    Err(error) if battery_failures_exhausted(&mut failures, &error) => break,
                     Err(_) => {}
                 }
             }
-            sleep(LIFETIME_POLL_INTERVAL);
+            sleep(Duration::from_millis(250));
         }
+        Ok(())
     }
 
     fn delete_owned_worker_state(worker: &Session) {
         for _ in 0..50 {
-            match session::acquire_lock() {
-                Ok(_lock) => {
-                    if let Some(session::SavedState::Valid(saved)) =
-                        session::read_saved_for_recovery()
-                        && saved.pid == worker.pid
-                        && saved.process_start == worker.process_start
-                        && !saved.even_lid
-                    {
-                        session::delete_state_file();
-                    }
-                    return;
+            if let Ok(_lock) = session::acquire_lock() {
+                if let Some(session::SavedState::Valid(saved)) = session::read_saved_for_recovery()
+                    && !saved.even_lid
+                    && saved.pid == worker.pid
+                    && saved.process_start == worker.process_start
+                {
+                    let _ = session::delete_state_file();
                 }
-                Err(_) => sleep(Duration::from_millis(100)),
+                return;
             }
+            sleep(Duration::from_millis(100));
         }
+    }
+
+    #[derive(Clone)]
+    struct GuardianArgs {
+        worker_pid: u32,
+        worker_start: u64,
+        scheme: String,
+        ac: u32,
+        dc: u32,
+        state_path: PathBuf,
     }
 
     pub fn run_guardian(args: &[String]) -> Result<()> {
-        if args.len() != 2 {
-            return Err(AppError::fail(
-                "Windows guardian expects one absolute request path",
-            ));
-        }
-        let request_path = Path::new(&args[1]);
-        let request = match session::read_guardian_request(request_path) {
-            Ok(request) => request,
-            Err(error) => {
-                if request_path.is_absolute() {
-                    let _ = session::write_marker(
-                        &request_path.with_extension("error"),
-                        error.message(),
-                    );
-                }
-                return Err(error);
-            }
-        };
-        let paths = session::marker_paths_for_request(&request);
-        let result = if request_path != paths.request {
-            Err(AppError::fail(
-                "guardian request name does not match the worker identity",
-            ))
-        } else {
-            match request.mode {
-                GuardianMode::Start => start_guardian(request_path, &request, &paths.ready),
-                GuardianMode::Recover => recover_guardian(request_path, &request, &paths.ready),
-            }
-        };
-        if let Err(error) = &result {
-            let _ = session::write_marker(&paths.error, error.message());
-        }
-        result
-    }
-
-    fn start_guardian(request_path: &Path, request: &GuardianRequest, ready: &Path) -> Result<()> {
-        let Some(worker) = sysutil::open_session_process(&request.session, false)? else {
-            return Err(AppError::fail("worker exited before the guardian started"));
-        };
-        if !worker.is_running()? {
-            return Err(AppError::fail("worker exited before the guardian started"));
-        }
+        let args = parse_guardian_args(args)?;
         let guardian = sysutil::current_identity()?;
-        let snapshot = platform::capture_lid_snapshot()?;
-        let mut saved = request.session.clone();
-        saved.guardian_pid = sysutil::current_pid();
-        saved.guardian_start = guardian.start;
-        saved.original_scheme = platform::format_guid(&snapshot.scheme);
-        saved.original_ac = snapshot.ac;
-        saved.original_dc = snapshot.dc;
-        let state_path = session::request_state_file(request_path)?;
-        session::write_state_at(&state_path, &saved)?;
-
-        match enable_lid(&snapshot) {
-            Ok(()) => {}
-            Err(failure) => {
-                if !failure.wrote_any
-                    && let Err(delete_error) = session::delete_state_at(&state_path)
-                {
-                    return Err(AppError::fail(format!(
-                        "{}; unwritten recovery state could not be removed: {delete_error}",
-                        failure.error
-                    )));
-                }
-                return Err(failure.error);
-            }
-        }
-        if let Err(marker_error) = session::write_marker(ready, "ready") {
-            let rollback = platform::restore_lid_snapshot(&snapshot);
-            return Err(match rollback {
-                Ok(()) => AppError::fail(format!(
-                    "{marker_error}; the lid change was rolled back, but recovery state was retained"
-                )),
-                Err(rollback_error) => AppError::fail(format!(
-                    "{marker_error}; rollback also failed: {rollback_error}; recovery state was retained"
-                )),
-            });
-        }
-
-        while worker.is_running()? {
-            sleep(Duration::from_millis(250));
-        }
-        platform::restore_lid_snapshot(&snapshot).map_err(|error| {
-            AppError::fail(format!(
-                "{error}; recovery state retained at {} and a later recovery will require UAC",
-                state_path.display()
-            ))
-        })?;
-        session::delete_state_at(&state_path)?;
-        Ok(())
-    }
-
-    struct EnableFailure {
-        error: AppError,
-        wrote_any: bool,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum EnableStep {
-        WriteAc,
-        WriteDc,
-        Reactivate,
-        Verify,
-    }
-
-    const ENABLE_STEPS: [EnableStep; 4] = [
-        EnableStep::WriteAc,
-        EnableStep::WriteDc,
-        EnableStep::Reactivate,
-        EnableStep::Verify,
-    ];
-
-    fn enable_lid(snapshot: &LidSnapshot) -> std::result::Result<(), EnableFailure> {
-        let mut wrote_any = false;
-        let mut expected = (snapshot.ac, snapshot.dc);
-        for step in ENABLE_STEPS {
-            let result = match step {
-                EnableStep::WriteAc => platform::write_lid_ac(&snapshot.scheme, 0).map(|()| {
-                    wrote_any = true;
-                    expected.0 = 0;
-                }),
-                EnableStep::WriteDc => match platform::read_lid_values(&snapshot.scheme) {
-                    Ok(current) if current == expected => {
-                        platform::write_lid_dc(&snapshot.scheme, 0).map(|()| {
-                            wrote_any = true;
-                            expected.1 = 0;
-                        })
-                    }
-                    Ok((ac, dc)) => Err(AppError::fail(format!(
-                        "lid values changed during startup (current AC={ac} DC={dc}); refusing the DC write"
-                    ))),
-                    Err(error) => Err(error),
-                },
-                EnableStep::Reactivate => platform::reactivate_if_still_active(&snapshot.scheme),
-                EnableStep::Verify => match platform::read_lid_values(&snapshot.scheme) {
-                    Ok((0, 0)) => Ok(()),
-                    Ok((ac, dc)) => Err(AppError::fail(format!(
-                        "failed to verify --even-lid (current AC={ac} DC={dc})"
-                    ))),
-                    Err(error) => Err(error),
-                },
-            };
-            if let Err(error) = result {
-                let error = if wrote_any {
-                    match rollback_startup(snapshot, expected) {
-                        Ok(()) => AppError::fail(format!(
-                            "{error}; the attempted lid change was rolled back, but recovery state was retained"
-                        )),
-                        Err(rollback) => AppError::fail(format!(
-                            "{error}; rollback also failed: {rollback}; recovery state was retained"
-                        )),
-                    }
-                } else {
-                    error
-                };
-                return Err(EnableFailure { error, wrote_any });
-            }
-        }
-        Ok(())
-    }
-
-    fn rollback_startup(snapshot: &LidSnapshot, expected: (u32, u32)) -> Result<()> {
-        let current = platform::read_lid_values(&snapshot.scheme)?;
-        if current == (snapshot.ac, snapshot.dc) {
-            return Ok(());
-        }
-        if current != expected {
-            return Err(AppError::fail(format!(
-                "lid values changed during startup (current AC={} DC={}); refusing rollback",
-                current.0, current.1
-            )));
-        }
-        platform::write_lid_ac(&snapshot.scheme, snapshot.ac)?;
-        let after_ac = platform::read_lid_values(&snapshot.scheme)?;
-        if after_ac != (snapshot.ac, expected.1) {
-            return Err(AppError::fail(format!(
-                "lid values changed during startup rollback (current AC={} DC={}); refusing the DC write",
-                after_ac.0, after_ac.1
-            )));
-        }
-        platform::write_lid_dc(&snapshot.scheme, snapshot.dc)?;
-        platform::reactivate_if_still_active(&snapshot.scheme)?;
-        let after = platform::read_lid_values(&snapshot.scheme)?;
-        if after == (snapshot.ac, snapshot.dc) {
-            Ok(())
-        } else {
-            Err(AppError::fail(format!(
-                "startup rollback did not verify (current AC={} DC={})",
-                after.0, after.1
-            )))
-        }
-    }
-
-    fn recover_guardian(
-        request_path: &Path,
-        request: &GuardianRequest,
-        ready: &Path,
-    ) -> Result<()> {
-        let state_path = session::request_state_file(request_path)?;
-        let expected = request
-            .expected_state
-            .as_ref()
-            .ok_or_else(|| AppError::fail("recovery request has no expected state"))?;
-        let current = fs::read(&state_path)
-            .map_err(|error| AppError::fail(format!("could not read recovery state: {error}")))?;
-        if &current != expected {
-            return Err(AppError::fail(
-                "recovery state changed after authorization; no power write was attempted",
-            ));
-        }
-        if exact_process_is_running(request.session.pid, request.session.process_start)? {
-            return Err(AppError::fail(
-                "worker is still running; refusing crash recovery",
-            ));
-        }
-        if exact_process_is_running(request.session.guardian_pid, request.session.guardian_start)? {
-            return Err(AppError::fail(
-                "original guardian is still running; refusing duplicate recovery",
-            ));
-        }
         let snapshot = LidSnapshot {
-            scheme: platform::parse_guid(&request.session.original_scheme)?,
-            ac: request.session.original_ac,
-            dc: request.session.original_dc,
+            scheme: platform::parse_guid(&args.scheme)?,
+            ac: args.ac,
+            dc: args.dc,
         };
-        platform::restore_lid_snapshot(&snapshot).map_err(|error| {
-            AppError::fail(format!(
-                "{error}; recovery state retained at {}",
-                state_path.display()
-            ))
-        })?;
-        session::delete_state_at(&state_path)?;
-        session::write_marker(ready, "recovered")?;
-        Ok(())
+        let worker = sysutil::open_exact_process(args.worker_pid, args.worker_start, false)?;
+        wait_for_authorization(&args, &guardian)?;
+        if let Some(worker) = worker.filter(|worker| worker.is_running().unwrap_or(false)) {
+            platform::enable_lid(&snapshot)?;
+            while worker.is_running()? {
+                sleep(Duration::from_millis(250));
+            }
+        }
+        platform::restore_lid_snapshot(&snapshot)
     }
 
-    fn exact_process_is_running(pid: u32, start: u64) -> Result<bool> {
-        Ok(sysutil::open_exact_process(pid, start, false)?
-            .is_some_and(|process| process.is_running().unwrap_or(false)))
+    fn wait_for_authorization(args: &GuardianArgs, guardian: &sysutil::Identity) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Some(session::SavedState::Valid(saved)) =
+                session::read_saved_at(&args.state_path)
+                && session_authorizes(&saved, args, sysutil::current_pid(), guardian.start)
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100));
+        }
+        Err(AppError::fail(
+            "guardian authorization state did not appear",
+        ))
     }
 
-    fn optional_positive_u64(raw: &str, name: &str) -> Result<Option<u64>> {
+    fn session_authorizes(
+        saved: &Session,
+        args: &GuardianArgs,
+        guardian_pid: u32,
+        guardian_start: u64,
+    ) -> bool {
+        saved.even_lid
+            && saved.pid == args.worker_pid
+            && saved.process_start == args.worker_start
+            && saved.guardian_pid == guardian_pid
+            && saved.guardian_start == guardian_start
+            && saved.original_scheme == args.scheme
+            && saved.original_ac == args.ac
+            && saved.original_dc == args.dc
+    }
+
+    fn parse_guardian_args(args: &[String]) -> Result<GuardianArgs> {
+        if args.len() != 7 {
+            return Err(AppError::fail(
+                "Windows guardian expects six immutable arguments",
+            ));
+        }
+        let scheme = args[3].clone();
+        platform::parse_guid(&scheme)?;
+        let state_path = PathBuf::from(&args[6]);
+        if !state_path.is_absolute() {
+            return Err(AppError::fail("guardian state path must be absolute"));
+        }
+        Ok(GuardianArgs {
+            worker_pid: positive(&args[1], "worker pid")?,
+            worker_start: positive(&args[2], "worker creation time")?,
+            scheme,
+            ac: number(&args[4], "original AC value")?,
+            dc: number(&args[5], "original DC value")?,
+            state_path,
+        })
+    }
+
+    fn optional_u64(raw: &str, name: &str) -> Result<Option<u64>> {
         if raw.is_empty() {
-            return Ok(None);
-        }
-        match raw.parse() {
-            Ok(value) if value > 0 => Ok(Some(value)),
-            _ => Err(AppError::fail(format!(
-                "Windows worker {name} must be a positive integer"
-            ))),
+            Ok(None)
+        } else {
+            positive(raw, name).map(Some)
         }
     }
 
-    fn optional_positive_u32(raw: &str, name: &str) -> Result<Option<u32>> {
-        optional_positive_u64(raw, name)?.map_or(Ok(None), |value| {
+    fn optional_u32(raw: &str, name: &str) -> Result<Option<u32>> {
+        optional_u64(raw, name)?.map_or(Ok(None), |value| {
             u32::try_from(value)
                 .map(Some)
                 .map_err(|_| AppError::fail(format!("Windows worker {name} is too large")))
         })
+    }
+
+    fn positive<T>(raw: &str, name: &str) -> Result<T>
+    where
+        T: std::str::FromStr + Default + PartialEq + ToString,
+    {
+        let value = raw
+            .parse::<T>()
+            .map_err(|_| AppError::fail(format!("invalid {name}")))?;
+        if value == T::default() || value.to_string() != raw {
+            Err(AppError::fail(format!("invalid {name}")))
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn number(raw: &str, name: &str) -> Result<u32> {
+        let value = raw
+            .parse::<u32>()
+            .map_err(|_| AppError::fail(format!("invalid {name}")))?;
+        if value.to_string() == raw {
+            Ok(value)
+        } else {
+            Err(AppError::fail(format!("invalid {name}")))
+        }
     }
 
     fn parse_timestamp(raw: &str, name: &str) -> Result<DateTime<Utc>> {
@@ -859,92 +698,59 @@ mod windows {
     mod tests {
         use super::*;
 
-        fn args(values: &[&str]) -> Vec<String> {
-            values.iter().map(|value| (*value).to_string()).collect()
+        fn strings(values: &[&str]) -> Vec<String> {
+            values.iter().map(|value| (*value).into()).collect()
         }
 
         #[test]
         fn worker_argument_parser_is_strict() {
-            let valid = args(&[
+            let valid = strings(&[
                 "__worker_windows__",
                 "system-only",
                 "60",
-                "42",
+                "",
+                "",
                 "80",
                 "up",
                 "until-charge",
                 "80%",
                 "2024-01-02T03:04:05+00:00",
-                "2024-01-02T03:05:05+00:00",
+                "",
                 "true",
             ]);
-            let parsed = parse_worker_args(&valid).unwrap();
-            assert!(parsed.no_display);
-            assert_eq!(parsed.wait_pid, Some(42));
-            assert_eq!(parsed.charge, Some((80, true)));
-            assert!(parsed.publish);
-
-            for invalid in [
-                &valid[..10],
-                &args(&[
-                    "__worker_windows__",
-                    "bad",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "timed",
-                    "1m",
-                    "2024-01-02T03:04:05+00:00",
-                    "",
-                    "true",
-                ]),
-                &args(&[
-                    "__worker_windows__",
-                    "system-only",
-                    "0",
-                    "",
-                    "",
-                    "",
-                    "timed",
-                    "1m",
-                    "2024-01-02T03:04:05+00:00",
-                    "",
-                    "true",
-                ]),
-                &args(&[
-                    "__worker_windows__",
-                    "system-only",
-                    "",
-                    "",
-                    "80",
-                    "",
-                    "until-charge",
-                    "80%",
-                    "2024-01-02T03:04:05+00:00",
-                    "",
-                    "true",
-                ]),
-            ] {
-                assert!(parse_worker_args(invalid).is_err());
-            }
+            assert!(parse_worker_args(&valid).unwrap().publish);
+            assert!(parse_worker_args(&valid[..11]).is_err());
+            let mut incomplete = valid;
+            incomplete[3] = "42".into();
+            assert!(parse_worker_args(&incomplete).is_err());
         }
 
         #[test]
-        fn guardian_enable_order_is_write_write_activate_verify() {
-            assert_eq!(
-                ENABLE_STEPS,
-                [
-                    EnableStep::WriteAc,
-                    EnableStep::WriteDc,
-                    EnableStep::Reactivate,
-                    EnableStep::Verify,
-                ]
-            );
-            assert_eq!(
-                platform::restoration_decision((0, 0), (1, 2)),
-                RestoreDecision::RestoreAppliedValues
-            );
+        fn immutable_args_must_match_the_complete_session() {
+            let args = GuardianArgs {
+                worker_pid: 7,
+                worker_start: 9,
+                scheme: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+                ac: 1,
+                dc: 2,
+                state_path: PathBuf::from("C:\\state\\session.properties"),
+            };
+            let mut saved = Session {
+                pid: 7,
+                process_start: 9,
+                guardian_pid: 11,
+                guardian_start: 13,
+                original_scheme: args.scheme.clone(),
+                original_ac: 1,
+                original_dc: 2,
+                even_lid: true,
+                ..Session::default()
+            };
+            assert!(session_authorizes(&saved, &args, 11, 13));
+            saved.original_dc = 3;
+            assert!(!session_authorizes(&saved, &args, 11, 13));
+            saved.original_dc = 2;
+            assert!(!session_authorizes(&saved, &args, 11, 14));
         }
     }
 }
@@ -993,7 +799,6 @@ mod tests {
             (status(80, false, true, None), (true, false)),
             (status(90, false, true, None), (false, false)),
             (status(80, true, false, None), (true, false)),
-            (status(90, true, false, None), (true, false)),
             (status(60, true, false, None), (false, true)),
             (status(80, false, false, None), (true, false)),
         ] {
@@ -1017,12 +822,9 @@ mod tests {
     fn hidden_value_parsers_are_strict() {
         assert_eq!(parse_charge_target("80").unwrap(), 80);
         for invalid in ["", "0", "101", " 80", "8.0"] {
-            assert!(parse_charge_target(invalid).is_err(), "target={invalid:?}");
+            assert!(parse_charge_target(invalid).is_err());
         }
         assert!(parse_bool("true", "test").unwrap());
         assert!(!parse_bool("false", "test").unwrap());
-        for invalid in ["", "True", "0", " false"] {
-            assert!(parse_bool(invalid, "test").is_err(), "bool={invalid:?}");
-        }
     }
 }

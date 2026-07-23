@@ -1,6 +1,7 @@
 //! Process discovery, identity, termination, and detached spawning.
 
 use crate::error::{AppError, Result};
+#[cfg(not(windows))]
 use crate::session::Session;
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
@@ -51,13 +52,8 @@ fn identity_of(sys: &System, pid: u32) -> Option<Identity> {
     })
 }
 
+#[cfg(not(windows))]
 pub fn is_alive(pid: u32) -> bool {
-    #[cfg(windows)]
-    return win::open_process(pid, false)
-        .ok()
-        .flatten()
-        .is_some_and(|process| process.is_running().unwrap_or(false));
-    #[cfg(not(windows))]
     process_exists(pid)
 }
 
@@ -272,27 +268,30 @@ fn detach(command: &mut Command) {
 
 #[cfg(windows)]
 pub use win::{
-    ProcessHandle, current_identity, open_exact_process, open_session_process,
+    ProcessHandle, child_identity, current_identity, open_exact_process, open_process_for_wait,
     spawn_elevated_guardian, spawn_worker,
 };
 
 #[cfg(windows)]
 mod win {
-    use super::{Identity, Session};
+    use super::Identity;
     use crate::error::{AppError, Result};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
     use std::path::Path;
+    use std::process::{Child, Command, Stdio};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_CANCELLED, ERROR_INVALID_PARAMETER, FILETIME, GetLastError, HANDLE,
-        WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_CANCELLED, ERROR_INVALID_PARAMETER, FILETIME, GetHandleInformation,
+        GetLastError, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_FAILED,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CreateProcessW, GetCurrentProcess, GetProcessId, GetProcessTimes,
-        OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        PROCESS_TERMINATE, QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess,
-        WaitForSingleObject,
+        CREATE_NO_WINDOW, DETACHED_PROCESS, GetCurrentProcess, GetProcessId, GetProcessTimes,
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -420,20 +419,15 @@ mod win {
         Ok(Some(process))
     }
 
-    pub fn open_session_process(
-        session: &Session,
-        terminate: bool,
-    ) -> Result<Option<ProcessHandle>> {
-        let Some(process) = open_process(session.pid, terminate)? else {
-            return Ok(None);
-        };
-        if !session.matches_identity(process.identity()) {
-            return Err(AppError::fail(format!(
-                "session process {} changed identity; refusing to use it",
-                session.pid
-            )));
+    pub fn open_process_for_wait(pid: u32) -> Result<ProcessHandle> {
+        match open_process(pid, false)? {
+            Some(process) if process.is_running()? => Ok(process),
+            _ => Err(AppError::fail(format!("process {pid} is not running"))),
         }
-        Ok(Some(process))
+    }
+
+    pub fn child_identity(child: &Child) -> Result<Identity> {
+        identity_from_raw(child.as_raw_handle() as HANDLE)
     }
 
     pub fn current_identity() -> Result<Identity> {
@@ -517,59 +511,88 @@ mod win {
         quoted
     }
 
-    pub fn spawn_worker(command: &[String]) -> Result<ProcessHandle> {
-        let (exe, _) = command
-            .split_first()
-            .ok_or_else(|| AppError::fail("worker command is empty"))?;
-        let exe = wide(OsStr::new(exe));
-        let command_line = command
-            .iter()
-            .map(|arg| quote_windows_arg(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let mut command_line = wide(OsStr::new(&command_line));
-        let startup = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            ..STARTUPINFOW::default()
-        };
-        let mut process = PROCESS_INFORMATION::default();
-        // SAFETY: The application and mutable command-line buffers outlive CreateProcessW. Handle
-        // inheritance is disabled, and both returned handles are owned on success.
-        if unsafe {
-            CreateProcessW(
-                exe.as_ptr(),
-                command_line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                CREATE_NO_WINDOW,
-                std::ptr::null(),
-                std::ptr::null(),
-                &startup,
-                &mut process,
-            )
-        } == 0
-        {
-            return Err(last_error("could not launch the Windows worker"));
+    struct StdioInheritanceGuard(Vec<(HANDLE, u32)>);
+
+    impl StdioInheritanceGuard {
+        fn clear() -> Self {
+            let handles = [
+                std::io::stdin().as_raw_handle() as HANDLE,
+                std::io::stdout().as_raw_handle() as HANDLE,
+                std::io::stderr().as_raw_handle() as HANDLE,
+            ];
+            let mut changed = Vec::new();
+            for handle in handles {
+                let mut flags = 0;
+                // SAFETY: Standard handles are borrowed and remain owned by the process.
+                if unsafe { GetHandleInformation(handle, &mut flags) } != 0
+                    && flags & HANDLE_FLAG_INHERIT != 0
+                    && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0
+                {
+                    changed.push((handle, flags));
+                }
+            }
+            Self(changed)
         }
-        // SAFETY: hThread is a distinct owned handle that wake does not need.
-        unsafe {
-            CloseHandle(process.hThread);
-        }
-        ProcessHandle::from_owned(OwnedHandle::new(process.hProcess)?)
     }
 
-    pub fn spawn_elevated_guardian(request: &Path) -> Result<ProcessHandle> {
-        if !request.is_absolute() {
-            return Err(AppError::fail("guardian request path must be absolute"));
+    impl Drop for StdioInheritanceGuard {
+        fn drop(&mut self) {
+            for &(handle, flags) in &self.0 {
+                // SAFETY: Restores only the borrowed flag changed by `clear`.
+                unsafe {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags & HANDLE_FLAG_INHERIT);
+                }
+            }
         }
+    }
+
+    pub fn spawn_worker(command: &[String], state_dir: &Path) -> Result<Child> {
+        if !state_dir.is_absolute() {
+            return Err(AppError::fail("worker state directory must be absolute"));
+        }
+        let (exe, args) = command
+            .split_first()
+            .ok_or_else(|| AppError::fail("worker command is empty"))?;
+        let mut child = Command::new(exe);
+        child
+            .args(args)
+            .env("WAKE_STATE_DIR", state_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        let _inheritance = StdioInheritanceGuard::clear();
+        child.spawn().map_err(|error| {
+            AppError::fail(format!("could not launch the Windows worker: {error}"))
+        })
+    }
+
+    pub fn spawn_elevated_guardian(
+        worker_pid: u32,
+        worker_start: u64,
+        scheme: &str,
+        ac: u32,
+        dc: u32,
+        state_path: &Path,
+    ) -> Result<ProcessHandle> {
         let exe = std::env::current_exe()
             .map_err(|error| AppError::fail(format!("can't determine executable path: {error}")))?;
-        let params = format!(
-            "{} {}",
-            quote_windows_arg("__guard_windows__"),
-            quote_windows_arg(&request.to_string_lossy())
-        );
+        if !state_path.is_absolute() {
+            return Err(AppError::fail("guardian state path must be absolute"));
+        }
+        let params = [
+            "__guard_windows__".to_string(),
+            worker_pid.to_string(),
+            worker_start.to_string(),
+            scheme.to_string(),
+            ac.to_string(),
+            dc.to_string(),
+            state_path.to_string_lossy().into_owned(),
+        ]
+        .iter()
+        .map(|arg| quote_windows_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
         let verb = wide(OsStr::new("runas"));
         let file = wide(exe.as_os_str());
         let params = wide(OsStr::new(&params));
@@ -646,6 +669,23 @@ mod tests {
     fn wake_exclusion_is_exact() {
         assert!(is_wake_name("WAKE.EXE"));
         assert!(!is_wake_name("wake-helper.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_target_identity_does_not_follow_pid_reuse() {
+        let target = open_process_for_wait(current_pid()).unwrap();
+        let start = target.identity().start;
+        assert!(
+            open_exact_process(current_pid(), start, false)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            open_exact_process(current_pid(), start + 1, false)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(windows)]

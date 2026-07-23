@@ -1,5 +1,3 @@
-//! Process discovery, identity, termination, and detached spawning.
-
 use crate::error::{AppError, Result};
 #[cfg(not(windows))]
 use crate::session::Session;
@@ -9,7 +7,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, Process, System};
+#[cfg(not(windows))]
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
@@ -29,17 +29,6 @@ fn refreshed(pid: u32) -> System {
 }
 
 #[cfg(not(windows))]
-fn process_exists(pid: u32) -> bool {
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    sys.process(Pid::from_u32(pid)).is_some()
-}
-
-#[cfg(not(windows))]
 fn identity_of(sys: &System, pid: u32) -> Option<Identity> {
     let process = sys.process(Pid::from_u32(pid))?;
     let command = process
@@ -54,7 +43,13 @@ fn identity_of(sys: &System, pid: u32) -> Option<Identity> {
 
 #[cfg(not(windows))]
 pub fn is_alive(pid: u32) -> bool {
-    process_exists(pid)
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(Pid::from_u32(pid)).is_some()
 }
 
 #[cfg(not(windows))]
@@ -65,24 +60,6 @@ pub fn live_identity(pid: u32) -> Option<Identity> {
 #[cfg(not(windows))]
 pub fn capture_identity(pid: u32) -> Result<Identity> {
     live_identity(pid).ok_or_else(|| AppError::fail(format!("process {pid} is not running")))
-}
-
-pub fn current_pid() -> u32 {
-    std::process::id()
-}
-
-pub fn parent_pid() -> Option<u32> {
-    let me = current_pid();
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from_u32(me)]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    system
-        .process(Pid::from_u32(me))
-        .and_then(|process| process.parent())
-        .map(|pid| pid.as_u32())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -96,9 +73,12 @@ pub fn find_app_pid(raw: &str) -> Result<Option<u32>> {
     if query.is_empty() {
         return Err(AppError::usage("app/process name cannot be empty"));
     }
-    let self_pid = current_pid();
-    let parent_pid = parent_pid();
+    let self_pid = std::process::id();
     let system = System::new_all();
+    let parent_pid = system
+        .process(Pid::from_u32(self_pid))
+        .and_then(|process| process.parent())
+        .map(|pid| pid.as_u32());
     Ok(choose_app_pid(system.processes().iter().filter_map(
         |(pid, process)| {
             let pid = pid.as_u32();
@@ -118,11 +98,11 @@ fn choose_app_pid(matches: impl IntoIterator<Item = (AppMatch, u32)>) -> Option<
 }
 
 fn app_match(query: &str, process: &Process) -> Option<AppMatch> {
-    let name = process.name().to_string_lossy().to_lowercase();
+    let name = process.name().to_string_lossy();
     let exe = process
         .exe()
         .and_then(|path| path.file_name())
-        .map(|name| name.to_string_lossy().to_lowercase())
+        .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     match_names(query, &name, &exe)
 }
@@ -198,14 +178,9 @@ fn wait_gone(pid: u32, within: Duration) -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn verify_child_alive(pid: u32) -> bool {
-    sleep(Duration::from_millis(300));
-    is_alive(pid)
-}
-
-#[cfg(not(windows))]
 pub fn require_child_alive(pid: u32, cmd: &[String]) -> Result<()> {
-    if verify_child_alive(pid) {
+    sleep(Duration::from_millis(300));
+    if is_alive(pid) {
         Ok(())
     } else {
         Err(AppError::fail(format!(
@@ -253,11 +228,6 @@ pub fn spawn_detached(cmd: &[String]) -> std::io::Result<Child> {
         .stderr(Stdio::null());
     detach(&mut command);
     command.spawn()
-}
-
-#[cfg(not(windows))]
-pub fn spawn_supervised_child(cmd: &[String]) -> std::io::Result<Child> {
-    spawn_detached(cmd)
 }
 
 #[cfg(unix)]
@@ -511,39 +481,36 @@ mod win {
         quoted
     }
 
-    struct StdioInheritanceGuard(Vec<(HANDLE, u32)>);
+    struct InheritGuard(Vec<(HANDLE, u32)>);
 
-    impl StdioInheritanceGuard {
-        fn clear() -> Self {
-            let handles = [
-                std::io::stdin().as_raw_handle() as HANDLE,
-                std::io::stdout().as_raw_handle() as HANDLE,
-                std::io::stderr().as_raw_handle() as HANDLE,
-            ];
-            let mut changed = Vec::new();
-            for handle in handles {
-                let mut flags = 0;
-                // SAFETY: Standard handles are borrowed and remain owned by the process.
-                if unsafe { GetHandleInformation(handle, &mut flags) } != 0
-                    && flags & HANDLE_FLAG_INHERIT != 0
-                    && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0
-                {
-                    changed.push((handle, flags));
+    impl Drop for InheritGuard {
+        fn drop(&mut self) {
+            for &(handle, flags) in &self.0 {
+                // SAFETY: Restores only the borrowed flag changed before spawn.
+                unsafe {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags);
                 }
             }
-            Self(changed)
         }
     }
 
-    impl Drop for StdioInheritanceGuard {
-        fn drop(&mut self) {
-            for &(handle, flags) in &self.0 {
-                // SAFETY: Restores only the borrowed flag changed by `clear`.
-                unsafe {
-                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags & HANDLE_FLAG_INHERIT);
-                }
+    fn suspend_stdio_inheritance() -> InheritGuard {
+        let mut changed = Vec::new();
+        for handle in [
+            std::io::stdin().as_raw_handle() as HANDLE,
+            std::io::stdout().as_raw_handle() as HANDLE,
+            std::io::stderr().as_raw_handle() as HANDLE,
+        ] {
+            let mut flags = 0;
+            // SAFETY: Standard handles are borrowed and remain process-owned.
+            if unsafe { GetHandleInformation(handle, &mut flags) } != 0
+                && flags & HANDLE_FLAG_INHERIT != 0
+                && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0
+            {
+                changed.push((handle, flags));
             }
         }
+        InheritGuard(changed)
     }
 
     pub fn spawn_worker(command: &[String], state_dir: &Path) -> Result<Child> {
@@ -561,7 +528,7 @@ mod win {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-        let _inheritance = StdioInheritanceGuard::clear();
+        let _inheritance = suspend_stdio_inheritance();
         child.spawn().map_err(|error| {
             AppError::fail(format!("could not launch the Windows worker: {error}"))
         })
@@ -674,15 +641,15 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn exact_target_identity_does_not_follow_pid_reuse() {
-        let target = open_process_for_wait(current_pid()).unwrap();
+        let target = open_process_for_wait(std::process::id()).unwrap();
         let start = target.identity().start;
         assert!(
-            open_exact_process(current_pid(), start, false)
+            open_exact_process(std::process::id(), start, false)
                 .unwrap()
                 .is_some()
         );
         assert!(
-            open_exact_process(current_pid(), start + 1, false)
+            open_exact_process(std::process::id(), start + 1, false)
                 .unwrap()
                 .is_none()
         );

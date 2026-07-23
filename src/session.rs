@@ -1,5 +1,3 @@
-//! Strict session state and the advisory lifecycle lock.
-
 use crate::error::{AppError, Result};
 use crate::{platform, sysutil};
 use chrono::{DateTime, Utc};
@@ -89,10 +87,6 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     #[cfg(not(windows))]
     pub fn capture_process_identity(&mut self) -> Result<()> {
         let identity = sysutil::capture_identity(self.pid)?;
@@ -114,6 +108,28 @@ impl Session {
     pub fn matches_live_process(&self) -> bool {
         sysutil::live_identity(self.pid).is_some_and(|live| self.matches_identity(&live))
     }
+
+    #[cfg(windows)]
+    pub fn matches_lid_authority(
+        &self,
+        worker: (u32, u64),
+        guardian: (u32, u64),
+        snapshot: (&str, u32, u32),
+    ) -> bool {
+        self.even_lid
+            && (self.pid, self.process_start) == worker
+            && (self.guardian_pid, self.guardian_start) == guardian
+            && (
+                self.original_scheme.as_str(),
+                self.original_ac,
+                self.original_dc,
+            ) == snapshot
+    }
+
+    #[cfg(windows)]
+    pub fn owned_non_lid_by(&self, pid: u32, start: u64) -> bool {
+        !self.even_lid && (self.pid, self.process_start) == (pid, start)
+    }
 }
 
 fn expected_command(command: &str) -> bool {
@@ -126,17 +142,7 @@ fn expected_command(command: &str) -> bool {
 
 pub enum SavedState {
     Valid(Session),
-    Malformed(MalformedState),
-}
-
-pub struct MalformedState {
-    lid_hints: bool,
-}
-
-impl MalformedState {
-    pub fn has_lid_recovery_hints(&self) -> bool {
-        self.lid_hints
-    }
+    Malformed(bool),
 }
 
 pub fn read_saved_for_recovery() -> Option<SavedState> {
@@ -147,11 +153,11 @@ pub fn read_saved_at(path: &Path) -> Option<SavedState> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => return Some(SavedState::Malformed(MalformedState { lid_hints: true })),
+        Err(_) => return Some(SavedState::Malformed(true)),
     };
     Some(match parse_session(&bytes) {
         Ok(session) => SavedState::Valid(session),
-        Err(_) => SavedState::Malformed(malformed(&bytes)),
+        Err(_) => SavedState::Malformed(lid_hints(&bytes)),
     })
 }
 
@@ -163,8 +169,8 @@ pub fn read_if_alive(delete_unhinted_malformed: bool) -> Option<Session> {
             let _ = delete_state_file();
             None
         }
-        Some(SavedState::Malformed(state)) => {
-            if delete_unhinted_malformed && !state.has_lid_recovery_hints() {
+        Some(SavedState::Malformed(lid_hints)) => {
+            if delete_unhinted_malformed && !lid_hints {
                 let _ = delete_state_file();
             }
             None
@@ -176,8 +182,10 @@ pub fn read_if_alive(delete_unhinted_malformed: bool) -> Option<Session> {
 fn parse_session(bytes: &[u8]) -> Result<Session> {
     let text = std::str::from_utf8(bytes).map_err(|_| AppError::fail("state is not UTF-8"))?;
     let properties = properties(text)?;
-    require(&properties, "version", STATE_VERSION)?;
-    let even_lid = boolean(field(&properties, "evenLid")?)?;
+    if field(&properties, "version")? != STATE_VERSION {
+        return Err(AppError::fail("unsupported state version"));
+    }
+    let even_lid = parse_bool(field(&properties, "evenLid")?, "evenLid")?;
     let mut keys: HashSet<&str> = [
         "version",
         "pid",
@@ -211,16 +219,16 @@ fn parse_session(bytes: &[u8]) -> Result<Session> {
     }
 
     let session = Session {
-        pid: positive(field(&properties, "pid")?, "pid")?,
+        pid: parse_positive(field(&properties, "pid")?, "pid")?,
         mode: field(&properties, "mode")?.into(),
         trigger: field(&properties, "trigger")?.into(),
         detail: field(&properties, "detail")?.into(),
-        started_at: Some(timestamp(field(&properties, "startedAt")?)?),
+        started_at: Some(parse_utc(field(&properties, "startedAt")?, "startedAt")?),
         ends_at: match field(&properties, "endsAt")? {
             "" => None,
-            value => Some(timestamp(value)?),
+            value => Some(parse_utc(value, "endsAt")?),
         },
-        process_start: positive(field(&properties, "processStart")?, "processStart")?,
+        process_start: parse_positive(field(&properties, "processStart")?, "processStart")?,
         process_command: field(&properties, "processCommand")?.into(),
         even_lid,
         #[cfg(not(windows))]
@@ -231,13 +239,13 @@ fn parse_session(bytes: &[u8]) -> Result<Session> {
         },
         #[cfg(windows)]
         guardian_pid: if even_lid {
-            positive(field(&properties, "guardianPid")?, "guardianPid")?
+            parse_positive(field(&properties, "guardianPid")?, "guardianPid")?
         } else {
             0
         },
         #[cfg(windows)]
         guardian_start: if even_lid {
-            positive(field(&properties, "guardianStart")?, "guardianStart")?
+            parse_positive(field(&properties, "guardianStart")?, "guardianStart")?
         } else {
             0
         },
@@ -251,13 +259,13 @@ fn parse_session(bytes: &[u8]) -> Result<Session> {
         },
         #[cfg(windows)]
         original_ac: if even_lid {
-            number(field(&properties, "originalAc")?, "originalAc")?
+            parse_u32(field(&properties, "originalAc")?, "originalAc")?
         } else {
             0
         },
         #[cfg(windows)]
         original_dc: if even_lid {
-            number(field(&properties, "originalDc")?, "originalDc")?
+            parse_u32(field(&properties, "originalDc")?, "originalDc")?
         } else {
             0
         },
@@ -371,23 +379,14 @@ fn field<'a>(properties: &'a HashMap<String, String>, key: &str) -> Result<&'a s
         .ok_or_else(|| AppError::fail(format!("state is missing {key}")))
 }
 
-fn require(properties: &HashMap<String, String>, key: &str, value: &str) -> Result<()> {
-    if field(properties, key)? == value {
-        Ok(())
-    } else {
-        Err(AppError::fail(format!("unsupported {key}")))
-    }
-}
-
-fn boolean(raw: &str) -> Result<bool> {
+pub(crate) fn parse_bool(raw: &str, name: &str) -> Result<bool> {
     match raw {
         "true" => Ok(true),
         "false" => Ok(false),
-        _ => Err(AppError::fail("invalid state boolean")),
+        _ => Err(AppError::fail(format!("invalid {name}"))),
     }
 }
-
-fn positive<T>(raw: &str, name: &str) -> Result<T>
+pub(crate) fn parse_positive<T>(raw: &str, name: &str) -> Result<T>
 where
     T: std::str::FromStr + Default + PartialEq + ToString,
 {
@@ -400,9 +399,7 @@ where
         Ok(value)
     }
 }
-
-#[cfg(windows)]
-fn number(raw: &str, name: &str) -> Result<u32> {
+pub(crate) fn parse_u32(raw: &str, name: &str) -> Result<u32> {
     let value = raw
         .parse::<u32>()
         .map_err(|_| AppError::fail(format!("invalid {name}")))?;
@@ -412,40 +409,35 @@ fn number(raw: &str, name: &str) -> Result<u32> {
         Err(AppError::fail(format!("invalid {name}")))
     }
 }
-
-fn timestamp(raw: &str) -> Result<DateTime<Utc>> {
+pub(crate) fn parse_utc(raw: &str, name: &str) -> Result<DateTime<Utc>> {
     let value = DateTime::parse_from_rfc3339(raw)
         .map(|time| time.with_timezone(&Utc))
-        .map_err(|_| AppError::fail("invalid state timestamp"))?;
+        .map_err(|_| AppError::fail(format!("invalid {name}")))?;
     if value.to_rfc3339() == raw {
         Ok(value)
     } else {
-        Err(AppError::fail("state timestamp is not canonical UTC"))
+        Err(AppError::fail(format!("{name} is not canonical UTC")))
     }
 }
-
 #[cfg(not(windows))]
 fn disable_sleep(raw: &str) -> Result<i32> {
-    match raw.parse() {
-        Ok(value @ (0 | 1)) if value.to_string() == raw => Ok(value),
+    match parse_u32(raw, "priorDisableSleep")? {
+        value @ (0 | 1) => Ok(value as i32),
         _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
     }
 }
-
-fn malformed(bytes: &[u8]) -> MalformedState {
+fn lid_hints(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
-    MalformedState {
-        lid_hints: [
-            "evenLid=true",
-            "priorDisableSleep=",
-            "guardianPid=",
-            "originalScheme=",
-            "originalAc=",
-            "originalDc=",
-        ]
-        .iter()
-        .any(|hint| text.contains(hint)),
-    }
+    [
+        "evenLid=true",
+        "priorDisableSleep=",
+        "guardianPid=",
+        "originalScheme=",
+        "originalAc=",
+        "originalDc=",
+    ]
+    .iter()
+    .any(|hint| text.contains(hint))
 }
 
 fn io_error(path: &Path, error: std::io::Error) -> AppError {
@@ -571,7 +563,6 @@ mod tests {
         }
         text
     }
-
     #[test]
     fn strict_state_accepts_only_complete_versioned_records() {
         assert_eq!(parse_session(valid(false).as_bytes()).unwrap().pid, 4321);
@@ -584,34 +575,21 @@ mod tests {
         ] {
             assert!(parse_session(invalid.as_bytes()).is_err());
         }
-    }
-
-    #[test]
-    fn identity_mismatch_is_rejected() {
         let session = parse_session(valid(false).as_bytes()).unwrap();
         assert!(!session.matches_identity(&sysutil::Identity {
             start: session.process_start + 1,
             command: session.process_command.clone(),
         }));
+        assert!(!lid_hints(b"broken=true\n"));
+        assert!(lid_hints(b"originalScheme=broken\n"));
     }
-
     #[test]
-    fn relative_state_paths_become_absolute() {
+    fn relative_paths_are_absolute_and_delete_failures_are_preserved() {
         assert!(absolute_path(PathBuf::from("relative state")).is_absolute());
-    }
-
-    #[test]
-    fn checked_delete_preserves_failures() {
         let path = std::env::temp_dir().join(format!("wake-delete-test-{}", std::process::id()));
         fs::create_dir(&path).unwrap();
         assert!(delete_path(&path).is_err());
         assert!(path.is_dir());
         fs::remove_dir(path).unwrap();
-    }
-
-    #[test]
-    fn malformed_lid_hints_are_detected() {
-        assert!(!malformed(b"broken=true\n").has_lid_recovery_hints());
-        assert!(malformed(b"originalScheme=broken\n").has_lid_recovery_hints());
     }
 }

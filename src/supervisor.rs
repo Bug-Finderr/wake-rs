@@ -1,9 +1,8 @@
-//! Unix supervisors and the native Windows worker/guardian lifecycle.
-
 use crate::error::{AppError, Result};
 use crate::platform;
 use crate::session::{self, Session};
 use crate::sysutil;
+#[cfg(not(windows))]
 use chrono::Utc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -11,7 +10,6 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BATTERY_FAILURES: u8 = 3;
 
-#[derive(Clone)]
 pub struct BatteryStatus {
     pub percent: i32,
     pub charging: bool,
@@ -38,10 +36,6 @@ impl ChargePlan {
             charging_up,
         }
     }
-}
-
-pub fn read_battery_status() -> Result<BatteryStatus> {
-    platform::read_battery()
 }
 
 pub fn plan_charge(target: i32, status: &BatteryStatus) -> Result<ChargePlan> {
@@ -76,6 +70,62 @@ pub fn plan_charge(target: i32, status: &BatteryStatus) -> Result<ChargePlan> {
     Err(AppError::usage(
         "cannot determine battery charging direction",
     ))
+}
+
+pub struct PreparedCharge {
+    pub initial_percent: i32,
+    pub charging_up: bool,
+}
+
+pub enum ChargePreparation {
+    AlreadyMet(i32),
+    Wait(PreparedCharge),
+}
+
+pub fn prepare_charge(target: i32) -> Result<ChargePreparation> {
+    let status = platform::read_battery()?;
+    let plan = plan_charge(target, &status)?;
+    Ok(if plan.already_met {
+        ChargePreparation::AlreadyMet(status.percent)
+    } else {
+        ChargePreparation::Wait(PreparedCharge {
+            initial_percent: status.percent,
+            charging_up: plan.charging_up,
+        })
+    })
+}
+
+pub fn charge_detail(target: i32, charge: &PreparedCharge) -> String {
+    format!(
+        "{target}% (was {}%, {})",
+        charge.initial_percent,
+        if charge.charging_up {
+            "charging up"
+        } else {
+            "discharging down"
+        }
+    )
+}
+
+enum BatteryPoll {
+    Continue,
+    Reached,
+    Failed,
+}
+
+fn poll_battery(target: i32, up: bool, failures: &mut u8) -> BatteryPoll {
+    match platform::read_battery() {
+        Ok(status) => {
+            *failures = 0;
+            if (up && status.percent >= target) || (!up && status.percent <= target) {
+                BatteryPoll::Reached
+            } else {
+                BatteryPoll::Continue
+            }
+        }
+        Err(error) if battery_failures_exhausted(failures, &error) => BatteryPoll::Failed,
+        Err(_) => BatteryPoll::Continue,
+    }
 }
 
 fn battery_failures_exhausted(failures: &mut u8, error: &AppError) -> bool {
@@ -116,39 +166,26 @@ mod unix {
             return Err(AppError::fail("charge supervisor expects 3 arguments"));
         }
         let target = parse_charge_target(&args[1])?;
-        let no_display = parse_bool(&args[2], "no-display")?;
+        let no_display = session::parse_bool(&args[2], "no-display")?;
         let mode = args[3].clone();
-        let (initial, plan) = match read_battery_status()
-            .and_then(|status| plan_charge(target, &status).map(|plan| (status, plan)))
-        {
-            Ok(value) => value,
+        let charge = match prepare_charge(target) {
+            Ok(ChargePreparation::Wait(charge)) => charge,
+            Ok(ChargePreparation::AlreadyMet(_)) => return Ok(()),
             Err(error) => {
                 eprintln!("wake supervisor: {error}");
                 return Ok(());
             }
         };
-        if plan.already_met {
-            return Ok(());
-        }
-        let charging_up = plan.charging_up;
         let keep_awake = platform::keep_awake_command(no_display, None, None)?;
-        let mut child = sysutil::spawn_supervised_child(&keep_awake.cmd)?;
+        let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         let child_pid = child.id();
         sysutil::require_child_alive(child_pid, &keep_awake.cmd)?;
 
-        let mut session = Session::new();
-        session.pid = sysutil::current_pid();
+        let mut session = Session::default();
+        session.pid = std::process::id();
         session.mode = mode;
         session.trigger = "until-charge".into();
-        session.detail = format!(
-            "{target}% (was {}%, {})",
-            initial.percent,
-            if charging_up {
-                "charging up"
-            } else {
-                "discharging down"
-            }
-        );
+        session.detail = charge_detail(target, &charge);
         session.started_at = Some(Utc::now());
         session.capture_process_identity()?;
         if let Err(error) = session::write(&session) {
@@ -166,17 +203,11 @@ mod unix {
             }
             if last_check.elapsed() >= POLL_INTERVAL {
                 last_check = Instant::now();
-                match read_battery_status() {
-                    Ok(status) => {
-                        failures = 0;
-                        if (charging_up && status.percent >= target)
-                            || (!charging_up && status.percent <= target)
-                        {
-                            break;
-                        }
-                    }
-                    Err(error) if battery_failures_exhausted(&mut failures, &error) => break,
-                    Err(_) => {}
+                if !matches!(
+                    poll_battery(target, charge.charging_up, &mut failures),
+                    BatteryPoll::Continue
+                ) {
+                    break;
                 }
             }
         }
@@ -191,17 +222,20 @@ mod unix {
             return Err(AppError::fail("lid supervisor expects 7 arguments"));
         }
         let prior_disable_sleep = parse_disable_sleep(&args[4])?;
-        let mut cleanup = platform::supports_even_lid().then_some(LidCleanup {
+        if !platform::supports_even_lid() {
+            return Ok(());
+        }
+        let mut cleanup = LidCleanup {
             child: None,
             prior_disable_sleep,
-        });
+        };
         let no_display = match args[1].as_str() {
             "i" => true,
             "d" => false,
             _ => return Err(AppError::fail("lid supervisor: bad caffeinate mode")),
         };
-        let timeout_sec = optional_i64(&args[2])?;
-        let wait_pid = optional_u32(&args[3])?;
+        let timeout_sec = optional_positive(&args[2], "lid supervisor timeout")?;
+        let wait_pid = optional_positive(&args[3], "lid supervisor pid")?;
         let trigger = args[5].clone();
         let detail = args[6].clone();
         let charge_target = if args[7].is_empty() {
@@ -209,28 +243,23 @@ mod unix {
         } else {
             Some(parse_charge_target(&args[7])?)
         };
-        if cleanup.is_none() {
-            return Ok(());
-        }
-        let charging_up = if let Some(target) = charge_target {
-            let plan = plan_charge(target, &read_battery_status()?)?;
-            if plan.already_met {
-                return Ok(());
-            }
-            Some(plan.charging_up)
-        } else {
-            None
+        let charge = match charge_target {
+            Some(target) => match prepare_charge(target)? {
+                ChargePreparation::Wait(charge) => Some(charge),
+                ChargePreparation::AlreadyMet(_) => return Ok(()),
+            },
+            None => None,
         };
 
         let keep_awake = platform::keep_awake_command(no_display, timeout_sec, wait_pid)?;
-        let child = sysutil::spawn_supervised_child(&keep_awake.cmd)?;
+        let child = sysutil::spawn_detached(&keep_awake.cmd)?;
         let child_pid = child.id();
-        cleanup.as_mut().unwrap().child = Some(child);
+        cleanup.child = Some(child);
         sysutil::require_child_alive(child_pid, &keep_awake.cmd)?;
 
         let now = Utc::now();
-        let mut session = Session::new();
-        session.pid = sysutil::current_pid();
+        let mut session = Session::default();
+        session.pid = std::process::id();
         session.mode = if no_display {
             "system-only"
         } else {
@@ -264,13 +293,13 @@ mod unix {
             }
             if last_check.elapsed() >= POLL_INTERVAL {
                 last_check = Instant::now();
-                if let (Some(target), Some(up)) = (charge_target, charging_up) {
-                    match charge_reached(target, up) {
-                        Ok(true) => break,
-                        Ok(false) => failures = 0,
-                        Err(error) if battery_failures_exhausted(&mut failures, &error) => break,
-                        Err(_) => {}
-                    }
+                if let (Some(target), Some(charge)) = (charge_target, &charge)
+                    && !matches!(
+                        poll_battery(target, charge.charging_up, &mut failures),
+                        BatteryPoll::Continue
+                    )
+                {
+                    break;
                 }
             }
             if Instant::now() >= next_sudo {
@@ -305,52 +334,11 @@ mod unix {
         }
     }
 
-    fn charge_reached(target: i32, up: bool) -> Result<bool> {
-        let status = read_battery_status()?;
-        Ok(if up {
-            status.percent >= target
-        } else {
-            status.percent <= target
-        })
-    }
-
-    fn optional_i64(raw: &str) -> Result<Option<i64>> {
-        if raw.is_empty() {
-            return Ok(None);
-        }
-        match raw.parse() {
-            Ok(value) if value > 0 => Ok(Some(value)),
-            _ => Err(AppError::fail(
-                "lid supervisor timeout must be a positive integer",
-            )),
-        }
-    }
-
-    fn optional_u32(raw: &str) -> Result<Option<u32>> {
-        if raw.is_empty() {
-            return Ok(None);
-        }
-        match raw.parse() {
-            Ok(value) if value > 0 => Ok(Some(value)),
-            _ => Err(AppError::fail(
-                "lid supervisor pid must be a positive integer",
-            )),
-        }
-    }
-
     fn parse_disable_sleep(raw: &str) -> Result<i32> {
-        match raw.parse() {
-            Ok(value @ (0 | 1)) => Ok(value),
+        match session::parse_u32(raw, "priorDisableSleep")? {
+            value @ (0 | 1) => Ok(value as i32),
             _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
         }
-    }
-
-    fn parse_charge_target(raw: &str) -> Result<i32> {
-        super::parse_charge_target(raw)
-    }
-
-    fn parse_bool(raw: &str, name: &str) -> Result<bool> {
-        super::parse_bool(raw, name)
     }
 }
 
@@ -361,7 +349,6 @@ pub use unix::{run_charge, run_lid};
 mod windows {
     use super::*;
     use crate::platform::LidSnapshot;
-    use chrono::DateTime;
     use std::path::PathBuf;
 
     struct WorkerSpec {
@@ -441,9 +428,9 @@ mod windows {
             "display+system" => false,
             _ => return Err(AppError::fail("Windows worker has an invalid mode")),
         };
-        let timeout = optional_u64(&args[2], "timeout")?.map(Duration::from_secs);
-        let target_pid = optional_u32(&args[3], "target pid")?;
-        let target_start = optional_u64(&args[4], "target creation time")?;
+        let timeout = optional_positive(&args[2], "timeout")?.map(Duration::from_secs);
+        let target_pid = optional_positive(&args[3], "target pid")?;
+        let target_start = optional_positive(&args[4], "target creation time")?;
         if target_pid.is_some() != target_start.is_some() {
             return Err(AppError::fail(
                 "Windows worker target identity is incomplete",
@@ -477,26 +464,27 @@ mod windows {
             ));
         }
         let identity = sysutil::current_identity()?;
+        let publish = session::parse_bool(&args[11], "publish")?;
         Ok(WorkerSpec {
             no_display,
             timeout,
             target,
             charge: charge_target.zip(charge_up),
-            publish: parse_bool(&args[11], "publish")?,
+            publish,
             session: Session {
-                pid: sysutil::current_pid(),
+                pid: std::process::id(),
                 mode: args[1].clone(),
                 trigger: args[7].clone(),
                 detail: args[8].clone(),
-                started_at: Some(parse_timestamp(&args[9], "start time")?),
+                started_at: Some(session::parse_utc(&args[9], "start time")?),
                 ends_at: if args[10].is_empty() {
                     None
                 } else {
-                    Some(parse_timestamp(&args[10], "end time")?)
+                    Some(session::parse_utc(&args[10], "end time")?)
                 },
                 process_start: identity.start,
                 process_command: identity.command,
-                even_lid: !parse_bool(&args[11], "publish")?,
+                even_lid: !publish,
                 guardian_pid: 0,
                 guardian_start: 0,
                 original_scheme: String::new(),
@@ -514,10 +502,11 @@ mod windows {
             if spec
                 .timeout
                 .is_some_and(|timeout| start.elapsed() >= timeout)
-                || spec
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| !target.is_running().unwrap_or(false))
+            {
+                break;
+            }
+            if let Some(target) = &spec.target
+                && !target.is_running()?
             {
                 break;
             }
@@ -525,15 +514,11 @@ mod windows {
                 && last_battery.elapsed() >= POLL_INTERVAL
             {
                 last_battery = Instant::now();
-                match read_battery_status() {
-                    Ok(status) => {
-                        failures = 0;
-                        if (up && status.percent >= target) || (!up && status.percent <= target) {
-                            break;
-                        }
-                    }
-                    Err(error) if battery_failures_exhausted(&mut failures, &error) => break,
-                    Err(_) => {}
+                if !matches!(
+                    poll_battery(target, up, &mut failures),
+                    BatteryPoll::Continue
+                ) {
+                    break;
                 }
             }
             sleep(Duration::from_millis(250));
@@ -545,9 +530,7 @@ mod windows {
         for _ in 0..50 {
             if let Ok(_lock) = session::acquire_lock() {
                 if let Some(session::SavedState::Valid(saved)) = session::read_saved_for_recovery()
-                    && !saved.even_lid
-                    && saved.pid == worker.pid
-                    && saved.process_start == worker.process_start
+                    && saved.owned_non_lid_by(worker.pid, worker.process_start)
                 {
                     let _ = session::delete_state_file();
                 }
@@ -569,15 +552,17 @@ mod windows {
 
     pub fn run_guardian(args: &[String]) -> Result<()> {
         let args = parse_guardian_args(args)?;
-        let guardian = sysutil::current_identity()?;
+        let guardian = (std::process::id(), sysutil::current_identity()?.start);
         let snapshot = LidSnapshot {
             scheme: platform::parse_guid(&args.scheme)?,
             ac: args.ac,
             dc: args.dc,
         };
         let worker = sysutil::open_exact_process(args.worker_pid, args.worker_start, false)?;
-        wait_for_authorization(&args, &guardian)?;
-        if let Some(worker) = worker.filter(|worker| worker.is_running().unwrap_or(false)) {
+        wait_for_authorization(&args, guardian)?;
+        if let Some(worker) = worker
+            && worker.is_running()?
+        {
             platform::enable_lid(&snapshot)?;
             while worker.is_running()? {
                 sleep(Duration::from_millis(250));
@@ -586,12 +571,16 @@ mod windows {
         platform::restore_lid_snapshot(&snapshot)
     }
 
-    fn wait_for_authorization(args: &GuardianArgs, guardian: &sysutil::Identity) -> Result<()> {
+    fn wait_for_authorization(args: &GuardianArgs, guardian: (u32, u64)) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Some(session::SavedState::Valid(saved)) =
                 session::read_saved_at(&args.state_path)
-                && session_authorizes(&saved, args, sysutil::current_pid(), guardian.start)
+                && saved.matches_lid_authority(
+                    (args.worker_pid, args.worker_start),
+                    guardian,
+                    (&args.scheme, args.ac, args.dc),
+                )
             {
                 return Ok(());
             }
@@ -600,22 +589,6 @@ mod windows {
         Err(AppError::fail(
             "guardian authorization state did not appear",
         ))
-    }
-
-    fn session_authorizes(
-        saved: &Session,
-        args: &GuardianArgs,
-        guardian_pid: u32,
-        guardian_start: u64,
-    ) -> bool {
-        saved.even_lid
-            && saved.pid == args.worker_pid
-            && saved.process_start == args.worker_start
-            && saved.guardian_pid == guardian_pid
-            && saved.guardian_start == guardian_start
-            && saved.original_scheme == args.scheme
-            && saved.original_ac == args.ac
-            && saved.original_dc == args.dc
     }
 
     fn parse_guardian_args(args: &[String]) -> Result<GuardianArgs> {
@@ -631,67 +604,13 @@ mod windows {
             return Err(AppError::fail("guardian state path must be absolute"));
         }
         Ok(GuardianArgs {
-            worker_pid: positive(&args[1], "worker pid")?,
-            worker_start: positive(&args[2], "worker creation time")?,
+            worker_pid: session::parse_positive(&args[1], "worker pid")?,
+            worker_start: session::parse_positive(&args[2], "worker creation time")?,
             scheme,
-            ac: number(&args[4], "original AC value")?,
-            dc: number(&args[5], "original DC value")?,
+            ac: session::parse_u32(&args[4], "original AC value")?,
+            dc: session::parse_u32(&args[5], "original DC value")?,
             state_path,
         })
-    }
-
-    fn optional_u64(raw: &str, name: &str) -> Result<Option<u64>> {
-        if raw.is_empty() {
-            Ok(None)
-        } else {
-            positive(raw, name).map(Some)
-        }
-    }
-
-    fn optional_u32(raw: &str, name: &str) -> Result<Option<u32>> {
-        optional_u64(raw, name)?.map_or(Ok(None), |value| {
-            u32::try_from(value)
-                .map(Some)
-                .map_err(|_| AppError::fail(format!("Windows worker {name} is too large")))
-        })
-    }
-
-    fn positive<T>(raw: &str, name: &str) -> Result<T>
-    where
-        T: std::str::FromStr + Default + PartialEq + ToString,
-    {
-        let value = raw
-            .parse::<T>()
-            .map_err(|_| AppError::fail(format!("invalid {name}")))?;
-        if value == T::default() || value.to_string() != raw {
-            Err(AppError::fail(format!("invalid {name}")))
-        } else {
-            Ok(value)
-        }
-    }
-
-    fn number(raw: &str, name: &str) -> Result<u32> {
-        let value = raw
-            .parse::<u32>()
-            .map_err(|_| AppError::fail(format!("invalid {name}")))?;
-        if value.to_string() == raw {
-            Ok(value)
-        } else {
-            Err(AppError::fail(format!("invalid {name}")))
-        }
-    }
-
-    fn parse_timestamp(raw: &str, name: &str) -> Result<DateTime<Utc>> {
-        let time = DateTime::parse_from_rfc3339(raw)
-            .map(|time| time.with_timezone(&Utc))
-            .map_err(|_| AppError::fail(format!("Windows worker has an invalid {name}")))?;
-        if time.to_rfc3339() == raw {
-            Ok(time)
-        } else {
-            Err(AppError::fail(format!(
-                "Windows worker {name} is not canonical UTC"
-            )))
-        }
     }
 
     #[cfg(test)]
@@ -746,11 +665,18 @@ mod windows {
                 even_lid: true,
                 ..Session::default()
             };
-            assert!(session_authorizes(&saved, &args, 11, 13));
+            let matches = |saved: &Session, guardian| {
+                saved.matches_lid_authority(
+                    (args.worker_pid, args.worker_start),
+                    guardian,
+                    (&args.scheme, args.ac, args.dc),
+                )
+            };
+            assert!(matches(&saved, (11, 13)));
             saved.original_dc = 3;
-            assert!(!session_authorizes(&saved, &args, 11, 13));
+            assert!(!matches(&saved, (11, 13)));
             saved.original_dc = 2;
-            assert!(!session_authorizes(&saved, &args, 11, 14));
+            assert!(!matches(&saved, (11, 14)));
         }
     }
 }
@@ -758,20 +684,23 @@ mod windows {
 #[cfg(windows)]
 pub use windows::{run_guardian, run_worker, worker_command};
 
-fn parse_charge_target(raw: &str) -> Result<i32> {
-    match raw.parse::<i32>() {
-        Ok(target @ 1..=100) => Ok(target),
-        _ => Err(AppError::fail(
-            "charge target must be an integer from 1 to 100",
-        )),
+fn optional_positive<T>(raw: &str, name: &str) -> Result<Option<T>>
+where
+    T: std::str::FromStr + Default + PartialEq + ToString,
+{
+    if raw.is_empty() {
+        Ok(None)
+    } else {
+        session::parse_positive(raw, name).map(Some)
     }
 }
 
-fn parse_bool(raw: &str, name: &str) -> Result<bool> {
-    match raw {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(AppError::fail(format!("{name} must be true or false"))),
+fn parse_charge_target(raw: &str) -> Result<i32> {
+    match session::parse_positive(raw, "charge target")? {
+        target @ 1..=100 => Ok(target),
+        _ => Err(AppError::fail(
+            "charge target must be an integer from 1 to 100",
+        )),
     }
 }
 
@@ -824,7 +753,7 @@ mod tests {
         for invalid in ["", "0", "101", " 80", "8.0"] {
             assert!(parse_charge_target(invalid).is_err());
         }
-        assert!(parse_bool("true", "test").unwrap());
-        assert!(!parse_bool("false", "test").unwrap());
+        assert!(session::parse_bool("true", "test").unwrap());
+        assert!(!session::parse_bool("false", "test").unwrap());
     }
 }

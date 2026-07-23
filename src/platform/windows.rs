@@ -1,5 +1,3 @@
-//! Native Windows sleep inhibition, battery status, and lid control.
-
 use crate::error::{AppError, Result};
 use crate::supervisor::BatteryStatus;
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
@@ -209,43 +207,41 @@ fn restore_field(current: u32, original: u32) -> RestoreField {
     }
 }
 
-fn ensure_restorable(current: (u32, u32), original: (u32, u32)) -> Result<(bool, bool)> {
-    let ac = restore_field(current.0, original.0);
-    let dc = restore_field(current.1, original.1);
-    if ac == RestoreField::Conflict || dc == RestoreField::Conflict {
-        Err(AppError::fail(format!(
-            "lid values conflict with wake recovery (current AC={} DC={}, original AC={} DC={})",
-            current.0, current.1, original.0, original.1
-        )))
-    } else {
-        Ok((ac == RestoreField::Write, dc == RestoreField::Write))
-    }
-}
-
 pub fn restore_lid_snapshot(snapshot: &LidSnapshot) -> Result<()> {
-    let original = (snapshot.ac, snapshot.dc);
-    let (restore_ac, _) = ensure_restorable(read_lid_values(&snapshot.scheme)?, original)?;
-    if restore_ac {
-        write_ac(&snapshot.scheme, snapshot.ac)?;
+    let mut issues = Vec::new();
+    let mut wrote = false;
+    match restore_field(read_lid_values(&snapshot.scheme)?.0, snapshot.ac) {
+        RestoreField::Write => match write_ac(&snapshot.scheme, snapshot.ac) {
+            Ok(()) => wrote = true,
+            Err(error) => issues.push(format!("AC write failed: {error}")),
+        },
+        RestoreField::Conflict => issues.push("AC has a third-party value".into()),
+        RestoreField::Keep => {}
     }
-    let (restore_ac, _) = ensure_restorable(read_lid_values(&snapshot.scheme)?, original)?;
-    if restore_ac {
-        write_ac(&snapshot.scheme, snapshot.ac)?;
+    match restore_field(read_lid_values(&snapshot.scheme)?.1, snapshot.dc) {
+        RestoreField::Write => match write_dc(&snapshot.scheme, snapshot.dc) {
+            Ok(()) => wrote = true,
+            Err(error) => issues.push(format!("DC write failed: {error}")),
+        },
+        RestoreField::Conflict => issues.push("DC has a third-party value".into()),
+        RestoreField::Keep => {}
     }
-    let (_, restore_dc) = ensure_restorable(read_lid_values(&snapshot.scheme)?, original)?;
-    if restore_dc {
-        write_dc(&snapshot.scheme, snapshot.dc)?;
+    if wrote {
+        reactivate_if_active(&snapshot.scheme)?;
     }
-    reactivate_if_active(&snapshot.scheme)?;
     let after = read_lid_values(&snapshot.scheme)?;
-    if after == original {
-        Ok(())
-    } else {
-        Err(AppError::fail(format!(
-            "lid restoration did not verify (current AC={} DC={}, expected AC={} DC={})",
-            after.0, after.1, snapshot.ac, snapshot.dc
-        )))
+    if after == (snapshot.ac, snapshot.dc) {
+        return Ok(());
     }
+    let detail = if issues.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", issues.join("; "))
+    };
+    Err(AppError::fail(format!(
+        "lid restoration did not verify (current AC={} DC={}, expected AC={} DC={}){detail}",
+        after.0, after.1, snapshot.ac, snapshot.dc
+    )))
 }
 
 fn enable_field(current: u32, original: u32) -> Result<bool> {
@@ -280,9 +276,6 @@ pub fn enable_lid(snapshot: &LidSnapshot) -> Result<()> {
         }
         if enable_field(current.1, snapshot.dc)? {
             write_dc(&snapshot.scheme, 0)?;
-        }
-        if !scheme_is_active(&snapshot.scheme)? {
-            return Err(AppError::fail("active power scheme changed during enable"));
         }
         reactivate_if_active(&snapshot.scheme)?;
         if !scheme_is_active(&snapshot.scheme)? || read_lid_values(&snapshot.scheme)? != (0, 0) {
@@ -348,12 +341,7 @@ pub fn format_guid(guid: &GUID) -> String {
 }
 
 pub fn parse_guid(raw: &str) -> Result<GUID> {
-    if !raw.is_ascii()
-        || raw.len() != 36
-        || ![8, 13, 18, 23]
-            .into_iter()
-            .all(|index| raw.as_bytes()[index] == b'-')
-    {
+    if !raw.is_ascii() || raw.len() != 36 {
         return Err(AppError::fail("invalid canonical power-scheme GUID"));
     }
     let hex = |range: std::ops::Range<usize>| {
@@ -418,17 +406,25 @@ mod tests {
     }
 
     #[test]
-    fn partial_crash_states_restore_per_field() {
+    fn partial_and_mixed_conflict_states_decide_each_rail() {
+        use RestoreField::{Conflict, Keep, Write};
         for (current, original, expected) in [
-            ((1, 2), (1, 2), (false, false)),
-            ((0, 2), (1, 2), (true, false)),
-            ((1, 0), (1, 2), (false, true)),
-            ((0, 0), (1, 2), (true, true)),
+            ((1, 2), (1, 2), (Keep, Keep)),
+            ((0, 2), (1, 2), (Write, Keep)),
+            ((1, 0), (1, 2), (Keep, Write)),
+            ((0, 0), (1, 2), (Write, Write)),
+            ((3, 0), (1, 2), (Conflict, Write)),
+            ((0, 3), (1, 2), (Write, Conflict)),
+            ((3, 4), (1, 2), (Conflict, Conflict)),
         ] {
-            assert_eq!(ensure_restorable(current, original).unwrap(), expected);
+            assert_eq!(
+                (
+                    restore_field(current.0, original.0),
+                    restore_field(current.1, original.1),
+                ),
+                expected
+            );
         }
-        assert!(ensure_restorable((3, 0), (1, 2)).is_err());
-        assert!(ensure_restorable((0, 3), (1, 2)).is_err());
     }
 
     #[test]

@@ -2,22 +2,18 @@
 //! recovery machinery and shared formatting helpers.
 
 use crate::error::{AppError, Result};
-#[cfg(not(windows))]
-use crate::session::PHASE_ENABLING;
 use crate::session::{self, Session};
 use crate::supervisor::{plan_charge, read_battery_status};
 use crate::sysutil;
 use crate::{durations, platform};
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
+#[cfg(not(windows))]
 use std::io::IsTerminal;
 
-// Used by the unix picker and the macOS sudo prompt; the Windows even-lid path never prompts.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(not(windows))]
 pub fn is_console() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
-
-// ---- start ----
 
 struct Parsed {
     timeout_sec: Option<i64>,
@@ -44,8 +40,8 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
-            "--no-display" => p.no_display = true,
-            "--even-lid" => p.even_lid = true,
+            "--no-display" => claim_boolean(&mut p.no_display, a)?,
+            "--even-lid" => claim_boolean(&mut p.even_lid, a)?,
             "-t" | "--for" => {
                 let v = next_value(args, i, a)?;
                 trigger_flag = claim_trigger(trigger_flag, a)?;
@@ -80,7 +76,7 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
                 let pid: u32 = v
                     .trim()
                     .parse()
-                    .map_err(|_| AppError::fail(format!("invalid pid: '{v}'")))?;
+                    .map_err(|_| AppError::usage(format!("invalid pid: '{v}'")))?;
                 if !sysutil::is_alive(pid) {
                     return Err(AppError::usage(format!("pid {pid} is not running")));
                 }
@@ -141,17 +137,16 @@ fn claim_trigger(current: Option<String>, next: &str) -> Result<Option<String>> 
     }
 }
 
+fn claim_boolean(value: &mut bool, flag: &str) -> Result<()> {
+    if *value {
+        Err(AppError::usage(format!("duplicate flag: {flag}")))
+    } else {
+        *value = true;
+        Ok(())
+    }
+}
+
 pub fn start(args: &[String]) -> Result<()> {
-    // Honor help/version anywhere in the args (not just as the first token), so `wake 1h --help`
-    // prints help instead of erroring on an "unknown flag".
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        crate::print_help();
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "-v" || a == "--version") {
-        println!("wake {}", crate::VERSION);
-        return Ok(());
-    }
     let p = parse_start_args(args)?;
 
     if p.even_lid && !platform::supports_even_lid() {
@@ -161,12 +156,10 @@ pub fn start(args: &[String]) -> Result<()> {
     let _lock = session::acquire_lock()?;
     recover_stale_lid_session_unlocked()?;
     if let Some(existing) = session::read_if_alive(true) {
-        eprintln!(
-            "wake: session already active (pid {}, {} {})",
+        return Err(AppError::fail(format!(
+            "session already active (pid {}, {} {}); run 'wake stop' first",
             existing.pid, existing.trigger, existing.detail
-        );
-        eprintln!("run 'wake stop' first");
-        std::process::exit(1);
+        )));
     }
 
     let mode = if p.no_display {
@@ -176,9 +169,6 @@ pub fn start(args: &[String]) -> Result<()> {
     }
     .to_string();
 
-    // macOS/Linux route even-lid through the lid supervisor (sudo + SleepDisabled). Windows instead
-    // overlays the power-plan lid action onto the normal session, so it falls through to the standard
-    // start path below and only diverges to set/restore the lid action.
     #[cfg(not(windows))]
     {
         if let Some(charge) = p.charge_target {
@@ -222,7 +212,7 @@ pub fn start(args: &[String]) -> Result<()> {
 
     let mut child = sysutil::spawn_named(&ka.cmd)?;
     s.pid = child.id();
-    sysutil::require_child_alive(s.pid, &ka.cmd);
+    sysutil::require_child_alive(s.pid, &ka.cmd)?;
     if let Err(e) = s
         .capture_process_identity()
         .and_then(|_| session::write(&s))
@@ -242,18 +232,6 @@ pub fn start(args: &[String]) -> Result<()> {
 
     print_start_confirmation(&s, ka.note.as_deref());
     Ok(())
-}
-
-pub fn start_forever(args: &[String]) -> Result<()> {
-    let rest = &args[1..];
-    for a in rest {
-        if a != "--no-display" && a != "--even-lid" {
-            return Err(AppError::usage(
-                "forever only accepts --no-display and --even-lid",
-            ));
-        }
-    }
-    start(rest)
 }
 
 #[cfg(not(windows))]
@@ -276,13 +254,9 @@ fn start_charge_supervisor(charge: i32, mode: &str, no_display: bool) -> Result<
     ];
     let _child = sysutil::spawn_named(&cmd)?;
     wait_for_state_file();
-    match session::read_if_alive(false) {
-        Some(s) => print_start_confirmation(&s, None),
-        None => {
-            eprintln!("wake: supervisor failed to start");
-            std::process::exit(1);
-        }
-    }
+    let session = session::read_if_alive(false)
+        .ok_or_else(|| AppError::fail("supervisor failed to start"))?;
+    print_start_confirmation(&session, None);
     Ok(())
 }
 
@@ -294,8 +268,6 @@ fn wait_for_state_file() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
-
-// ---- status / stop ----
 
 pub fn status() -> Result<()> {
     let _lock = session::acquire_lock()?;
@@ -347,7 +319,7 @@ pub fn stop() -> Result<()> {
         session::delete_state_file();
         return Ok(());
     };
-    sysutil::terminate(s.pid);
+    sysutil::terminate_session(&s)?;
     if s.even_lid {
         #[cfg(windows)]
         restore_even_lid_windows(&s)?;
@@ -358,8 +330,6 @@ pub fn stop() -> Result<()> {
     println!("wake: stopped (pid {}, {})", s.pid, s.trigger);
     Ok(())
 }
-
-// ---- start confirmation + formatting ----
 
 fn print_start_confirmation(s: &Session, note: Option<&str>) {
     let started = s.started_at.map(hms).unwrap_or_else(|| "-".into());
@@ -416,17 +386,62 @@ fn seconds_until(hhmm: &str) -> Result<i64> {
         return Err(AppError::usage(format!("--until: invalid time '{hhmm}'")));
     }
     let now = Local::now();
-    // h/m were range-checked to 0..=23 / 0..=59 just above, so this is always Some.
-    let time = chrono::NaiveTime::from_hms_opt(h as u32, m as u32, 0).expect("valid HH:MM");
-    let naive = now.date_naive().and_time(time);
-    let mut target = match naive.and_local_timezone(Local) {
-        chrono::LocalResult::Single(t) | chrono::LocalResult::Ambiguous(t, _) => t,
-        chrono::LocalResult::None => now,
-    };
-    if target <= now {
-        target += Duration::days(1);
+    let time = NaiveTime::from_hms_opt(h as u32, m as u32, 0).expect("validated HH:MM");
+    let target = next_wall_time(&now, time, |wall| Local.from_local_datetime(&wall))?;
+    Ok(target.timestamp() - now.timestamp())
+}
+
+fn next_wall_time<Tz: TimeZone>(
+    now: &DateTime<Tz>,
+    time: NaiveTime,
+    mut localize: impl FnMut(NaiveDateTime) -> chrono::LocalResult<DateTime<Tz>>,
+) -> Result<DateTime<Tz>> {
+    let today = now.date_naive();
+    if let Some(target) =
+        earliest_future(wall_candidates(today.and_time(time), &mut localize)?, now)
+    {
+        return Ok(target);
     }
-    Ok((target - now).num_seconds())
+    let tomorrow = today
+        .succ_opt()
+        .ok_or_else(|| AppError::fail("cannot resolve tomorrow's calendar date"))?;
+    earliest_future(
+        wall_candidates(tomorrow.and_time(time), &mut localize)?,
+        now,
+    )
+    .ok_or_else(|| AppError::fail("cannot resolve the next --until time"))
+}
+
+fn wall_candidates<Tz: TimeZone>(
+    requested: NaiveDateTime,
+    localize: &mut impl FnMut(NaiveDateTime) -> chrono::LocalResult<DateTime<Tz>>,
+) -> Result<Vec<DateTime<Tz>>> {
+    match localize(requested) {
+        chrono::LocalResult::Single(time) => return Ok(vec![time]),
+        chrono::LocalResult::Ambiguous(first, second) => return Ok(vec![first, second]),
+        chrono::LocalResult::None => {}
+    }
+    for seconds in 1..=3 * 60 * 60 {
+        match localize(requested + Duration::seconds(seconds)) {
+            chrono::LocalResult::Single(time) => return Ok(vec![time]),
+            chrono::LocalResult::Ambiguous(first, second) => return Ok(vec![first, second]),
+            chrono::LocalResult::None => {}
+        }
+    }
+    Err(AppError::fail(
+        "cannot resolve --until local time within three hours",
+    ))
+}
+
+fn earliest_future<Tz: TimeZone>(
+    candidates: Vec<DateTime<Tz>>,
+    now: &DateTime<Tz>,
+) -> Option<DateTime<Tz>> {
+    let now_key = (now.timestamp(), now.timestamp_subsec_nanos());
+    candidates
+        .into_iter()
+        .filter(|candidate| (candidate.timestamp(), candidate.timestamp_subsec_nanos()) > now_key)
+        .min_by_key(|candidate| (candidate.timestamp(), candidate.timestamp_subsec_nanos()))
 }
 
 fn parse_int(s: &str, name: &str) -> Result<i32> {
@@ -438,8 +453,6 @@ fn parse_int(s: &str, name: &str) -> Result<i32> {
 fn even_lid_unsupported_message() -> String {
     "--even-lid is unsupported on Linux; lid-switch inhibition is handled through systemd when privileged".into()
 }
-
-// ---- even-lid: power-plan lid action (Windows) ----
 
 /// Set the lid-close action to (ac, dc). Tries a direct write first (it succeeds unprivileged for
 /// admin accounts); only if the OS denies it does it retry via the elevated `__set_lid__` helper (UAC).
@@ -518,10 +531,8 @@ fn start_charge_supervisor_windows(
     ];
     let _child = sysutil::spawn_named(&cmd)?;
     wait_for_state_file();
-    let Some(s) = session::read_if_alive(false) else {
-        eprintln!("wake: supervisor failed to start");
-        std::process::exit(1);
-    };
+    let s = session::read_if_alive(false)
+        .ok_or_else(|| AppError::fail("supervisor failed to start"))?;
     if prior_lid.is_some()
         && let Err(e) = enable_even_lid_windows()
     {
@@ -532,8 +543,6 @@ fn start_charge_supervisor_windows(
     print_start_confirmation(&s, None);
     Ok(())
 }
-
-// ---- even-lid: sudo + SleepDisabled (macOS) ----
 
 #[cfg(not(windows))]
 fn ensure_sudo_for_even_lid() -> Result<()> {
@@ -645,7 +654,6 @@ fn write_lid_startup_recovery_record(
     s.ends_at = timeout_sec.map(|t| now + Duration::seconds(t));
     s.even_lid = true;
     s.prior_disable_sleep = prior;
-    s.phase = PHASE_ENABLING.into();
     s.capture_process_identity()?;
     session::write(&s)
 }
@@ -740,12 +748,6 @@ fn restore_disable_sleep_best_effort(prior: i32) -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn print_sleep_restore_command(value: i32) {
-    eprintln!("wake: manual sleep restore command: sudo pmset -a disablesleep {value}");
-    print_sleep_state_path();
-}
-
-#[cfg(not(windows))]
 pub fn print_sleep_restore_rescue(value: i32) {
     eprintln!("wake: could not restore sleep; run: sudo pmset -a disablesleep {value}");
     print_sleep_state_path();
@@ -754,13 +756,6 @@ pub fn print_sleep_restore_rescue(value: i32) {
 #[cfg(not(windows))]
 fn print_sleep_state_path() {
     eprintln!("wake: recovery state: {}", session::state_file().display());
-}
-
-// ---- crash recovery ----
-
-pub fn recover_stale_lid_session_foreground() -> Result<()> {
-    let _lock = session::acquire_lock()?;
-    recover_stale_lid_session_unlocked()
 }
 
 pub fn recover_stale_lid_session_unlocked() -> Result<()> {
@@ -835,87 +830,105 @@ fn recover_crashed_even_lid_windows(saved: &Session) -> Result<()> {
 }
 
 fn recover_malformed_lid_session_unlocked(m: &session::MalformedState) -> Result<()> {
-    if !platform::supports_even_lid() {
-        if m.has_lid_recovery_hints() {
-            return Err(AppError::fail(format!(
-                "malformed --even-lid recovery state found at {}, but this platform cannot restore the lid action",
-                session::state_file().display()
-            )));
-        }
-        session::delete_state_file();
-        return Ok(());
-    }
-    #[cfg(windows)]
-    return recover_malformed_lid_session_windows(m);
-    #[cfg(not(windows))]
-    recover_malformed_lid_session_unix(m)
-}
-
-#[cfg(not(windows))]
-fn recover_malformed_lid_session_unix(m: &session::MalformedState) -> Result<()> {
-    let current = platform::read_disable_sleep().ok();
-    if !m.has_lid_recovery_hints() && current != Some(1) {
-        session::delete_state_file();
-        return Ok(());
-    }
-
-    let safe_restore = 0;
-    eprintln!(
-        "wake: malformed --even-lid recovery state at {}; using safe SleepDisabled=0 recovery",
-        session::state_file().display()
-    );
-    if let Some(prior) = m.parsed_prior_disable_sleep
-        && prior != safe_restore
-    {
-        eprintln!(
-            "wake: malformed state contained priorDisableSleep={prior}; safe recovery still uses 0"
-        );
-    }
-    print_sleep_restore_command(safe_restore);
-
-    if current == Some(safe_restore) {
-        session::delete_state_file();
-        return Ok(());
-    }
-    restore_disable_sleep_with_prompt_if_possible(
-        safe_restore,
-        "malformed lid recovery state needs sudo recovery, but no interactive terminal is available",
-    )?;
-    let after = platform::read_disable_sleep()?;
-    if after != safe_restore {
-        print_sleep_restore_rescue(safe_restore);
+    if m.has_lid_recovery_hints() {
         return Err(AppError::fail(format!(
-            "failed to recover malformed lid session; SleepDisabled is {after}"
+            "malformed lid recovery state retained at {}; refusing automatic OS changes",
+            session::state_file().display()
         )));
     }
     session::delete_state_file();
     Ok(())
 }
 
-/// Windows malformed-state recovery: the prior lid action is not trustworthy, so restore the OS
-/// default (lid close = Sleep) so the machine is not left unable to sleep on lid close.
-#[cfg(windows)]
-fn recover_malformed_lid_session_windows(m: &session::MalformedState) -> Result<()> {
-    if !m.has_lid_recovery_hints() {
-        session::delete_state_file();
-        return Ok(());
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{FixedOffset, LocalResult, NaiveDate};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
     }
-    let (safe_ac, safe_dc) = (1u32, 1u32); // Sleep on lid close
-    eprintln!(
-        "wake: malformed --even-lid recovery state at {}; restoring lid close to Sleep",
-        session::state_file().display()
-    );
-    let current = platform::read_lid_action()?;
-    if current != (safe_ac, safe_dc) {
-        set_lid(safe_ac, safe_dc)?;
-        let after = platform::read_lid_action()?;
-        if after != (safe_ac, safe_dc) {
-            return Err(AppError::fail(format!(
-                "failed to recover malformed lid session; lid action is AC={} DC={}",
-                after.0, after.1
-            )));
+
+    fn fixed(wall: NaiveDateTime, offset: i32) -> DateTime<FixedOffset> {
+        FixedOffset::east_opt(offset)
+            .unwrap()
+            .from_local_datetime(&wall)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn parser_routes_indefinite_and_rejects_duplicates() {
+        let parsed = parse_start_args(&args(&["forever", "--no-display"])).unwrap();
+        assert_eq!(parsed.trigger, "indefinite");
+        assert!(parsed.no_display);
+        for values in [
+            &["--no-display", "--no-display"][..],
+            &["--even-lid", "--even-lid"],
+        ] {
+            assert!(matches!(
+                parse_start_args(&args(values)),
+                Err(AppError::Usage(_))
+            ));
         }
     }
-    session::delete_state_file();
-    Ok(())
+
+    #[test]
+    fn invalid_pid_is_usage() {
+        assert!(matches!(
+            parse_start_args(&args(&["--while-pid", "not-a-pid"])),
+            Err(AppError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn until_fold_chooses_earliest_future_occurrence() {
+        let date = NaiveDate::from_ymd_opt(2024, 11, 3).unwrap();
+        let requested = date.and_hms_opt(1, 30, 0).unwrap();
+        let now = fixed(date.and_hms_opt(5, 45, 0).unwrap(), 0);
+        let target = next_wall_time(&now, requested.time(), |wall| {
+            if wall == requested {
+                LocalResult::Ambiguous(fixed(wall, -4 * 3600), fixed(wall, -5 * 3600))
+            } else {
+                LocalResult::Single(fixed(wall, -5 * 3600))
+            }
+        })
+        .unwrap();
+        assert_eq!(target.timestamp(), fixed(requested, -5 * 3600).timestamp());
+    }
+
+    #[test]
+    fn until_gap_uses_first_valid_wall_time() {
+        let date = NaiveDate::from_ymd_opt(2024, 3, 10).unwrap();
+        let gap_start = date.and_hms_opt(2, 0, 0).unwrap();
+        let gap_end = date.and_hms_opt(3, 0, 0).unwrap();
+        let now = fixed(date.and_hms_opt(1, 0, 0).unwrap(), -5 * 3600);
+        let target = next_wall_time(&now, date.and_hms_opt(2, 30, 0).unwrap().time(), |wall| {
+            if (gap_start..gap_end).contains(&wall) {
+                LocalResult::None
+            } else {
+                LocalResult::Single(fixed(wall, -4 * 3600))
+            }
+        })
+        .unwrap();
+        assert_eq!(target.naive_local(), gap_end);
+    }
+
+    #[test]
+    fn until_tomorrow_uses_the_next_calendar_date() {
+        let today = NaiveDate::from_ymd_opt(2024, 3, 9).unwrap();
+        let tomorrow = today.succ_opt().unwrap();
+        let now = fixed(today.and_hms_opt(23, 0, 0).unwrap(), -5 * 3600);
+        let target = next_wall_time(&now, NaiveTime::from_hms_opt(12, 0, 0).unwrap(), |wall| {
+            let offset = if wall.date() == today {
+                -5 * 3600
+            } else {
+                -4 * 3600
+            };
+            LocalResult::Single(fixed(wall, offset))
+        })
+        .unwrap();
+        assert_eq!(target.date_naive(), tomorrow);
+        assert_eq!(target.offset().local_minus_utc(), -4 * 3600);
+    }
 }

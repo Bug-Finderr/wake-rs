@@ -26,39 +26,8 @@ pub struct KeepAwake {
     pub note: Option<String>,
 }
 
-/// Run a pgrep-style command and collect the numeric pids it prints, ignoring stderr.
-#[cfg(unix)]
-pub fn pgrep(cmd: &[&str]) -> Vec<u32> {
-    let out = match std::process::Command::new(cmd[0])
-        .args(&cmd[1..])
-        .stderr(std::process::Stdio::null())
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .collect()
-}
-
-/// First pid that is alive, not ourselves/our parent, and whose command does not look like wake.
-pub fn first_allowed_pid(pids: &[u32]) -> Option<u32> {
-    pids.iter().copied().find(|&pid| is_allowed_app_pid(pid))
-}
-
-fn is_allowed_app_pid(pid: u32) -> bool {
-    if pid == sysutil::current_pid() || Some(pid) == sysutil::parent_pid() {
-        return false;
-    }
-    match sysutil::live_identity(pid) {
-        None => false,
-        Some(id) => {
-            let haystack = format!("{} {}", id.command, id.command_line).to_lowercase();
-            !haystack.contains("wake")
-        }
-    }
+pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
+    sysutil::find_app_pid(name)
 }
 
 /// Find an executable named `executable` on PATH and return its full path.

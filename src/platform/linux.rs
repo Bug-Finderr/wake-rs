@@ -17,10 +17,6 @@ pub fn expected_command_basenames() -> &'static [&'static str] {
     EXPECTED
 }
 
-pub fn supports_interactive() -> bool {
-    true
-}
-
 pub fn supports_even_lid() -> bool {
     false
 }
@@ -60,28 +56,6 @@ pub fn keep_awake_command(
         );
     }
     Ok(KeepAwake { cmd, note })
-}
-
-pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
-    let pattern = case_insensitive_ere(name);
-    let exact = super::first_allowed_pid(&super::pgrep(&["pgrep", "-x", &pattern]));
-    if exact.is_some() {
-        return Ok(exact);
-    }
-    if name.chars().count() > 15 {
-        let short: String = name.chars().take(15).collect();
-        let exact = super::first_allowed_pid(&super::pgrep(&[
-            "pgrep",
-            "-x",
-            &case_insensitive_ere(&short),
-        ]));
-        if exact.is_some() {
-            return Ok(exact);
-        }
-    }
-    Ok(super::first_allowed_pid(&super::pgrep(&[
-        "pgrep", "-f", &pattern,
-    ])))
 }
 
 pub fn read_battery() -> Result<BatteryStatus> {
@@ -160,8 +134,6 @@ pub fn set_disable_sleep_non_interactive(_value: i32) -> Result<bool> {
 pub fn refresh_sudo_non_interactive() -> Result<bool> {
     unsupported()
 }
-
-// ---- helpers ----
 
 fn choose_inhibitor_what(
     no_display: bool,
@@ -251,34 +223,4 @@ fn read_measurement(dir: &Path, now_name: &str, full_name: &str) -> Option<(u64,
         return None;
     }
     Some((now as u64, full as u64))
-}
-
-fn case_insensitive_ere(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() * 4);
-    for c in name.chars() {
-        if c.is_ascii_lowercase() {
-            out.push('[');
-            out.push(c);
-            out.push(c.to_ascii_uppercase());
-            out.push(']');
-        } else if c.is_ascii_uppercase() {
-            out.push('[');
-            out.push(c.to_ascii_lowercase());
-            out.push(c);
-            out.push(']');
-        } else if is_ere_metacharacter(c) {
-            out.push('\\');
-            out.push(c);
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-fn is_ere_metacharacter(c: char) -> bool {
-    matches!(
-        c,
-        '.' | '[' | ']' | '\\' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | '|' | '(' | ')'
-    )
 }

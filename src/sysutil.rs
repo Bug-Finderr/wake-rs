@@ -1,17 +1,15 @@
-//! Process helpers backed by `sysinfo`: liveness, identity capture/match, termination,
-//! detached spawning, and locating our own executable.
+//! Process discovery, identity, termination, and detached spawning.
 
 use crate::error::{AppError, Result};
+use crate::session::Session;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
-/// Identity fingerprint of a process: start time (epoch seconds), executable path, full command line.
 pub struct Identity {
     pub start: u64,
     pub command: String,
-    pub command_line: String,
 }
 
 fn refreshed(pid: u32) -> System {
@@ -38,28 +36,14 @@ fn process_exists(pid: u32) -> bool {
 }
 
 fn identity_of(sys: &System, pid: u32) -> Option<Identity> {
-    let p = sys.process(Pid::from_u32(pid))?;
-    let command = p
+    let process = sys.process(Pid::from_u32(pid))?;
+    let command = process
         .exe()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.name().to_string_lossy().into_owned());
-    let command_line = {
-        let joined = p
-            .cmd()
-            .iter()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if joined.is_empty() {
-            command.clone()
-        } else {
-            joined
-        }
-    };
+        .map(|exe| exe.to_string_lossy().into_owned())
+        .unwrap_or_else(|| process.name().to_string_lossy().into_owned());
     Some(Identity {
-        start: p.start_time(),
+        start: process.start_time(),
         command,
-        command_line,
     })
 }
 
@@ -73,7 +57,6 @@ pub fn live_identity(pid: u32) -> Option<Identity> {
     identity_of(&sys, pid)
 }
 
-/// Capture identity, erroring (like the reference) if the process or its start time is unreadable.
 pub fn capture_identity(pid: u32) -> Result<Identity> {
     live_identity(pid).ok_or_else(|| AppError::fail(format!("process {pid} is not running")))
 }
@@ -86,18 +69,85 @@ pub fn parent_pid() -> Option<u32> {
     let me = current_pid();
     refreshed(me)
         .process(Pid::from_u32(me))
-        .and_then(|p| p.parent())
-        .map(|p| p.as_u32())
+        .and_then(|process| process.parent())
+        .map(|pid| pid.as_u32())
 }
 
-/// SIGTERM then SIGKILL (Unix) / TerminateProcess (Windows), matching the reference's grace window.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum AppMatch {
+    Exact,
+    Substring,
+}
+
+pub fn find_app_pid(raw: &str) -> Result<Option<u32>> {
+    let query = raw.trim().to_lowercase();
+    if query.is_empty() {
+        return Err(AppError::usage("app/process name cannot be empty"));
+    }
+    let self_pid = current_pid();
+    let parent_pid = parent_pid();
+    let system = System::new_all();
+    Ok(choose_app_pid(system.processes().iter().filter_map(
+        |(pid, process)| {
+            let pid = pid.as_u32();
+            if pid == self_pid || Some(pid) == parent_pid || is_wake_process(process) {
+                return None;
+            }
+            app_match(&query, process).map(|rank| (rank, pid))
+        },
+    )))
+}
+
+fn choose_app_pid(matches: impl IntoIterator<Item = (AppMatch, u32)>) -> Option<u32> {
+    matches
+        .into_iter()
+        .min_by_key(|&(rank, pid)| (rank, pid))
+        .map(|(_, pid)| pid)
+}
+
+fn app_match(query: &str, process: &Process) -> Option<AppMatch> {
+    let name = process.name().to_string_lossy().to_lowercase();
+    let exe = process
+        .exe()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match_names(query, &name, &exe)
+}
+
+fn match_names(query: &str, process_name: &str, exe_basename: &str) -> Option<AppMatch> {
+    let query = query.to_lowercase();
+    let process_name = process_name.to_lowercase();
+    let exe_basename = exe_basename.to_lowercase();
+    if process_name == query || exe_basename == query {
+        Some(AppMatch::Exact)
+    } else if process_name.contains(&query) || exe_basename.contains(&query) {
+        Some(AppMatch::Substring)
+    } else {
+        None
+    }
+}
+
+fn is_wake_process(process: &Process) -> bool {
+    let name = process.name().to_string_lossy();
+    let exe = process
+        .exe()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy());
+    is_wake_name(&name) || exe.as_deref().is_some_and(is_wake_name)
+}
+
+fn is_wake_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("wake") || name.eq_ignore_ascii_case("wake.exe")
+}
+
 pub fn terminate(pid: u32) {
     {
-        let sys = refreshed(pid);
-        match sys.process(Pid::from_u32(pid)) {
-            Some(p) => {
-                if p.kill_with(Signal::Term).is_none() {
-                    p.kill();
+        let system = refreshed(pid);
+        match system.process(Pid::from_u32(pid)) {
+            Some(process) => {
+                if process.kill_with(Signal::Term).is_none() {
+                    process.kill();
                 }
             }
             None => return,
@@ -106,10 +156,39 @@ pub fn terminate(pid: u32) {
     if wait_gone(pid, Duration::from_secs(5)) {
         return;
     }
-    if let Some(p) = refreshed(pid).process(Pid::from_u32(pid)) {
-        p.kill();
+    if let Some(process) = refreshed(pid).process(Pid::from_u32(pid)) {
+        process.kill();
     }
     wait_gone(pid, Duration::from_secs(1));
+}
+
+pub fn terminate_session(session: &Session) -> Result<()> {
+    if !signal_session(session, false)? || wait_gone(session.pid, Duration::from_secs(5)) {
+        return Ok(());
+    }
+    signal_session(session, true)?;
+    wait_gone(session.pid, Duration::from_secs(1));
+    Ok(())
+}
+
+fn signal_session(session: &Session, force: bool) -> Result<bool> {
+    let system = refreshed(session.pid);
+    let Some(process) = system.process(Pid::from_u32(session.pid)) else {
+        return Ok(false);
+    };
+    let Some(identity) = identity_of(&system, session.pid) else {
+        return Ok(false);
+    };
+    if !session.matches_identity(&identity) {
+        return Err(AppError::fail(format!(
+            "session process {} changed identity; refusing to terminate it",
+            session.pid
+        )));
+    }
+    if force || process.kill_with(Signal::Term).is_none() {
+        process.kill();
+    }
+    Ok(true)
 }
 
 fn wait_gone(pid: u32, within: Duration) -> bool {
@@ -129,16 +208,15 @@ pub fn verify_child_alive(pid: u32) -> bool {
     is_alive(pid)
 }
 
-/// Reference parity: if the keep-awake child died immediately, report and exit 1.
-pub fn require_child_alive(pid: u32, cmd: &[String]) {
+pub fn require_child_alive(pid: u32, cmd: &[String]) -> Result<()> {
     if verify_child_alive(pid) {
-        return;
+        Ok(())
+    } else {
+        Err(AppError::fail(format!(
+            "keep-awake process exited immediately ({}); see platform requirements",
+            command_basename(cmd)
+        )))
     }
-    eprintln!(
-        "wake: keep-awake process exited immediately ({}); see platform requirements",
-        command_basename(cmd)
-    );
-    std::process::exit(1);
 }
 
 fn command_basename(cmd: &[String]) -> String {
@@ -336,6 +414,46 @@ mod win {
 #[cfg(unix)]
 fn detach(c: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // New process group so terminal SIGINT/SIGTSTP don't reach the detached child.
     c.process_group(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_app_query_is_usage() {
+        assert!(matches!(find_app_pid("  \t"), Err(AppError::Usage(_))));
+    }
+
+    #[test]
+    fn app_match_prefers_exact_then_literal_substring() {
+        assert_eq!(
+            match_names("SLACK.EXE", "slack", "slack.exe"),
+            Some(AppMatch::Exact)
+        );
+        assert_eq!(
+            match_names("app[1]", "my-app[1]-helper", "helper"),
+            Some(AppMatch::Substring)
+        );
+        assert_eq!(match_names("app.", "appx", "other"), None);
+    }
+
+    #[test]
+    fn app_selection_prefers_exact_then_lowest_pid() {
+        assert_eq!(
+            choose_app_pid([
+                (AppMatch::Substring, 1),
+                (AppMatch::Exact, 9),
+                (AppMatch::Exact, 3),
+            ]),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn wake_exclusion_is_exact() {
+        assert!(is_wake_name("WAKE.EXE"));
+        assert!(!is_wake_name("wake-helper.exe"));
+    }
 }

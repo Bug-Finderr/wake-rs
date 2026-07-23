@@ -1,4 +1,4 @@
-//! wake - keep your machine awake from the CLI. Rust port of wake-cli (binary name: `wake`).
+//! wake - keep your machine awake from the CLI.
 
 mod commands;
 mod durations;
@@ -7,9 +7,6 @@ mod platform;
 mod session;
 mod supervisor;
 mod sysutil;
-
-#[cfg(unix)]
-mod interactive;
 
 use error::AppError;
 
@@ -27,40 +24,54 @@ fn main() {
 }
 
 fn dispatch(args: &[String]) -> Result<(), AppError> {
-    if let Some(first) = args.first() {
-        match first.as_str() {
-            "-h" | "--help" | "help" => {
-                print_help();
-                return Ok(());
-            }
-            "-v" | "--version" | "version" => {
-                println!("wake {VERSION}");
-                return Ok(());
-            }
-            "status" => return commands::status(),
-            "stop" => return commands::stop(),
-            "forever" | "indefinite" => return commands::start_forever(args),
-            "__supervise_charge__" => return supervisor::run_charge(args),
-            "__supervise_lid__" => return supervisor::run_lid(args),
-            #[cfg(windows)]
-            "__set_lid__" => return set_lid(&args[1..]),
-            _ => return commands::start(args),
-        }
+    if args.len() > 1 && args.iter().any(|arg| is_help_or_version(arg)) {
+        return Err(AppError::usage("help and version must be used alone"));
     }
-
-    commands::recover_stale_lid_session_foreground()?;
-
-    #[cfg(unix)]
-    {
-        if commands::is_console() && platform::supports_interactive() {
-            return interactive::run();
+    let Some((first, rest)) = args.split_first() else {
+        return commands::start(args);
+    };
+    match first.as_str() {
+        "-h" | "--help" | "help" => {
+            print_help();
+            Ok(())
         }
+        "-v" | "--version" | "version" => {
+            println!("wake {VERSION}");
+            Ok(())
+        }
+        "status" => {
+            reject_trailing(first, rest)?;
+            commands::status()
+        }
+        "stop" => {
+            reject_trailing(first, rest)?;
+            commands::stop()
+        }
+        "__supervise_charge__" => supervisor::run_charge(args),
+        "__supervise_lid__" => supervisor::run_lid(args),
+        #[cfg(windows)]
+        "__set_lid__" => set_lid(rest),
+        _ => commands::start(args),
     }
-    commands::start(&[])
 }
 
-/// Hidden, Windows-only helper meant to run elevated: set the power-plan lid action to `<ac> <dc>`.
-/// Success is a silent exit 0; failure prints to stderr (via `main`) and exits non-zero.
+fn is_help_or_version(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-h" | "--help" | "help" | "-v" | "--version" | "version"
+    )
+}
+
+fn reject_trailing(command: &str, args: &[String]) -> Result<(), AppError> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::usage(format!(
+            "{command} does not accept arguments"
+        )))
+    }
+}
+
 #[cfg(windows)]
 fn set_lid(args: &[String]) -> Result<(), AppError> {
     fn parse(raw: &str) -> Result<u32, AppError> {
@@ -86,12 +97,9 @@ platforms:
   Windows uses PowerShell + SetThreadExecutionState
   note: closing the lid still sleeps the mac unless you use --even-lid
 
-interactive:
-  wake                       open the picker on macOS/Linux; on Windows, start indefinitely
-                             (macOS/Linux: a non-interactive or piped 'wake' starts indefinitely)
-
-direct:
-  wake forever               stay awake indefinitely (no menu)
+usage:
+  wake                       stay awake indefinitely
+  wake forever               stay awake indefinitely
   wake <duration>            e.g. wake 1h, wake 30m, wake 1h30m, wake 90s
   wake -t <duration>         same as above with explicit flag
   wake --until HH:MM         stay awake until clock time
@@ -117,4 +125,32 @@ state file:
   ~/.local/state/wake/session.properties (override dir with WAKE_STATE_DIR)
   Windows: %LOCALAPPDATA%\wake\session.properties"#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn fixed_commands_reject_trailing_args() {
+        for values in [
+            &["help", "extra"][..],
+            &["version", "extra"],
+            &["status", "extra"],
+            &["stop", "extra"],
+        ] {
+            assert!(matches!(dispatch(&args(values)), Err(AppError::Usage(_))));
+        }
+    }
+
+    #[test]
+    fn start_help_and_version_must_be_alone() {
+        for values in [&["1h", "--help"][..], &["--no-display", "--version"]] {
+            assert!(matches!(dispatch(&args(values)), Err(AppError::Usage(_))));
+        }
+    }
 }

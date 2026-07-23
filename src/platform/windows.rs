@@ -1,5 +1,4 @@
-//! Windows: PowerShell `SetThreadExecutionState` for sleep blocking, `Win32_Battery` for charge,
-//! `tasklist` for app lookup, and the power-plan lid-close action for `--even-lid`.
+//! Windows sleep inhibition, battery status, and lid-close control.
 
 use super::KeepAwake;
 use crate::error::{AppError, Result};
@@ -19,11 +18,6 @@ const EXPECTED: &[&str] = &["powershell.exe", "powershell", "wake.exe", "wake"];
 
 pub fn expected_command_basenames() -> &'static [&'static str] {
     EXPECTED
-}
-
-#[allow(dead_code)] // part of the platform surface; the picker is gated to unix
-pub fn supports_interactive() -> bool {
-    false
 }
 
 pub fn supports_even_lid() -> bool {
@@ -101,29 +95,6 @@ pub fn read_battery() -> Result<BatteryStatus> {
     summarize_batteries(&parse_csv(&out)?)
 }
 
-pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
-    if name.contains('"') {
-        return Err(AppError::usage(
-            "app/process name cannot contain double quotes",
-        ));
-    }
-    for image in image_name_candidates(name) {
-        let filter = format!("IMAGENAME eq {image}");
-        let out = run_capture("tasklist", &["/FO", "CSV", "/NH", "/FI", filter.as_str()])?;
-        let pids: Vec<u32> = parse_csv(&out)?
-            .iter()
-            .filter(|row| row.len() >= 2)
-            .filter_map(|row| row[1].trim().parse::<u32>().ok())
-            .collect();
-        if let Some(allowed) = super::first_allowed_pid(&pids) {
-            return Ok(Some(allowed));
-        }
-    }
-    Ok(None)
-}
-
-// ---- even-lid: power-plan lid-close action ----
-//
 // `SetThreadExecutionState` (used for idle inhibition above) cannot stop the lid-close switch from
 // sleeping the machine; only the active power plan's lid action can. We read the prior AC/DC lid
 // action, set both to "Do nothing" (0) while a session is active, and restore them on stop/recover.
@@ -230,20 +201,9 @@ pub fn write_lid_action(ac: u32, dc: u32) -> Result<()> {
     }
 }
 
-// ---- helpers ----
-
 fn resolve_powershell() -> Result<String> {
     super::resolve_on_path("powershell.exe", POWERSHELL_MISSING)
         .or_else(|_| super::resolve_on_path("powershell", POWERSHELL_MISSING))
-}
-
-fn image_name_candidates(name: &str) -> Vec<String> {
-    let trimmed = name.trim();
-    if trimmed.to_lowercase().ends_with(".exe") {
-        vec![trimmed.to_string()]
-    } else {
-        vec![format!("{trimmed}.exe"), trimmed.to_string()]
-    }
 }
 
 fn run_capture(program: &str, args: &[&str]) -> Result<String> {
@@ -303,7 +263,6 @@ fn summarize_batteries(rows: &[Vec<String>]) -> Result<BatteryStatus> {
     })
 }
 
-/// Minimal RFC-4180-ish CSV parser matching the reference: quotes, `""` escapes, CR/LF rows.
 fn parse_csv(input: &str) -> Result<Vec<Vec<String>>> {
     let mut rows = Vec::new();
     let mut row: Vec<String> = Vec::new();
@@ -407,12 +366,6 @@ mod tests {
         assert!(b.charging);
         assert!(!b.discharging);
         assert!(b.neutral_state.is_none());
-    }
-
-    #[test]
-    fn image_candidates() {
-        assert_eq!(image_name_candidates("foo"), vec!["foo.exe", "foo"]);
-        assert_eq!(image_name_candidates("Foo.EXE"), vec!["Foo.EXE"]);
     }
 
     #[test]

@@ -16,7 +16,6 @@ chrono = "0.4.45"
 sysinfo = { version = "0.39.5", default-features = false, features = ["system"] }
 
 [target."cfg(unix)".dependencies]
-crossterm = "0.29.0"
 signal-hook = "0.4.4"
 
 [target."cfg(windows)".dependencies]

@@ -8,10 +8,6 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 
-#[cfg(not(windows))]
-pub const PHASE_ENABLING: &str = "enabling";
-pub const PHASE_ACTIVE: &str = "active";
-
 pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("WAKE_STATE_DIR")
         && !dir.is_empty()
@@ -66,52 +62,40 @@ pub struct Session {
     pub ends_at: Option<DateTime<Utc>>,
     pub process_start: u64,
     pub process_command: String,
-    pub process_command_line: String,
     pub even_lid: bool,
     pub prior_disable_sleep: i32,
-    pub phase: String,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Session {
-            phase: PHASE_ACTIVE.to_string(),
-            ..Default::default()
-        }
+        Self::default()
     }
 
-    /// Fill identity fields from the live process at `self.pid`.
     pub fn capture_process_identity(&mut self) -> Result<()> {
         let id = sysutil::capture_identity(self.pid)?;
         self.process_start = id.start;
         self.process_command = id.command;
-        self.process_command_line = id.command_line;
         Ok(())
     }
 
-    /// True if the recorded pid is still the same live process we started.
+    pub fn matches_identity(&self, live: &sysutil::Identity) -> bool {
+        self.process_start == live.start
+            && self.process_command == live.command
+            && is_expected_command(&live.command)
+    }
+
     pub fn matches_live_process(&self) -> bool {
-        match sysutil::live_identity(self.pid) {
-            None => false,
-            Some(live) => {
-                self.process_start == live.start
-                    && self.process_command == live.command
-                    && is_expected_command(&live.command, &live.command_line)
-            }
-        }
+        sysutil::live_identity(self.pid).is_some_and(|live| self.matches_identity(&live))
     }
 }
 
-fn is_expected_command(command: &str, command_line: &str) -> bool {
+fn is_expected_command(command: &str) -> bool {
     let base = std::path::Path::new(command)
         .file_name()
         .map(|f| f.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    let line = command_line.to_lowercase();
-    platform::expected_command_basenames().contains(&base.as_str()) || line.contains("wake")
+    platform::expected_command_basenames().contains(&base.as_str())
 }
-
-// ---- read ----
 
 pub enum SavedState {
     Valid(Session),
@@ -121,10 +105,6 @@ pub enum SavedState {
 pub struct MalformedState {
     pub even_lid_true: bool,
     pub has_prior_disable_sleep: bool,
-    // Only the macOS malformed-recovery path inspects the parsed prior; Windows recovery restores a
-    // safe default instead.
-    #[cfg_attr(windows, allow(dead_code))]
-    pub parsed_prior_disable_sleep: Option<i32>,
 }
 
 impl MalformedState {
@@ -192,7 +172,7 @@ fn build_session(p: &HashMap<String, String>) -> Option<Session> {
         None | Some("") => None,
         Some(s) => Some(parse_ts(s)?),
     };
-    let process_start = p.get("processStartMs")?.trim().parse().ok()?;
+    let process_start = p.get("processStart")?.trim().parse().ok()?;
     let prior_disable_sleep = parse_disable_sleep(p.get("priorDisableSleep").map_or("0", |v| v))?;
 
     Some(Session {
@@ -204,16 +184,11 @@ fn build_session(p: &HashMap<String, String>) -> Option<Session> {
         ends_at,
         process_start,
         process_command: p.get("processCommand").cloned().unwrap_or_default(),
-        process_command_line: p.get("processCommandLine").cloned().unwrap_or_default(),
         even_lid: p
             .get("evenLid")
             .map(|v| v.trim() == "true")
             .unwrap_or(false),
         prior_disable_sleep,
-        phase: p
-            .get("phase")
-            .cloned()
-            .unwrap_or_else(|| PHASE_ACTIVE.to_string()),
     })
 }
 
@@ -252,13 +227,8 @@ fn malformed_from(p: &HashMap<String, String>) -> MalformedState {
             .map(|v| v.trim() == "true")
             .unwrap_or(false),
         has_prior_disable_sleep: p.contains_key("priorDisableSleep"),
-        parsed_prior_disable_sleep: p
-            .get("priorDisableSleep")
-            .and_then(|v| parse_disable_sleep(v)),
     }
 }
-
-// ---- write ----
 
 /// Wrap a state-file IO error with the offending path and the `WAKE_STATE_DIR` escape hatch, so
 /// permission/quota failures point at the directory instead of surfacing a bare OS error.
@@ -289,25 +259,14 @@ pub fn write(s: &Session) -> Result<()> {
         "endsAt",
         &s.ends_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
     );
-    push(&mut out, "processStartMs", &s.process_start.to_string());
+    push(&mut out, "processStart", &s.process_start.to_string());
     push(&mut out, "processCommand", &s.process_command);
-    push(&mut out, "processCommandLine", &s.process_command_line);
     push(&mut out, "evenLid", &s.even_lid.to_string());
     push(
         &mut out,
         "priorDisableSleep",
         &s.prior_disable_sleep.to_string(),
     );
-    push(
-        &mut out,
-        "phase",
-        if s.phase.is_empty() {
-            PHASE_ACTIVE
-        } else {
-            &s.phase
-        },
-    );
-
     let tmp = dir.join("session.properties.tmp");
     fs::write(&tmp, out).map_err(|e| state_io_err(&tmp, e))?;
     if let Err(e) = fs::rename(&tmp, state_file()) {
@@ -324,8 +283,6 @@ fn ts(t: Option<DateTime<Utc>>) -> String {
 pub fn delete_state_file() {
     let _ = fs::remove_file(state_file());
 }
-
-// ---- lock ----
 
 pub struct LockGuard {
     file: File,
@@ -368,12 +325,10 @@ mod tests {
              detail=1h\n\
              startedAt=2024-01-02T03:04:05+00:00\n\
              endsAt=2024-01-02T04:04:05+00:00\n\
-             processStartMs=1700000000\n\
+             processStart=1700000000\n\
              processCommand=/usr/bin/caffeinate\n\
-             processCommandLine=/usr/bin/caffeinate -d\n\
              evenLid=false\n\
-             priorDisableSleep=0\n\
-             phase=active\n";
+             priorDisableSleep=0\n";
         let s = build_session(&parse_properties(text)).expect("valid session");
         assert_eq!(s.pid, 4321);
         assert_eq!(s.mode, "display+system");
@@ -384,12 +339,11 @@ mod tests {
         assert!(s.started_at.is_some());
         assert!(s.ends_at.is_some());
         assert!(!s.even_lid);
-        assert_eq!(s.phase, PHASE_ACTIVE);
     }
 
     #[test]
     fn missing_started_at_is_none() {
-        let text = "pid=1\nprocessStartMs=10\n";
+        let text = "pid=1\nprocessStart=10\n";
         assert!(build_session(&parse_properties(text)).is_none());
     }
 
@@ -401,6 +355,17 @@ mod tests {
         assert_eq!(p.get("spaced").map(String::as_str), Some(" trimmed-key"));
         assert!(!p.contains_key("# a comment"));
         assert_eq!(p.len(), 2);
+    }
+
+    #[test]
+    fn malformed_lid_hints_are_detected_without_guessing_values() {
+        assert!(!malformed_from(&HashMap::new()).has_lid_recovery_hints());
+        for text in ["evenLid=true", "priorDisableSleep=not-a-number"] {
+            assert!(
+                malformed_from(&parse_properties(text)).has_lid_recovery_hints(),
+                "missing hint in {text}"
+            );
+        }
     }
 
     #[cfg(windows)]

@@ -5,8 +5,6 @@
 use crate::commands;
 use crate::error::{AppError, Result};
 use crate::platform;
-#[cfg(not(windows))]
-use crate::session::PHASE_ACTIVE;
 use crate::session::{self, Session};
 use crate::sysutil;
 use chrono::Utc;
@@ -98,8 +96,6 @@ fn install_stop_flag() -> Arc<AtomicBool> {
     flag
 }
 
-// ---- until-charge supervisor ----
-
 pub fn run_charge(args: &[String]) -> Result<()> {
     if args.len() < 4 {
         return Err(AppError::fail("supervisor: bad args"));
@@ -131,7 +127,7 @@ pub fn run_charge(args: &[String]) -> Result<()> {
 
     let ka = platform::keep_awake_command(no_display, None, None)?;
     let mut child = sysutil::spawn_supervised_child(&ka.cmd)?;
-    sysutil::require_child_alive(child.id(), &ka.cmd);
+    sysutil::require_child_alive(child.id(), &ka.cmd)?;
 
     let mut s = Session::new();
     s.pid = sysutil::current_pid();
@@ -206,8 +202,6 @@ fn restore_lid_on_windows(prior: i32) {
     let _ = sysutil::run_elevated_self(&["__set_lid__", &ac.to_string(), &dc.to_string()]);
 }
 
-// ---- even-lid supervisor (macOS) ----
-
 /// Windows never spawns the lid supervisor (even-lid is overlaid on the normal session via the
 /// power-plan lid action), so this is an inert stub there.
 #[cfg(windows)]
@@ -250,7 +244,7 @@ pub fn run_lid(args: &[String]) -> Result<()> {
 
     let ka = platform::keep_awake_command(no_display, timeout_sec, wait_pid)?;
     let mut child = sysutil::spawn_supervised_child(&ka.cmd)?;
-    sysutil::require_child_alive(child.id(), &ka.cmd);
+    sysutil::require_child_alive(child.id(), &ka.cmd)?;
 
     let mut s = Session::new();
     s.pid = sysutil::current_pid();
@@ -265,7 +259,6 @@ pub fn run_lid(args: &[String]) -> Result<()> {
     s.ends_at = timeout_sec.map(|t| Utc::now() + chrono::Duration::seconds(t));
     s.even_lid = true;
     s.prior_disable_sleep = prior_disable_sleep;
-    s.phase = PHASE_ACTIVE.into();
     if let Err(e) = s
         .capture_process_identity()
         .and_then(|_| session::write(&s))
@@ -315,7 +308,6 @@ pub fn run_lid(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Restore SleepDisabled and remove state, matching the reference lid teardown.
 #[cfg(not(windows))]
 fn lid_cleanup(child_pid: u32, prior_disable_sleep: i32) {
     if let Ok(current) = platform::read_disable_sleep()

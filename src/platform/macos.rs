@@ -7,17 +7,12 @@ use std::process::{Command, Stdio};
 
 const CAFFEINATE: &str = "/usr/bin/caffeinate";
 const PMSET: &str = "/usr/bin/pmset";
-const PGREP: &str = "/usr/bin/pgrep";
 const SUDO: &str = "/usr/bin/sudo";
 const LID_CLOSE_NOTE: &str = "note: closing the lid still sleeps the mac unless you use --even-lid";
 const EXPECTED: &[&str] = &["caffeinate", "wake"];
 
 pub fn expected_command_basenames() -> &'static [&'static str] {
     EXPECTED
-}
-
-pub fn supports_interactive() -> bool {
-    true
 }
 
 pub fn supports_even_lid() -> bool {
@@ -66,16 +61,6 @@ pub fn read_battery() -> Result<BatteryStatus> {
     })
 }
 
-pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
-    let exact = super::first_allowed_pid(&super::pgrep(&[PGREP, "-i", "-x", name]));
-    if exact.is_some() {
-        return Ok(exact);
-    }
-    Ok(super::first_allowed_pid(&super::pgrep(&[
-        PGREP, "-i", "-f", name,
-    ])))
-}
-
 pub fn read_disable_sleep() -> Result<i32> {
     let out = capture(PMSET, &["-g"])?;
     for line in out.lines() {
@@ -110,8 +95,6 @@ pub fn set_disable_sleep_non_interactive(value: i32) -> Result<bool> {
 pub fn refresh_sudo_non_interactive() -> Result<bool> {
     Ok(run_quiet(&[SUDO, "-n", "-v"])? == 0)
 }
-
-// ---- helpers ----
 
 fn first_percent(out: &str) -> Option<i32> {
     let bytes = out.as_bytes();

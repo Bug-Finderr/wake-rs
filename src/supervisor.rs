@@ -183,8 +183,7 @@ mod unix {
         let (child_timeout, child_wait_pid) = supervisor_inhibitor_lifetime();
         let keep_awake = platform::keep_awake_command(no_display, child_timeout, child_wait_pid)?;
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
-        let child_pid = child.id();
-        sysutil::require_child_alive(child_pid, &keep_awake.cmd)?;
+        sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
 
         let mut session = Session {
             pid: std::process::id(),
@@ -205,7 +204,7 @@ mod unix {
         let mut failures = 0;
         loop {
             sleep(Duration::from_secs(1));
-            if stop.load(Ordering::Relaxed) || !sysutil::is_alive(child_pid) {
+            if stop.load(Ordering::Relaxed) || child.try_wait()?.is_some() {
                 break;
             }
             if last_check.elapsed() >= POLL_INTERVAL {
@@ -260,10 +259,9 @@ mod unix {
 
         let (child_timeout, child_wait_pid) = supervisor_inhibitor_lifetime();
         let keep_awake = platform::keep_awake_command(no_display, child_timeout, child_wait_pid)?;
-        let child = sysutil::spawn_detached(&keep_awake.cmd)?;
-        let child_pid = child.id();
+        let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
+        sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
         cleanup.child = Some(child);
-        sysutil::require_child_alive(child_pid, &keep_awake.cmd)?;
 
         let now = Utc::now();
         let mut session = Session {
@@ -292,7 +290,11 @@ mod unix {
         let mut failures = 0;
         loop {
             sleep(Duration::from_secs(1));
-            if stop.load(Ordering::Relaxed) || !sysutil::is_alive(child_pid) {
+            let child_exited = match cleanup.child.as_mut() {
+                Some(child) => child.try_wait()?.is_some(),
+                None => true,
+            };
+            if stop.load(Ordering::Relaxed) || child_exited {
                 break;
             }
             if timeout_sec

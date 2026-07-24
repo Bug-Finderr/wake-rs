@@ -211,7 +211,7 @@ fn start_unix(p: Parsed) -> Result<()> {
             .map(|timeout| now + Duration::seconds(timeout)),
         ..Session::default()
     };
-    sysutil::require_child_alive(saved.pid, &keep_awake.cmd)?;
+    sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
     if let Err(error) = saved
         .capture_process_identity()
         .and_then(|()| session::write(&saved))
@@ -663,10 +663,7 @@ fn wait_for_lid_ready(
             return Err(AppError::fail("worker exited during even-lid startup"));
         }
         if !guardian.is_running()? {
-            return Err(AppError::fail(format!(
-                "elevated guardian exited before readiness; recovery state retained at {}",
-                session::state_file().display()
-            )));
+            return Err(AppError::fail("elevated guardian exited before readiness"));
         }
         if let Some(session::SavedState::Valid(saved)) = session::read_saved_for_recovery() {
             let health = platform::lid_health(
@@ -692,10 +689,7 @@ fn wait_for_lid_ready(
         }
         std::thread::sleep(StdDuration::from_millis(100));
     }
-    Err(AppError::fail(format!(
-        "timed out waiting for even-lid readiness; guardian was not terminated and state remains at {}",
-        session::state_file().display()
-    )))
+    Err(AppError::fail("timed out waiting for even-lid readiness"))
 }
 
 #[cfg(windows)]

@@ -193,15 +193,14 @@ fn wait_gone(pid: u32, within: Duration) -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn require_child_alive(pid: u32, cmd: &[String]) -> Result<()> {
+pub fn require_child_alive(child: &mut Child, cmd: &[String]) -> Result<()> {
     sleep(Duration::from_millis(300));
-    if is_alive(pid) {
-        Ok(())
-    } else {
-        Err(AppError::fail(format!(
-            "keep-awake process exited immediately ({}); see platform requirements",
+    match child.try_wait()? {
+        None => Ok(()),
+        Some(status) => Err(AppError::fail(format!(
+            "keep-awake process exited immediately ({}, {status}); see platform requirements",
             command_basename(cmd)
-        )))
+        ))),
     }
 }
 
@@ -676,6 +675,20 @@ mod tests {
     fn wake_exclusion_is_exact() {
         assert!(is_wake_name("WAKE.EXE"));
         assert!(!is_wake_name("wake-helper.exe"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immediate_child_failure_is_detected() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 17"])
+            .spawn()
+            .unwrap();
+        let error = require_child_alive(&mut child, &["/bin/sh".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exited immediately"));
+        assert!(error.contains("17"));
     }
 
     #[cfg(windows)]

@@ -50,8 +50,7 @@ Windows reports aggregate system battery percentage. macOS and Linux use the bat
 
 Session state is stored at:
 
-- macOS: `~/.local/state/wake/session.properties`
-- Linux: `$XDG_STATE_HOME/wake/session.properties`, or `~/.local/state/wake/session.properties`
+- macOS/Linux: `$XDG_STATE_HOME/wake/session.properties`, or `~/.local/state/wake/session.properties`
 - Windows: `%LOCALAPPDATA%\wake\session.properties`
 
 Set `WAKE_STATE_DIR` to use another directory.
@@ -64,6 +63,7 @@ State writes are locked and atomic. A valid stale lid record restores only the e
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --release --locked
+cargo build --release --locked
 bash tests/smoke_linux.sh
 bash tests/smoke_macos.sh
 pwsh tests/smoke_windows.ps1

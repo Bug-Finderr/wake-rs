@@ -136,12 +136,6 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
         }
         i += 1;
     }
-    #[cfg(target_os = "linux")]
-    if p.charge_target.is_some() && p.even_lid {
-        return Err(AppError::usage(
-            "Linux --until-charge does not yet carry --even-lid through the charge supervisor",
-        ));
-    }
     Ok(p)
 }
 
@@ -197,7 +191,7 @@ fn start_unix(p: Parsed) -> Result<()> {
         if p.even_lid {
             return start_lid_supervisor(&p, &mode, Some(charge));
         }
-        return start_charge_supervisor(charge, &mode, p.no_display);
+        return start_charge_supervisor(charge, &mode, p.no_display, p.even_lid);
     }
     #[cfg(target_os = "macos")]
     if p.even_lid {
@@ -233,7 +227,12 @@ fn start_unix(p: Parsed) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn start_charge_supervisor(target: i32, mode: &str, no_display: bool) -> Result<()> {
+fn start_charge_supervisor(
+    target: i32,
+    mode: &str,
+    no_display: bool,
+    even_lid: bool,
+) -> Result<()> {
     let charge = match prepare_charge(target)? {
         ChargePreparation::AlreadyMet(percent) => {
             print_charge_met(percent, target);
@@ -241,25 +240,41 @@ fn start_charge_supervisor(target: i32, mode: &str, no_display: bool) -> Result<
         }
         ChargePreparation::Wait(charge) => charge,
     };
-    let cmd = vec![
+    #[cfg(target_os = "linux")]
+    if even_lid {
+        platform::keep_awake_command(no_display, true, None, Some(std::process::id()))?;
+    }
+    let cmd = charge_supervisor_command(target, no_display, mode, even_lid)?;
+    let mut child = sysutil::spawn_named(&cmd)?;
+    if let Some(published) = wait_for_supervisor_session(child.id(), even_lid) {
+        print_start_confirmation(&published, None);
+        return Ok(());
+    }
+    let exited = child.try_wait().ok().flatten().is_some();
+    let _ = child.kill();
+    let _ = child.wait();
+    if exited && let Some(percent) = current_charge_met(target, charge.charging_up) {
+        print_charge_met(percent, target);
+        return Ok(());
+    }
+    Err(AppError::fail("supervisor failed to publish session state"))
+}
+
+#[cfg(not(windows))]
+fn charge_supervisor_command(
+    target: i32,
+    no_display: bool,
+    mode: &str,
+    even_lid: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![
         sysutil::self_exe()?,
         "__supervise_charge__".into(),
         target.to_string(),
         no_display.to_string(),
         mode.to_string(),
-    ];
-    let mut child = sysutil::spawn_named(&cmd)?;
-    if let Some(published) = wait_for_supervisor_session(child.id(), false) {
-        print_start_confirmation(&published, None);
-        return Ok(());
-    }
-    if child.try_wait()?.is_some()
-        && let Some(percent) = current_charge_met(target, charge.charging_up)
-    {
-        print_charge_met(percent, target);
-        return Ok(());
-    }
-    Err(AppError::fail("supervisor failed to publish session state"))
+        even_lid.to_string(),
+    ])
 }
 
 #[cfg(not(windows))]
@@ -1309,12 +1324,23 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_rejects_until_charge_with_even_lid() {
-        assert!(matches!(
-            parse_start_args(&args(&["--until-charge", "80", "--even-lid"])),
-            Err(AppError::Usage(message))
-                if message.contains("--until-charge") && message.contains("--even-lid")
-        ));
+    fn linux_routes_until_charge_with_even_lid() {
+        let parsed = parse_start_args(&args(&["--until-charge", "80", "--even-lid"])).unwrap();
+        assert_eq!(parsed.charge_target, Some(80));
+        assert!(parsed.even_lid);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn charge_supervisor_command_appends_even_lid() {
+        let explicit = charge_supervisor_command(80, true, "system-only", true).unwrap();
+        assert_eq!(
+            &explicit[1..],
+            ["__supervise_charge__", "80", "true", "system-only", "true"]
+        );
+
+        let ordinary = charge_supervisor_command(80, false, "display+system", false).unwrap();
+        assert_eq!(ordinary.last().map(String::as_str), Some("false"));
     }
 
     #[test]

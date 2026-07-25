@@ -168,14 +168,28 @@ mod unix {
         (None, Some(std::process::id()))
     }
 
-    pub fn run_charge(args: &[String]) -> Result<()> {
-        if args.len() != 4 {
-            return Err(AppError::fail("charge supervisor expects 3 arguments"));
+    struct ChargeArgs {
+        target: i32,
+        no_display: bool,
+        mode: String,
+        even_lid: bool,
+    }
+
+    fn parse_charge_args(args: &[String]) -> Result<ChargeArgs> {
+        if args.len() != 5 {
+            return Err(AppError::fail("charge supervisor expects 4 arguments"));
         }
-        let target = parse_charge_target(&args[1])?;
-        let no_display = session::parse_bool(&args[2], "no-display")?;
-        let mode = args[3].clone();
-        let charge = match prepare_charge(target) {
+        Ok(ChargeArgs {
+            target: parse_charge_target(&args[1])?,
+            no_display: session::parse_bool(&args[2], "no-display")?,
+            mode: args[3].clone(),
+            even_lid: session::parse_bool(&args[4], "even-lid")?,
+        })
+    }
+
+    pub fn run_charge(args: &[String]) -> Result<()> {
+        let args = parse_charge_args(args)?;
+        let charge = match prepare_charge(args.target) {
             Ok(ChargePreparation::Wait(charge)) => charge,
             Ok(ChargePreparation::AlreadyMet(_)) => return Ok(()),
             Err(error) => {
@@ -184,22 +198,30 @@ mod unix {
             }
         };
         let (child_timeout, child_wait_pid) = supervisor_inhibitor_lifetime();
-        let keep_awake =
-            platform::keep_awake_command(no_display, false, child_timeout, child_wait_pid)?;
+        let keep_awake = platform::keep_awake_command(
+            args.no_display,
+            args.even_lid,
+            child_timeout,
+            child_wait_pid,
+        )?;
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
 
         let mut session = Session {
             pid: std::process::id(),
-            mode,
+            mode: args.mode,
             trigger: "until-charge".into(),
-            detail: charge_detail(target, &charge),
+            detail: charge_detail(args.target, &charge),
             started_at: Some(Utc::now()),
+            even_lid: args.even_lid,
             ..Session::default()
         };
-        session.capture_process_identity()?;
-        if let Err(error) = session::write(&session) {
+        if let Err(error) = session
+            .capture_process_identity()
+            .and_then(|()| session::write(&session))
+        {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(error);
         }
 
@@ -214,7 +236,7 @@ mod unix {
             if last_check.elapsed() >= POLL_INTERVAL {
                 last_check = Instant::now();
                 if !matches!(
-                    poll_battery(target, charge.charging_up, &mut failures),
+                    poll_battery(args.target, charge.charging_up, &mut failures),
                     BatteryPoll::Continue
                 ) {
                     break;
@@ -363,12 +385,67 @@ mod unix {
     mod tests {
         use super::*;
 
+        fn strings(values: &[&str]) -> Vec<String> {
+            values.iter().map(|value| (*value).into()).collect()
+        }
+
         #[test]
         fn supervisor_owns_native_inhibitor_lifetime() {
             assert_eq!(
                 supervisor_inhibitor_lifetime(),
                 (None, Some(std::process::id()))
             );
+        }
+
+        #[test]
+        fn charge_supervisor_protocol_parses_canonical_even_lid() {
+            let explicit = parse_charge_args(&strings(&[
+                "__supervise_charge__",
+                "80",
+                "true",
+                "system-only",
+                "true",
+            ]))
+            .unwrap();
+            assert_eq!(explicit.target, 80);
+            assert!(explicit.no_display);
+            assert_eq!(explicit.mode, "system-only");
+            assert!(explicit.even_lid);
+
+            let ordinary = parse_charge_args(&strings(&[
+                "__supervise_charge__",
+                "80",
+                "false",
+                "display+system",
+                "false",
+            ]))
+            .unwrap();
+            assert!(!ordinary.even_lid);
+        }
+
+        #[test]
+        fn charge_supervisor_protocol_rejects_wrong_arity_or_malformed_even_lid() {
+            let missing = strings(&["__supervise_charge__", "80", "false", "display+system"]);
+            assert!(parse_charge_args(&missing).is_err());
+
+            let extra = strings(&[
+                "__supervise_charge__",
+                "80",
+                "false",
+                "display+system",
+                "false",
+                "extra",
+            ]);
+            assert!(parse_charge_args(&extra).is_err());
+
+            let malformed = strings(&[
+                "__supervise_charge__",
+                "80",
+                "false",
+                "display+system",
+                "True",
+            ]);
+            assert!(parse_charge_args(&malformed).is_err());
         }
     }
 }

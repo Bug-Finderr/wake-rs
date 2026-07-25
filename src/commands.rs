@@ -1,17 +1,19 @@
 use crate::error::{AppError, Result};
 use crate::session::{self, Session};
-use crate::supervisor::{ChargePreparation, charge_detail, prepare_charge};
+#[cfg(any(target_os = "macos", windows))]
+use crate::supervisor::charge_detail;
+use crate::supervisor::{ChargePreparation, prepare_charge};
 use crate::sysutil;
 use crate::{durations, platform};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 use std::io::IsTerminal;
 #[cfg(windows)]
 use std::process::Child;
 #[cfg(windows)]
 use std::time::{Duration as StdDuration, Instant};
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 pub fn is_console() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
@@ -162,9 +164,6 @@ fn claim_boolean(value: &mut bool, flag: &str) -> Result<()> {
 
 pub fn start(args: &[String]) -> Result<()> {
     let parsed = parse_start_args(args)?;
-    if parsed.even_lid && !platform::supports_even_lid() {
-        return Err(AppError::usage("--even-lid is unsupported on Linux"));
-    }
     #[cfg(windows)]
     return start_windows(parsed);
     #[cfg(not(windows))]
@@ -188,11 +187,13 @@ fn start_unix(p: Parsed) -> Result<()> {
     }
     .to_string();
     if let Some(charge) = p.charge_target {
+        #[cfg(target_os = "macos")]
         if p.even_lid {
             return start_lid_supervisor(&p, &mode, Some(charge));
         }
         return start_charge_supervisor(charge, &mode, p.no_display);
     }
+    #[cfg(target_os = "macos")]
     if p.even_lid {
         return start_lid_supervisor(&p, &mode, None);
     }
@@ -210,6 +211,7 @@ fn start_unix(p: Parsed) -> Result<()> {
         ends_at: p
             .timeout_sec
             .map(|timeout| now + Duration::seconds(timeout)),
+        even_lid: p.even_lid,
         ..Session::default()
     };
     sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
@@ -311,6 +313,7 @@ fn stop_unix() -> Result<()> {
         return Ok(());
     };
     sysutil::terminate_session(&saved)?;
+    #[cfg(target_os = "macos")]
     if saved.even_lid {
         verify_disable_sleep_restored_after_stop(&saved)?;
     }
@@ -336,13 +339,17 @@ fn print_status(saved: &Session) {
         pretty_duration(elapsed)
     );
     println!("  remaining : {remaining}");
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     if saved.even_lid {
         println!(
             "  even lid  : active (restore SleepDisabled={}, state {})",
             saved.prior_disable_sleep,
             session::state_file().display()
         );
+    }
+    #[cfg(target_os = "linux")]
+    if saved.even_lid {
+        println!("  even lid  : logind inhibitor active");
     }
 }
 
@@ -359,9 +366,13 @@ fn print_start_confirmation(s: &Session, note: Option<&str>) {
         println!(
             "note: --even-lid override verified; use 'wake status' to detect later power changes"
         );
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         println!(
             "note: --even-lid is active; this Mac should stay awake with the lid closed until the session ends"
+        );
+        #[cfg(target_os = "linux")]
+        println!(
+            "note: --even-lid holds a logind inhibitor for lid-switch handling; privileged or non-logind suspend paths are not covered"
         );
         println!(
             "caution: closed lid + battery + no external display can run hot and drain quickly"
@@ -924,7 +935,7 @@ fn broken_guardian_error(saved: &Session) -> AppError {
     ))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn ensure_sudo_for_even_lid() -> Result<()> {
     if !is_console() {
         return Err(AppError::fail(
@@ -942,13 +953,13 @@ fn ensure_sudo_for_even_lid() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 enum LidLaunch {
     Published(Session),
     ChargeMet { target: i32, percent: i32 },
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> Result<()> {
     let mut supervisor_detail = p.trigger_detail.clone();
     let mut charging_up = None;
@@ -995,7 +1006,7 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn lid_enable_and_launch(
     p: &Parsed,
     _mode: &str,
@@ -1038,7 +1049,7 @@ fn lid_enable_and_launch(
     ))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn restore_lid_startup_state(prior: i32) -> Result<()> {
     if platform::read_disable_sleep()? != prior {
         restore_disable_sleep_foreground(prior)?;
@@ -1046,7 +1057,7 @@ fn restore_lid_startup_state(prior: i32) -> Result<()> {
     session::delete_state_file()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn write_lid_startup_recovery_record(
     trigger: &str,
     detail: &str,
@@ -1087,7 +1098,7 @@ fn wait_for_supervisor_session(supervisor_pid: u32, even_lid: bool) -> Option<Se
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn verify_disable_sleep_restored_after_stop(s: &Session) -> Result<()> {
     for _ in 0..20 {
         if platform::read_disable_sleep()? == s.prior_disable_sleep {
@@ -1117,7 +1128,7 @@ fn verify_disable_sleep_restored_after_stop(s: &Session) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn restore_disable_sleep_foreground(prior: i32) -> Result<()> {
     if let Err(e) = platform::set_disable_sleep_foreground(prior) {
         print_sleep_restore_rescue(prior);
@@ -1134,7 +1145,7 @@ fn restore_disable_sleep_foreground(prior: i32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn restore_disable_sleep_with_prompt_if_possible(
     prior: i32,
     no_console_message: &str,
@@ -1151,7 +1162,7 @@ fn restore_disable_sleep_with_prompt_if_possible(
     restore_disable_sleep_foreground(prior)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn restore_disable_sleep_best_effort(prior: i32) -> bool {
     let _ = platform::set_disable_sleep_foreground(prior);
     platform::read_disable_sleep()
@@ -1159,13 +1170,13 @@ fn restore_disable_sleep_best_effort(prior: i32) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 pub fn print_sleep_restore_rescue(value: i32) {
     eprintln!("wake: could not restore sleep; run: sudo pmset -a disablesleep {value}");
     print_sleep_state_path();
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn print_sleep_state_path() {
     eprintln!("wake: recovery state: {}", session::state_file().display());
 }
@@ -1185,19 +1196,15 @@ pub fn recover_stale_lid_session_unlocked() -> Result<()> {
     if saved.matches_live_process() {
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
     if saved.even_lid {
-        if !platform::supports_even_lid() {
-            return Err(AppError::fail(
-                "stale --even-lid session found, but this platform cannot restore the lid action",
-            ));
-        }
         recover_crashed_even_lid_unix(&saved)?;
     }
     session::delete_state_file()?;
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn recover_crashed_even_lid_unix(saved: &Session) -> Result<()> {
     let current = platform::read_disable_sleep()?;
     if current != saved.prior_disable_sleep {
@@ -1229,9 +1236,9 @@ fn recover_malformed_lid_session_unlocked(lid_hints: bool) -> Result<()> {
             "malformed wake state retained byte-for-byte at {}; no OS changes made; inspect SleepDisabled with 'pmset -g', restore it manually with 'sudo pmset -a disablesleep <0-or-1>', then remove the state file",
             session::state_file().display()
         )));
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         return Err(AppError::fail(format!(
-            "malformed lid recovery state retained at {}; refusing automatic OS changes; restore the platform lid setting manually, then remove the state file",
+            "malformed or unreadable wake state retained unchanged at {}; no OS changes made; inspect it for persistent recovery fields before removing it",
             session::state_file().display()
         )));
     }

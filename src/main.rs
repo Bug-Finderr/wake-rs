@@ -48,7 +48,7 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
         }
         #[cfg(not(windows))]
         "__supervise_charge__" => supervisor::run_charge(args),
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         "__supervise_lid__" => supervisor::run_lid(args),
         #[cfg(windows)]
         "__worker_windows__" => supervisor::run_worker(args),

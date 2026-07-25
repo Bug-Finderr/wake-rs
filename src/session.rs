@@ -72,7 +72,7 @@ pub struct Session {
     pub process_start: u64,
     pub process_command: String,
     pub even_lid: bool,
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     pub prior_disable_sleep: i32,
     #[cfg(windows)]
     pub guardian_pid: u32,
@@ -186,7 +186,27 @@ fn parse_session(bytes: &[u8]) -> Result<Session> {
         return Err(AppError::fail("unsupported state version"));
     }
     let even_lid = parse_bool(field(&properties, "evenLid")?, "evenLid")?;
-    let mut keys: HashSet<&str> = [
+    #[cfg(target_os = "linux")]
+    let platform_keys: &[&str] = &[];
+    #[cfg(target_os = "macos")]
+    let platform_keys: &[&str] = if even_lid {
+        &["priorDisableSleep"]
+    } else {
+        &[]
+    };
+    #[cfg(windows)]
+    let platform_keys: &[&str] = if even_lid {
+        &[
+            "guardianPid",
+            "guardianStart",
+            "originalScheme",
+            "originalAc",
+            "originalDc",
+        ]
+    } else {
+        &[]
+    };
+    let keys: HashSet<&str> = [
         "version",
         "pid",
         "mode",
@@ -199,21 +219,8 @@ fn parse_session(bytes: &[u8]) -> Result<Session> {
         "evenLid",
     ]
     .into_iter()
+    .chain(platform_keys.iter().copied())
     .collect();
-    #[cfg(not(windows))]
-    if even_lid {
-        keys.insert("priorDisableSleep");
-    }
-    #[cfg(windows)]
-    if even_lid {
-        keys.extend([
-            "guardianPid",
-            "guardianStart",
-            "originalScheme",
-            "originalAc",
-            "originalDc",
-        ]);
-    }
     if properties.len() != keys.len() || properties.keys().any(|key| !keys.contains(key.as_str())) {
         return Err(AppError::fail("state has missing or unknown fields"));
     }
@@ -231,7 +238,7 @@ fn parse_session(bytes: &[u8]) -> Result<Session> {
         process_start: parse_positive(field(&properties, "processStart")?, "processStart")?,
         process_command: field(&properties, "processCommand")?.into(),
         even_lid,
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         prior_disable_sleep: if even_lid {
             disable_sleep(field(&properties, "priorDisableSleep")?)?
         } else {
@@ -329,7 +336,7 @@ fn serialize(session: &Session) -> Result<Vec<u8>> {
     if session.pid == 0 || session.process_start == 0 || session.started_at.is_none() {
         return Err(AppError::fail("session identity or start time is missing"));
     }
-    let mut fields = vec![
+    let fields = vec![
         ("version", STATE_VERSION.to_string()),
         ("pid", session.pid.to_string()),
         ("mode", session.mode.clone()),
@@ -347,25 +354,33 @@ fn serialize(session: &Session) -> Result<Vec<u8>> {
         ("processCommand", session.process_command.clone()),
         ("evenLid", session.even_lid.to_string()),
     ];
-    #[cfg(not(windows))]
-    if session.even_lid {
-        disable_sleep(&session.prior_disable_sleep.to_string())?;
-        fields.push(("priorDisableSleep", session.prior_disable_sleep.to_string()));
-    }
-    #[cfg(windows)]
-    if session.even_lid {
-        if session.guardian_pid == 0 || session.guardian_start == 0 {
-            return Err(AppError::fail("guardian identity is missing"));
+    #[cfg(target_os = "macos")]
+    let fields = {
+        let mut fields = fields;
+        if session.even_lid {
+            disable_sleep(&session.prior_disable_sleep.to_string())?;
+            fields.push(("priorDisableSleep", session.prior_disable_sleep.to_string()));
         }
-        platform::parse_guid(&session.original_scheme)?;
-        fields.extend([
-            ("guardianPid", session.guardian_pid.to_string()),
-            ("guardianStart", session.guardian_start.to_string()),
-            ("originalScheme", session.original_scheme.clone()),
-            ("originalAc", session.original_ac.to_string()),
-            ("originalDc", session.original_dc.to_string()),
-        ]);
-    }
+        fields
+    };
+    #[cfg(windows)]
+    let fields = {
+        let mut fields = fields;
+        if session.even_lid {
+            if session.guardian_pid == 0 || session.guardian_start == 0 {
+                return Err(AppError::fail("guardian identity is missing"));
+            }
+            platform::parse_guid(&session.original_scheme)?;
+            fields.extend([
+                ("guardianPid", session.guardian_pid.to_string()),
+                ("guardianStart", session.guardian_start.to_string()),
+                ("originalScheme", session.original_scheme.clone()),
+                ("originalAc", session.original_ac.to_string()),
+                ("originalDc", session.original_dc.to_string()),
+            ]);
+        }
+        fields
+    };
     Ok(fields
         .into_iter()
         .flat_map(|(key, value)| format!("{key}={value}\n").into_bytes())
@@ -399,6 +414,7 @@ where
         Ok(value)
     }
 }
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn parse_u32(raw: &str, name: &str) -> Result<u32> {
     let value = raw
         .parse::<u32>()
@@ -419,7 +435,7 @@ pub(crate) fn parse_utc(raw: &str, name: &str) -> Result<DateTime<Utc>> {
         Err(AppError::fail(format!("{name} is not canonical UTC")))
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn disable_sleep(raw: &str) -> Result<i32> {
     match parse_u32(raw, "priorDisableSleep")? {
         value @ (0 | 1) => Ok(value as i32),
@@ -433,16 +449,17 @@ pub(crate) fn retain_malformed_state(lid_hints: bool) -> bool {
 
 fn lid_hints(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
-    [
-        "evenLid=true",
+    let persistent_recovery = [
         "priorDisableSleep=",
         "guardianPid=",
+        "guardianStart=",
         "originalScheme=",
         "originalAc=",
         "originalDc=",
     ]
     .iter()
-    .any(|hint| text.contains(hint))
+    .any(|hint| text.contains(hint));
+    persistent_recovery || (!cfg!(target_os = "linux") && text.contains("evenLid=true"))
 }
 
 fn io_error(path: &Path, error: std::io::Error) -> AppError {
@@ -555,18 +572,18 @@ mod tests {
         } else {
             "/usr/bin/systemd-inhibit"
         };
-        let mut text = format!(
-            "version=2\npid=4321\nmode=display+system\ntrigger=timed\ndetail=1h\nstartedAt=2024-01-02T03:04:05+00:00\nendsAt=2024-01-02T04:04:05+00:00\nprocessStart=1700000000\nprocessCommand={command}\nevenLid={even_lid}\n"
-        );
-        #[cfg(not(windows))]
-        if even_lid {
-            text.push_str("priorDisableSleep=0\n");
-        }
-        #[cfg(windows)]
-        if even_lid {
-            text.push_str("guardianPid=99\nguardianStart=1800000000\noriginalScheme=381b4222-f694-41f0-9685-ff5bb260df2e\noriginalAc=4294967295\noriginalDc=2\n");
-        }
-        text
+        let platform_fields = if !even_lid {
+            ""
+        } else if cfg!(target_os = "macos") {
+            "priorDisableSleep=0\n"
+        } else if cfg!(windows) {
+            "guardianPid=99\nguardianStart=1800000000\noriginalScheme=381b4222-f694-41f0-9685-ff5bb260df2e\noriginalAc=4294967295\noriginalDc=2\n"
+        } else {
+            ""
+        };
+        format!(
+            "version=2\npid=4321\nmode=display+system\ntrigger=timed\ndetail=1h\nstartedAt=2024-01-02T03:04:05+00:00\nendsAt=2024-01-02T04:04:05+00:00\nprocessStart=1700000000\nprocessCommand={command}\nevenLid={even_lid}\n{platform_fields}"
+        )
     }
     #[test]
     fn strict_state_accepts_only_complete_versioned_records() {
@@ -588,6 +605,40 @@ mod tests {
         assert!(!lid_hints(b"broken=true\n"));
         assert!(lid_hints(b"originalScheme=broken\n"));
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_even_lid_round_trips_without_restoration_state() {
+        let text = valid(true);
+        let session = parse_session(text.as_bytes()).unwrap();
+        assert!(session.even_lid);
+        assert_eq!(serialize(&session).unwrap(), text.as_bytes());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_even_lid_requires_and_round_trips_prior_sleep_state() {
+        let text = valid(true);
+        let session = parse_session(text.as_bytes()).unwrap();
+        assert_eq!(session.prior_disable_sleep, 0);
+        assert_eq!(serialize(&session).unwrap(), text.as_bytes());
+        assert!(parse_session(text.replace("priorDisableSleep=0\n", "").as_bytes()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_even_lid_round_trips_guardian_and_power_plan_state() {
+        let text = valid(true);
+        let session = parse_session(text.as_bytes()).unwrap();
+        assert_eq!(session.guardian_pid, 99);
+        assert_eq!(session.guardian_start, 1_800_000_000);
+        assert_eq!(
+            session.original_scheme,
+            "381b4222-f694-41f0-9685-ff5bb260df2e"
+        );
+        assert_eq!((session.original_ac, session.original_dc), (u32::MAX, 2));
+        assert_eq!(serialize(&session).unwrap(), text.as_bytes());
+    }
+
     #[test]
     fn relative_paths_are_absolute_and_delete_failures_are_preserved() {
         assert!(absolute_path(PathBuf::from("relative state")).is_absolute());
@@ -600,8 +651,16 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn malformed_retention_is_platform_aware() {
-        assert!(retain_malformed_state(true));
+    fn malformed_retention_requires_persistent_recovery_fields_on_linux() {
+        assert!(retain_malformed_state(lid_hints(b"priorDisableSleep=0\n")));
+        assert!(retain_malformed_state(lid_hints(b"guardianStart=broken\n")));
+        assert!(retain_malformed_state(lid_hints(
+            b"originalScheme=broken\n"
+        )));
+        assert_eq!(
+            retain_malformed_state(lid_hints(b"evenLid=true\n")),
+            cfg!(target_os = "macos")
+        );
         assert_eq!(retain_malformed_state(false), cfg!(target_os = "macos"));
     }
 }

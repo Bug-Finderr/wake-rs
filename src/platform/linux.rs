@@ -13,10 +13,6 @@ pub fn expected_command_basenames() -> &'static [&'static str] {
     EXPECTED
 }
 
-pub fn supports_even_lid() -> bool {
-    false
-}
-
 pub fn static_start_note() -> Option<String> {
     None
 }
@@ -101,32 +97,6 @@ fn read_battery_from(base: &Path) -> Result<BatteryStatus> {
         neutral_state: (!charging && !discharging)
             .then(|| "not charging or discharging".to_string()),
     })
-}
-
-fn unsupported<T>() -> Result<T> {
-    Err(AppError::fail(
-        "--even-lid is not supported on this platform",
-    ))
-}
-
-pub fn read_disable_sleep() -> Result<i32> {
-    unsupported()
-}
-
-pub fn authenticate_sudo() -> Result<bool> {
-    unsupported()
-}
-
-pub fn set_disable_sleep_foreground(_value: i32) -> Result<()> {
-    unsupported()
-}
-
-pub fn set_disable_sleep_non_interactive(_value: i32) -> Result<bool> {
-    unsupported()
-}
-
-pub fn refresh_sudo_non_interactive() -> Result<bool> {
-    unsupported()
 }
 
 fn select_inhibitor(

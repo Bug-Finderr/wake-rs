@@ -142,11 +142,14 @@ fn battery_failures_exhausted(failures: &mut u8, error: &AppError) -> bool {
 #[cfg(not(windows))]
 mod unix {
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::commands;
+    #[cfg(target_os = "macos")]
     use std::process::Child;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(target_os = "macos")]
     const SUDO_HEARTBEAT: Duration = Duration::from_secs(180);
 
     fn install_stop_flag() -> Arc<AtomicBool> {
@@ -224,14 +227,12 @@ mod unix {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     pub fn run_lid(args: &[String]) -> Result<()> {
         if args.len() != 8 {
             return Err(AppError::fail("lid supervisor expects 7 arguments"));
         }
         let prior_disable_sleep = parse_disable_sleep(&args[4])?;
-        if !platform::supports_even_lid() {
-            return Ok(());
-        }
         let mut cleanup = LidCleanup {
             child: None,
             prior_disable_sleep,
@@ -324,11 +325,13 @@ mod unix {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     struct LidCleanup {
         child: Option<Child>,
         prior_disable_sleep: i32,
     }
 
+    #[cfg(target_os = "macos")]
     impl Drop for LidCleanup {
         fn drop(&mut self) {
             let prior = self.prior_disable_sleep;
@@ -348,6 +351,7 @@ mod unix {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn parse_disable_sleep(raw: &str) -> Result<i32> {
         match session::parse_u32(raw, "priorDisableSleep")? {
             value @ (0 | 1) => Ok(value as i32),
@@ -370,7 +374,9 @@ mod unix {
 }
 
 #[cfg(not(windows))]
-pub use unix::{run_charge, run_lid};
+pub use unix::run_charge;
+#[cfg(target_os = "macos")]
+pub use unix::run_lid;
 
 #[cfg(windows)]
 mod windows {
@@ -707,6 +713,7 @@ mod windows {
 #[cfg(windows)]
 pub use windows::{run_guardian, run_worker, worker_command};
 
+#[cfg(any(target_os = "macos", windows))]
 fn optional_positive<T>(raw: &str, name: &str) -> Result<Option<T>>
 where
     T: std::str::FromStr + Default + PartialEq + ToString,

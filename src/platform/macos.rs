@@ -13,10 +13,6 @@ pub fn expected_command_basenames() -> &'static [&'static str] {
     EXPECTED
 }
 
-pub fn supports_even_lid() -> bool {
-    true
-}
-
 pub fn static_start_note() -> Option<String> {
     Some(LID_CLOSE_NOTE.to_string())
 }

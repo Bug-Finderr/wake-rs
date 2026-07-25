@@ -23,6 +23,7 @@ pub fn static_start_note() -> Option<String> {
 
 pub fn keep_awake_command(
     no_display: bool,
+    _even_lid: bool,
     timeout_sec: Option<i64>,
     wait_pid: Option<u32>,
 ) -> Result<KeepAwake> {
@@ -175,15 +176,17 @@ mod tests {
     #[test]
     fn caffeinate_assertions_match_display_mode() {
         assert_eq!(
-            keep_awake_command(false, None, None).unwrap().cmd,
+            keep_awake_command(false, false, None, None).unwrap().cmd,
             [CAFFEINATE, "-di"]
         );
         assert_eq!(
-            keep_awake_command(true, None, None).unwrap().cmd,
+            keep_awake_command(true, false, None, None).unwrap().cmd,
             [CAFFEINATE, "-i"]
         );
         assert_eq!(
-            keep_awake_command(false, None, Some(42)).unwrap().cmd,
+            keep_awake_command(false, false, None, Some(42))
+                .unwrap()
+                .cmd,
             [CAFFEINATE, "-di", "-w", "42"]
         );
     }

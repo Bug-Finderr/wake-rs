@@ -197,7 +197,8 @@ fn start_unix(p: Parsed) -> Result<()> {
         return start_lid_supervisor(&p, &mode, None);
     }
 
-    let keep_awake = platform::keep_awake_command(p.no_display, p.timeout_sec, p.wait_pid)?;
+    let keep_awake =
+        platform::keep_awake_command(p.no_display, p.even_lid, p.timeout_sec, p.wait_pid)?;
     let now = Utc::now();
     let mut child = sysutil::spawn_named(&keep_awake.cmd)?;
     let mut saved = Session {

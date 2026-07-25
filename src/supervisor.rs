@@ -181,7 +181,8 @@ mod unix {
             }
         };
         let (child_timeout, child_wait_pid) = supervisor_inhibitor_lifetime();
-        let keep_awake = platform::keep_awake_command(no_display, child_timeout, child_wait_pid)?;
+        let keep_awake =
+            platform::keep_awake_command(no_display, false, child_timeout, child_wait_pid)?;
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
 
@@ -258,7 +259,8 @@ mod unix {
         };
 
         let (child_timeout, child_wait_pid) = supervisor_inhibitor_lifetime();
-        let keep_awake = platform::keep_awake_command(no_display, child_timeout, child_wait_pid)?;
+        let keep_awake =
+            platform::keep_awake_command(no_display, true, child_timeout, child_wait_pid)?;
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
         cleanup.child = Some(child);

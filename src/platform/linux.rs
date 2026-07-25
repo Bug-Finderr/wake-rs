@@ -23,6 +23,7 @@ pub fn static_start_note() -> Option<String> {
 
 pub fn keep_awake_command(
     no_display: bool,
+    even_lid: bool,
     timeout_sec: Option<i64>,
     wait_pid: Option<u32>,
 ) -> Result<KeepAwake> {
@@ -30,8 +31,9 @@ pub fn keep_awake_command(
         "systemd-inhibit",
         "systemd-inhibit not found on PATH; wake requires systemd on Linux",
     )?;
-    let (what, note) =
-        select_inhibitor(no_display, |what| probe_inhibitor(&systemd_inhibit, what))?;
+    let (what, note) = select_inhibitor(no_display, even_lid, |what| {
+        probe_inhibitor(&systemd_inhibit, what)
+    })?;
     Ok(KeepAwake {
         cmd: inhibitor_command(systemd_inhibit, what, timeout_sec, wait_pid),
         note,
@@ -129,6 +131,7 @@ pub fn refresh_sudo_non_interactive() -> Result<bool> {
 
 fn select_inhibitor(
     no_display: bool,
+    even_lid: bool,
     mut probe: impl FnMut(&str) -> bool,
 ) -> Result<(&'static str, Option<String>)> {
     let candidates = if no_display {
@@ -136,9 +139,20 @@ fn select_inhibitor(
     } else {
         DISPLAY_INHIBITORS
     };
+    if even_lid {
+        let what = candidates[0];
+        return if probe(what) {
+            Ok((what, None))
+        } else {
+            Err(AppError::fail(format!(
+                "--even-lid requires systemd inhibitor scope {what}"
+            )))
+        };
+    }
     for (index, &what) in candidates.iter().enumerate() {
         if probe(what) {
-            let note = (index > 0).then(|| format!("note: inhibitor degraded to {what}"));
+            let note = (index > 0)
+                .then(|| format!("note: inhibitor degraded to {what}; lid closure may suspend"));
             return Ok((what, note));
         }
     }
@@ -274,9 +288,9 @@ mod tests {
     }
 
     #[test]
-    fn inhibitor_probes_are_ordered_and_choose_first_success() {
+    fn non_explicit_inhibitor_probes_keep_order_and_explain_lid_degradation() {
         let mut probed = Vec::new();
-        let selected = select_inhibitor(false, |what| {
+        let selected = select_inhibitor(false, false, |what| {
             probed.push(what.to_string());
             what == "idle:sleep"
         })
@@ -285,18 +299,63 @@ mod tests {
         assert_eq!(selected.0, "idle:sleep");
         assert_eq!(
             selected.1.as_deref(),
-            Some("note: inhibitor degraded to idle:sleep")
+            Some("note: inhibitor degraded to idle:sleep; lid closure may suspend")
         );
 
         let mut probed = Vec::new();
-        let selected = select_inhibitor(true, |what| {
+        let selected = select_inhibitor(true, false, |what| {
             probed.push(what.to_string());
             what == "sleep"
         })
         .unwrap();
         assert_eq!(probed, ["sleep:handle-lid-switch", "sleep"]);
         assert_eq!(selected.0, "sleep");
-        assert!(selected.1.is_some());
+        assert_eq!(
+            selected.1.as_deref(),
+            Some("note: inhibitor degraded to sleep; lid closure may suspend")
+        );
+    }
+
+    #[test]
+    fn explicit_display_inhibitor_probes_only_the_required_scope() {
+        let mut probed = Vec::new();
+        let selected = select_inhibitor(false, true, |what| {
+            probed.push(what.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(probed, ["idle:sleep:handle-lid-switch"]);
+        assert_eq!(selected, ("idle:sleep:handle-lid-switch", None));
+    }
+
+    #[test]
+    fn explicit_system_inhibitor_probes_only_the_required_scope() {
+        let mut probed = Vec::new();
+        let selected = select_inhibitor(true, true, |what| {
+            probed.push(what.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(probed, ["sleep:handle-lid-switch"]);
+        assert_eq!(selected, ("sleep:handle-lid-switch", None));
+    }
+
+    #[test]
+    fn explicit_inhibitor_refusal_never_falls_back_and_names_the_required_scope() {
+        for (no_display, required) in [
+            (false, "idle:sleep:handle-lid-switch"),
+            (true, "sleep:handle-lid-switch"),
+        ] {
+            let mut probed = Vec::new();
+            let error = select_inhibitor(no_display, true, |what| {
+                probed.push(what.to_string());
+                false
+            })
+            .unwrap_err();
+            assert_eq!(probed, [required]);
+            assert!(error.message().contains("--even-lid"));
+            assert!(error.message().contains(required));
+        }
     }
 
     #[test]

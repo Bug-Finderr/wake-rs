@@ -34,7 +34,7 @@ Conditions that require polling use a detached copy of `wake` as a supervisor:
 
 The supervisor owns the native inhibitor child, publishes itself as the session process, handles termination signals, and tears down toward allowing sleep. Repeated battery-read failures also end the session rather than leaving an unbounded inhibitor.
 
-Linux `--even-lid` requires the exact systemd-logind inhibitor scope that includes `handle-lid-switch`. The scope is probed at startup; if logind refuses it, the session errors instead of degrading. Sessions without `--even-lid` probe the same lid-inclusive scope first and may degrade to a narrower scope with an explicit note. There is no `sudo` and no persistent setting: the lock is a file descriptor held by the `systemd-inhibit` process and releases when that process exits, so Linux needs no restoration lifecycle. macOS and Windows retain theirs: macOS restores `SleepDisabled` and Windows restores the recorded power-plan values. The Linux boundary is logind-managed suspend only; root bypasses, direct `/sys/power/state` writes, custom acpid handlers, WSL, containers, and non-logind stacks are out of scope.
+Linux `--even-lid` requires the exact systemd-logind inhibitor scope for the session: `idle:sleep:handle-lid-switch` for the default display+system session, `sleep:handle-lid-switch` with `--no-display`. The scope is probed at startup; if logind refuses it, the session errors instead of degrading. Sessions without `--even-lid` probe the same lid-inclusive scope first and may degrade to a narrower scope with an explicit note. There is no `sudo` and no persistent setting: the lock is a file descriptor held by the `systemd-inhibit` process and releases when that process exits, so Linux needs no restoration lifecycle. macOS and Windows retain theirs: macOS restores `SleepDisabled` and Windows restores the recorded power-plan values. The Linux boundary is logind-managed suspend only; root bypasses, direct `/sys/power/state` writes, custom acpid handlers, WSL, containers, and non-logind stacks are out of scope.
 
 ### Windows
 
@@ -59,7 +59,7 @@ A guardian crash or power loss can require one later UAC-approved recovery. No u
 - process ID, native start identity, and executable path
 - mode and trigger details
 - start and optional end timestamps
-- whether persistent lid recovery is required
+- whether lid coverage was requested (`evenLid`)
 
 Windows lid sessions also record guardian identity, the exact power-scheme GUID, and raw AC/DC values. macOS lid sessions record the prior `SleepDisabled` value.
 
@@ -70,7 +70,8 @@ State operations follow these rules:
 - Unknown, duplicate, missing, or inconsistent fields make a record malformed.
 - Malformed lid-hinted state is retained and never authorizes an OS write.
 - A stale ordinary session is deleted only after its process identity is no longer live.
-- A valid stale lid session is deleted only after exact restoration verifies.
+- A valid stale macOS or Windows lid session is deleted only after exact restoration verifies; those records are persistent because the OS change outlives the process.
+- A stale Linux lid session holds no restoration value — the inhibitor is a file descriptor that dies with its process — so it is treated as ordinary stale state.
 
 There is no compatibility parser for older state schemas because the product has no released state-compatibility requirement.
 

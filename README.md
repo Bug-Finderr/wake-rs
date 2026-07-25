@@ -44,7 +44,7 @@ Only one session can be active. `wake stop` is safe to repeat.
 | Linux | `systemd-inhibit` | `/sys/class/power_supply` | Requires the exact systemd-logind `handle-lid-switch` inhibitor and errors if logind refuses it |
 | Windows | Native `SetThreadExecutionState` worker | `GetSystemPowerStatus` | One UAC prompt starts a narrow guardian that restores the exact power-plan values |
 
-On Linux, `--even-lid` never degrades: startup fails unless logind grants the lid-inclusive inhibitor scope. It uses no `sudo` and no persistent setting; the lock is held by the `systemd-inhibit` process and releases when that process exits. Sessions without `--even-lid` still request lid handling best-effort and may degrade to a narrower scope with an explicit note. This covers normal logind-managed suspend only, not root-initiated suspend, direct `/sys/power/state` writes, custom acpid scripts, WSL, containers, or non-logind stacks.
+On Linux, `--even-lid` never degrades: the default display+system session requires the exact `idle:sleep:handle-lid-switch` scope, `--no-display` requires `sleep:handle-lid-switch`, and startup fails unless logind grants the requested scope. It uses no `sudo` and no persistent setting; the lock is held by the `systemd-inhibit` process and releases when that process exits. Sessions without `--even-lid` still request lid handling best-effort and may degrade to a narrower scope with an explicit note. This covers normal logind-managed suspend only, not root-initiated suspend, direct `/sys/power/state` writes, custom acpid scripts, WSL, containers, or non-logind stacks.
 
 Windows reports aggregate system battery percentage. macOS and Linux use the battery information exposed by their native platform interfaces.
 
@@ -57,7 +57,7 @@ Session state is stored at:
 
 Set `WAKE_STATE_DIR` to use another directory.
 
-State writes are locked and atomic. A valid stale lid record restores only the exact value recorded before `wake` changed it. Malformed lid recovery state is retained and reported without changing system settings.
+State writes are locked and atomic. On macOS and Windows, a valid stale lid record restores only the exact value recorded before `wake` changed it. Linux lid sessions record no persistent value; a stale Linux lid record is deleted once its inhibitor process is dead, because the lock dies with that process. Malformed lid recovery state is retained and reported without changing system settings.
 
 ## Verification
 

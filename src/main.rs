@@ -89,7 +89,7 @@ usage:
   wake --while-pid PID       stay awake while a process is running
   wake --while-app NAME      stay awake while a matching app is running
   wake --no-display          allow display sleep
-  wake --even-lid            include lid closure (macOS/Windows only)
+  wake --even-lid            include lid closure
   wake status                show the current session
   wake stop                  stop the current session
   wake version, -v           print version
@@ -97,7 +97,7 @@ usage:
 
 platforms:
   macOS: caffeinate; --even-lid uses sudo
-  Linux: systemd-inhibit; --even-lid is unsupported
+  Linux: systemd-inhibit; --even-lid requires the logind handle-lid-switch inhibitor
   Windows: native power APIs; --even-lid uses one UAC guardian
 
 durations:

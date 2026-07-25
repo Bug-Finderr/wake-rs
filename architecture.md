@@ -34,7 +34,7 @@ Conditions that require polling use a detached copy of `wake` as a supervisor:
 
 The supervisor owns the native inhibitor child, publishes itself as the session process, handles termination signals, and tears down toward allowing sleep. Repeated battery-read failures also end the session rather than leaving an unbounded inhibitor.
 
-Linux does not support `--even-lid`.
+Linux `--even-lid` requires the exact systemd-logind inhibitor scope that includes `handle-lid-switch`. The scope is probed at startup; if logind refuses it, the session errors instead of degrading. Sessions without `--even-lid` probe the same lid-inclusive scope first and may degrade to a narrower scope with an explicit note. There is no `sudo` and no persistent setting: the lock is a file descriptor held by the `systemd-inhibit` process and releases when that process exits, so Linux needs no restoration lifecycle. macOS and Windows retain theirs: macOS restores `SleepDisabled` and Windows restores the recorded power-plan values. The Linux boundary is logind-managed suspend only; root bypasses, direct `/sys/power/state` writes, custom acpid handlers, WSL, containers, and non-logind stacks are out of scope.
 
 ### Windows
 

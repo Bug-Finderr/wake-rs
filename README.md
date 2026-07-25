@@ -23,7 +23,7 @@ wake --until-charge 80   # until battery reaches 80%
 wake --while-pid 1234    # while this process is running
 wake --while-app Slack   # while a matching app is running
 wake --no-display        # allow display sleep
-wake --even-lid          # macOS/Windows only
+wake --even-lid          # keep awake with the lid closed
 wake status
 wake stop
 wake help
@@ -41,8 +41,10 @@ Only one session can be active. `wake stop` is safe to repeat.
 | Platform | Sleep inhibition | Battery | `--even-lid` |
 |---|---|---|---|
 | macOS | `caffeinate` | `pmset` | Temporarily changes `SleepDisabled` through `sudo` |
-| Linux | `systemd-inhibit` | `/sys/class/power_supply` | Unsupported |
+| Linux | `systemd-inhibit` | `/sys/class/power_supply` | Requires the exact systemd-logind `handle-lid-switch` inhibitor and errors if logind refuses it |
 | Windows | Native `SetThreadExecutionState` worker | `GetSystemPowerStatus` | One UAC prompt starts a narrow guardian that restores the exact power-plan values |
+
+On Linux, `--even-lid` never degrades: startup fails unless logind grants the lid-inclusive inhibitor scope. It uses no `sudo` and no persistent setting; the lock is held by the `systemd-inhibit` process and releases when that process exits. Sessions without `--even-lid` still request lid handling best-effort and may degrade to a narrower scope with an explicit note. This covers normal logind-managed suspend only, not root-initiated suspend, direct `/sys/power/state` writes, custom acpid scripts, WSL, containers, or non-logind stacks.
 
 Windows reports aggregate system battery percentage. macOS and Linux use the battery information exposed by their native platform interfaces.
 

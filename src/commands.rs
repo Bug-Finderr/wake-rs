@@ -136,6 +136,12 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
         }
         i += 1;
     }
+    #[cfg(target_os = "linux")]
+    if p.charge_target.is_some() && p.even_lid {
+        return Err(AppError::usage(
+            "Linux --until-charge does not yet carry --even-lid through the charge supervisor",
+        ));
+    }
     Ok(p)
 }
 
@@ -1299,6 +1305,16 @@ mod tests {
                 Err(AppError::Usage(_))
             ));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rejects_until_charge_with_even_lid() {
+        assert!(matches!(
+            parse_start_args(&args(&["--until-charge", "80", "--even-lid"])),
+            Err(AppError::Usage(message))
+                if message.contains("--until-charge") && message.contains("--even-lid")
+        ));
     }
 
     #[test]

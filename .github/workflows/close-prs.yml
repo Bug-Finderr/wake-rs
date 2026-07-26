@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Close if not allowed
-        if: ${{ github.actor != 'Bug-Finderr' }}
+        if: ${{ github.actor != github.repository_owner }}
         run: gh pr close ${{ github.event.number }} --comment "This repository does not accept external pull requests. Please open an issue instead." --repo ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

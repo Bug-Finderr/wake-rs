@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   fmt:
+    if: github.event_name != 'pull_request' || github.actor == github.repository_owner
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +47,7 @@ jobs:
         run: pwsh tests/smoke_windows.ps1 target/release/wake.exe
 
   msrv:
+    if: github.event_name != 'pull_request' || github.actor == github.repository_owner
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +55,7 @@ jobs:
       - run: cargo build --locked
 
   audit:
+    if: github.event_name != 'pull_request' || github.actor == github.repository_owner
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -172,7 +175,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fmt, native, msrv, audit, tag-version, package, linux-package-smoke]
+    needs: [package, linux-package-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -41,10 +41,10 @@ Only one session can be active. `wake stop` is safe to repeat.
 | Platform | Sleep inhibition | Battery | `--even-lid` |
 |---|---|---|---|
 | macOS | `caffeinate` | `pmset` | Changes `SleepDisabled` 0 to 1 with `sudo` |
-| Linux | `systemd-inhibit` | `/sys/class/power_supply` | Requires the exact systemd-logind `handle-lid-switch` inhibitor and errors if logind refuses it |
+| Linux | `systemd-inhibit` | `/sys/class/power_supply` | Requires a systemd-logind lid-switch inhibitor; errors if refused |
 | Windows | Native `SetThreadExecutionState` worker | `GetSystemPowerStatus` | One UAC prompt starts a narrow guardian that restores the exact power-plan values |
 
-On Linux, `--even-lid` never degrades: the default display+system session requires the exact `idle:sleep:handle-lid-switch` scope, `--no-display` requires `sleep:handle-lid-switch`, and startup fails unless logind grants the requested scope. It uses no `sudo` and no persistent setting; the lock is held by the `systemd-inhibit` process and releases when that process exits. Sessions without `--even-lid` still request lid handling best-effort and may degrade to a narrower scope with an explicit note. This covers normal logind-managed suspend only, not root-initiated suspend, direct `/sys/power/state` writes, custom acpid scripts, WSL, containers, or non-logind stacks.
+On Linux, `--even-lid` requires `idle:sleep:handle-lid-switch`, or `sleep:handle-lid-switch` with `--no-display`. It never falls back, needs no `sudo`, and leaves no persistent setting; the inhibitor ends with the `systemd-inhibit` process. Without `--even-lid`, `wake` may fall back and report what was lost. This covers only logind-managed suspend, not privileged or non-logind paths such as direct `/sys/power/state` writes, acpid, WSL, or containers.
 
 Windows reports aggregate system battery percentage. macOS and Linux use the battery information exposed by their native platform interfaces.
 
@@ -62,8 +62,6 @@ State writes are locked and atomic. On macOS, recovery restores `SleepDisabled=0
 ## Verification
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
 cargo test --release --locked
 cargo build --release --locked
 bash tests/smoke_linux.sh

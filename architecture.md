@@ -1,6 +1,6 @@
 # Architecture
 
-`wake` is one CLI binary with no daemon. A foreground invocation validates arguments, reconciles durable state under an advisory lock, starts the platform sleep inhibitor, publishes the session, and exits.
+`wake` is one CLI binary with no daemon. A foreground invocation validates arguments, reconciles durable state under an advisory lock, starts the platform-specific lifetime owner, publishes or waits for its session state, and exits.
 
 ## Source layout
 
@@ -9,6 +9,7 @@
 | `main.rs` | Dispatch, help, and process exit codes |
 | `commands.rs` | Public start, status, stop, and recovery flows |
 | `durations.rs` | Duration parsing |
+| `error.rs` | Usage and runtime errors with their exit codes |
 | `session.rs` | Strict state records, atomic writes, and advisory locking |
 | `supervisor.rs` | Conditional Unix supervisors and Windows worker/guardian commands |
 | `sysutil.rs` | Process identity, spawning, termination, and Windows handles |
@@ -20,7 +21,7 @@ Platform modules expose free functions selected with `cfg`; there is no runtime 
 
 ### macOS and Linux
 
-Ordinary indefinite, timed, and process-bound sessions use a detached native inhibitor:
+Indefinite, duration-based, and process-bound sessions use a detached native inhibitor unless macOS `--even-lid` needs a supervisor:
 
 - macOS: `caffeinate`
 - Linux: `systemd-inhibit`
@@ -29,6 +30,7 @@ The inhibitor owns the session lifetime. `status` and `stop` validate its proces
 
 Conditions that require polling use a detached copy of `wake` as a supervisor:
 
+- `--until` enforces an absolute local-time deadline.
 - `--until-charge` polls battery state.
 - macOS `--even-lid` restores only its `SleepDisabled` 0-to-1 change.
 

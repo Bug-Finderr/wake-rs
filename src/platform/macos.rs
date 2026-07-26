@@ -19,7 +19,6 @@ pub fn static_start_note() -> Option<String> {
 
 pub fn keep_awake_command(
     no_display: bool,
-    _even_lid: bool,
     timeout_sec: Option<i64>,
     wait_pid: Option<u32>,
 ) -> Result<KeepAwake> {
@@ -35,10 +34,7 @@ pub fn keep_awake_command(
         cmd.push("-w".into());
         cmd.push(p.to_string());
     }
-    Ok(KeepAwake {
-        cmd,
-        note: Some(LID_CLOSE_NOTE.to_string()),
-    })
+    Ok(KeepAwake { cmd, note: None })
 }
 
 pub fn read_battery() -> Result<BatteryStatus> {
@@ -171,18 +167,22 @@ mod tests {
 
     #[test]
     fn caffeinate_assertions_match_display_mode() {
+        assert!(
+            keep_awake_command(false, None, None)
+                .unwrap()
+                .note
+                .is_none()
+        );
         assert_eq!(
-            keep_awake_command(false, false, None, None).unwrap().cmd,
+            keep_awake_command(false, None, None).unwrap().cmd,
             [CAFFEINATE, "-di"]
         );
         assert_eq!(
-            keep_awake_command(true, false, None, None).unwrap().cmd,
+            keep_awake_command(true, None, None).unwrap().cmd,
             [CAFFEINATE, "-i"]
         );
         assert_eq!(
-            keep_awake_command(false, false, None, Some(42))
-                .unwrap()
-                .cmd,
+            keep_awake_command(false, None, Some(42)).unwrap().cmd,
             [CAFFEINATE, "-di", "-w", "42"]
         );
     }

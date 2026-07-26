@@ -31,31 +31,16 @@ pub struct BatteryStatus {
     pub neutral_state: Option<String>,
 }
 
-pub struct ChargePlan {
-    pub already_met: bool,
-    pub charging_up: bool,
-}
-
-impl ChargePlan {
-    fn already_met() -> Self {
-        Self {
-            already_met: true,
-            charging_up: false,
-        }
-    }
-
-    fn waiting(charging_up: bool) -> Self {
-        Self {
-            already_met: false,
-            charging_up,
-        }
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChargePlan {
+    AlreadyMet,
+    Wait(bool),
 }
 
 pub fn plan_charge(target: i32, status: &BatteryStatus) -> Result<ChargePlan> {
     if status.discharging {
         if status.percent == target {
-            return Ok(ChargePlan::already_met());
+            return Ok(ChargePlan::AlreadyMet);
         }
         if status.percent < target {
             return Err(AppError::usage(format!(
@@ -63,17 +48,17 @@ pub fn plan_charge(target: i32, status: &BatteryStatus) -> Result<ChargePlan> {
                 status.percent
             )));
         }
-        return Ok(ChargePlan::waiting(false));
+        return Ok(ChargePlan::Wait(false));
     }
     if status.charging {
         return Ok(if status.percent >= target {
-            ChargePlan::already_met()
+            ChargePlan::AlreadyMet
         } else {
-            ChargePlan::waiting(true)
+            ChargePlan::Wait(true)
         });
     }
     if status.percent == target {
-        return Ok(ChargePlan::already_met());
+        return Ok(ChargePlan::AlreadyMet);
     }
     if let Some(state) = &status.neutral_state {
         return Err(AppError::usage(format!(
@@ -98,14 +83,12 @@ pub enum ChargePreparation {
 
 pub fn prepare_charge(target: i32) -> Result<ChargePreparation> {
     let status = platform::read_battery()?;
-    let plan = plan_charge(target, &status)?;
-    Ok(if plan.already_met {
-        ChargePreparation::AlreadyMet(status.percent)
-    } else {
-        ChargePreparation::Wait(PreparedCharge {
+    Ok(match plan_charge(target, &status)? {
+        ChargePlan::AlreadyMet => ChargePreparation::AlreadyMet(status.percent),
+        ChargePlan::Wait(charging_up) => ChargePreparation::Wait(PreparedCharge {
             initial_percent: status.percent,
-            charging_up: plan.charging_up,
-        })
+            charging_up,
+        }),
     })
 }
 
@@ -240,7 +223,7 @@ mod unix {
                     "until supervisor received unexpected lid authority",
                 ));
             }
-            platform::keep_awake_command(args.no_display, false, child_timeout, child_wait_pid)?
+            platform::keep_awake_command(args.no_display, child_timeout, child_wait_pid)?
         };
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
@@ -340,12 +323,7 @@ mod unix {
                     "charge supervisor received an unexpected inhibitor scope",
                 ));
             }
-            platform::keep_awake_command(
-                args.no_display,
-                args.even_lid,
-                child_timeout,
-                child_wait_pid,
-            )?
+            platform::keep_awake_command(args.no_display, child_timeout, child_wait_pid)?
         };
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
@@ -397,7 +375,7 @@ mod unix {
         if args.len() != 9 {
             return Err(AppError::fail("lid supervisor expects 8 arguments"));
         }
-        let prior_disable_sleep = parse_disable_sleep(&args[5])?;
+        let prior_disable_sleep = session::parse_disable_sleep(&args[5])?;
         let mut cleanup = LidCleanup {
             child: None,
             prior_disable_sleep,
@@ -438,8 +416,7 @@ mod unix {
             return Ok(());
         }
         let (child_timeout, child_wait_pid) = supervisor_inhibitor_lifetime();
-        let keep_awake =
-            platform::keep_awake_command(no_display, true, child_timeout, child_wait_pid)?;
+        let keep_awake = platform::keep_awake_command(no_display, child_timeout, child_wait_pid)?;
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
         cleanup.child = Some(child);
@@ -449,12 +426,7 @@ mod unix {
         }
         let mut session = Session {
             pid: std::process::id(),
-            mode: if no_display {
-                "system-only"
-            } else {
-                "display+system"
-            }
-            .into(),
+            mode: session::mode_for(no_display).into(),
             trigger,
             detail,
             started_at: Some(now),
@@ -541,14 +513,6 @@ mod unix {
             } else {
                 commands::print_sleep_restore_rescue(prior);
             }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn parse_disable_sleep(raw: &str) -> Result<i32> {
-        match session::parse_u32(raw, "priorDisableSleep")? {
-            value @ (0 | 1) => Ok(value as i32),
-            _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
         }
     }
 
@@ -694,6 +658,26 @@ mod unix {
                 "idle:sleep",
             ]);
             assert!(parse_until_args(&malformed).is_err());
+
+            let missing = strings(&[
+                "__supervise_until__",
+                "2024-01-02T03:04:05+00:00",
+                "false",
+                "until 03:04",
+                "false",
+            ]);
+            assert!(parse_until_args(&missing).is_err());
+
+            let extra = strings(&[
+                "__supervise_until__",
+                "2024-01-02T03:04:05+00:00",
+                "false",
+                "until 03:04",
+                "false",
+                "idle:sleep",
+                "extra",
+            ]);
+            assert!(parse_until_args(&extra).is_err());
         }
 
         #[test]
@@ -1324,14 +1308,13 @@ mod tests {
     #[test]
     fn charge_plan_table() {
         for (battery, expected) in [
-            (status(80, false, true, None), (true, false)),
-            (status(90, false, true, None), (false, false)),
-            (status(80, true, false, None), (true, false)),
-            (status(60, true, false, None), (false, true)),
-            (status(80, false, false, None), (true, false)),
+            (status(80, false, true, None), ChargePlan::AlreadyMet),
+            (status(90, false, true, None), ChargePlan::Wait(false)),
+            (status(80, true, false, None), ChargePlan::AlreadyMet),
+            (status(60, true, false, None), ChargePlan::Wait(true)),
+            (status(80, false, false, None), ChargePlan::AlreadyMet),
         ] {
-            let plan = plan_charge(80, &battery).unwrap();
-            assert_eq!((plan.already_met, plan.charging_up), expected);
+            assert_eq!(plan_charge(80, &battery).unwrap(), expected);
         }
     }
 

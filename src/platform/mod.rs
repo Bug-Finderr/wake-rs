@@ -1,8 +1,8 @@
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use crate::error::AppError;
 use crate::error::Result;
 use crate::sysutil;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 #[cfg(windows)]
@@ -30,8 +30,7 @@ pub fn find_app_pid(name: &str) -> Result<Option<u32>> {
     sysutil::find_app_pid(name)
 }
 
-#[cfg(not(windows))]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(target_os = "linux")]
 pub fn resolve_on_path(executable: &str, missing_message: &str) -> Result<String> {
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -47,8 +46,7 @@ pub fn resolve_on_path(executable: &str, missing_message: &str) -> Result<String
     Err(AppError::fail(missing_message.to_string()))
 }
 
-#[cfg(unix)]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(target_os = "linux")]
 fn is_runnable_file(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.is_file()

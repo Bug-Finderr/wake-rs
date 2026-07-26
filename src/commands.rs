@@ -70,19 +70,7 @@ pub(crate) fn sleep_restore_needed(prior: i32, current: i32) -> bool {
 
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn sleep_restored(prior: i32, current: i32) -> bool {
-    prior != 0 || current == 0
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn prior_after_authentication(
-    prior: i32,
-    read_current: impl FnOnce() -> Result<i32>,
-) -> Result<i32> {
-    if prior == 0 {
-        read_current()
-    } else {
-        Ok(prior)
-    }
+    !sleep_restore_needed(prior, current)
 }
 
 fn parse_start_args(args: &[String]) -> Result<Parsed> {
@@ -103,6 +91,9 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
+            "-h" | "--help" | "help" | "-v" | "--version" | "version" => {
+                return Err(AppError::usage("help and version must be used alone"));
+            }
             "--no-display" => claim_boolean(&mut p.no_display, a)?,
             "--even-lid" => claim_boolean(&mut p.even_lid, a)?,
             "-t" | "--for" => {
@@ -169,8 +160,6 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
             }
             "forever" | "indefinite" => {
                 trigger_flag = claim_trigger(trigger_flag, a)?;
-                p.trigger_detail = "indefinite".into();
-                p.trigger = "indefinite".into();
             }
             other => {
                 if other.starts_with('-') {
@@ -240,13 +229,13 @@ fn start_unix(p: Parsed) -> Result<()> {
     if let Some(charge) = p.charge_target {
         #[cfg(target_os = "macos")]
         if p.even_lid {
-            return start_lid_supervisor(&p, &mode, Some(charge));
+            return start_lid_supervisor(&p, Some(charge));
         }
         return start_charge_supervisor(charge, p.no_display, p.even_lid);
     }
     #[cfg(target_os = "macos")]
     if p.even_lid {
-        return start_lid_supervisor(&p, &mode, None);
+        return start_lid_supervisor(&p, None);
     }
     if p.until_deadline.is_some() {
         return start_until_supervisor(&p);
@@ -259,8 +248,7 @@ fn start_unix(p: Parsed) -> Result<()> {
     #[cfg(target_os = "linux")]
     let keep_awake = prepared.command(lifetime.timeout_sec, p.wait_pid);
     #[cfg(target_os = "macos")]
-    let keep_awake =
-        platform::keep_awake_command(p.no_display, p.even_lid, lifetime.timeout_sec, p.wait_pid)?;
+    let keep_awake = platform::keep_awake_command(p.no_display, lifetime.timeout_sec, p.wait_pid)?;
     let mut child = sysutil::spawn_named(&keep_awake.cmd)?;
     sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
     let mut saved = Session {
@@ -304,7 +292,7 @@ fn start_until_supervisor(p: &Parsed) -> Result<()> {
     #[cfg(target_os = "linux")]
     let (inhibitor_scope, note) = (prepared.scope(), prepared.note().map(str::to_string));
     #[cfg(target_os = "macos")]
-    let (inhibitor_scope, note) = ("", platform::static_start_note());
+    let (inhibitor_scope, note) = ("", None::<String>);
     let command = until_supervisor_command(
         deadline,
         p.no_display,
@@ -540,35 +528,48 @@ fn print_status(saved: &Session) {
     }
 }
 
-fn print_start_confirmation(s: &Session, note: Option<&str>) {
+fn start_confirmation_lines(s: &Session, note: Option<&str>) -> Vec<String> {
     let started = s.started_at.map(hms).unwrap_or_else(|| "-".into());
     let ends = s.ends_at.map(hms).unwrap_or_else(|| "-".into());
-    println!("wake: session active (pid {})", s.pid);
-    println!("  mode    : {}", s.mode);
-    println!("  trigger : {} ({})", s.trigger, s.detail);
-    println!("  started : {started}");
-    println!("  ends    : {ends}");
+    let mut lines = vec![
+        format!("wake: session active (pid {})", s.pid),
+        format!("  mode    : {}", s.mode),
+        format!("  trigger : {} ({})", s.trigger, s.detail),
+        format!("  started : {started}"),
+        format!("  ends    : {ends}"),
+    ];
     if s.even_lid {
         #[cfg(windows)]
-        println!(
+        lines.push(
             "note: --even-lid override verified; use 'wake status' to detect later power changes"
+                .into(),
         );
         #[cfg(target_os = "macos")]
-        println!(
+        lines.push(
             "note: --even-lid is active; this Mac should stay awake with the lid closed until the session ends"
+                .into(),
         );
         #[cfg(target_os = "linux")]
-        println!(
+        lines.push(
             "note: --even-lid holds a logind inhibitor for lid-switch handling; privileged or non-logind suspend paths are not covered"
+                .into(),
         );
-        println!(
+        lines.push(
             "caution: closed lid + battery + no external display can run hot and drain quickly"
+                .into(),
         );
-    } else if let Some(n) = note
+    } else if let Some(note) = note
         .map(str::to_string)
         .or_else(platform::static_start_note)
     {
-        println!("{n}");
+        lines.push(note);
+    }
+    lines
+}
+
+fn print_start_confirmation(s: &Session, note: Option<&str>) {
+    for line in start_confirmation_lines(s, note) {
+        println!("{line}");
     }
 }
 
@@ -1200,7 +1201,7 @@ enum LidLaunch {
 }
 
 #[cfg(target_os = "macos")]
-fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> Result<()> {
+fn start_lid_supervisor(p: &Parsed, charge_target: Option<i32>) -> Result<()> {
     let mut supervisor_detail = p.trigger_detail.clone();
     let mut charging_up = None;
     if let Some(target) = charge_target {
@@ -1223,7 +1224,7 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
     let mut prior = platform::read_disable_sleep()?;
     if prior == 0 {
         ensure_sudo_for_even_lid()?;
-        prior = prior_after_authentication(prior, platform::read_disable_sleep)?;
+        prior = platform::read_disable_sleep()?;
     }
     if launch_lifetime(p.timeout_sec, p.until_deadline, Utc::now()).is_none() {
         print_deadline_elapsed();
@@ -1231,14 +1232,7 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
     }
     session::write_pending_lid_recovery(prior)?;
 
-    match lid_enable_and_launch(
-        p,
-        mode,
-        &supervisor_detail,
-        charge_target,
-        charging_up,
-        prior,
-    ) {
+    match lid_enable_and_launch(p, &supervisor_detail, charge_target, charging_up, prior) {
         Ok(LidLaunch::Published(s)) => {
             print_start_confirmation(&s, None);
             Ok(())
@@ -1275,7 +1269,6 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
 #[cfg(target_os = "macos")]
 fn lid_enable_and_launch(
     p: &Parsed,
-    _mode: &str,
     supervisor_detail: &str,
     charge_target: Option<i32>,
     charging_up: Option<bool>,
@@ -1664,6 +1657,51 @@ mod tests {
     }
 
     #[test]
+    fn start_confirmation_output_covers_direct_charge_and_until_paths() {
+        for (trigger, detail) in [
+            ("indefinite", "indefinite"),
+            ("until-charge", "80% (was 60%, charging up)"),
+            ("until-time", "until 23:59"),
+        ] {
+            let session = Session {
+                pid: 42,
+                mode: "display+system".into(),
+                trigger: trigger.into(),
+                detail: detail.into(),
+                ..Session::default()
+            };
+            assert_eq!(
+                start_confirmation_lines(&session, Some("note: route note")),
+                [
+                    "wake: session active (pid 42)".to_string(),
+                    "  mode    : display+system".to_string(),
+                    format!("  trigger : {trigger} ({detail})"),
+                    "  started : -".to_string(),
+                    "  ends    : -".to_string(),
+                    "note: route note".to_string(),
+                ]
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_note_covers_direct_charge_and_until_paths() {
+        for trigger in ["indefinite", "until-charge", "until-time"] {
+            let session = Session {
+                trigger: trigger.into(),
+                ..Session::default()
+            };
+            assert_eq!(
+                start_confirmation_lines(&session, None)
+                    .last()
+                    .map(String::as_str),
+                Some("note: closing the lid still sleeps the mac unless you use --even-lid")
+            );
+        }
+    }
+
+    #[test]
     fn parser_routes_indefinite_and_rejects_duplicates() {
         let parsed = parse_start_args(&args(&["forever", "--no-display"])).unwrap();
         assert_eq!(parsed.trigger, "indefinite");
@@ -1676,6 +1714,23 @@ mod tests {
                 parse_start_args(&args(values)),
                 Err(AppError::Usage(_))
             ));
+        }
+    }
+
+    #[test]
+    fn parser_rejects_mixed_help_and_version_with_the_top_level_message() {
+        for values in [&["1h", "--help"][..], &["--no-display", "version"]] {
+            let error = parse_start_args(&args(values)).err().unwrap();
+            assert_eq!(error.message(), "help and version must be used alone");
+        }
+    }
+
+    #[test]
+    fn parser_consumes_help_and_version_as_while_app_values() {
+        for value in ["help", "version", "--help"] {
+            if let Err(error) = parse_start_args(&args(&["--while-app", value])) {
+                assert_ne!(error.message(), "help and version must be used alone");
+            }
         }
     }
 
@@ -1875,13 +1930,12 @@ mod tests {
     fn prior_enabled_sleep_is_not_a_wake_owned_transition() {
         assert!(sleep_restore_needed(0, 1));
         assert!(!sleep_restore_needed(1, 0));
-        assert!(sleep_restored(1, 0));
-        assert_eq!(
-            prior_after_authentication(0, || Ok(1)).unwrap(),
-            1,
-            "the post-sudo value decides transition ownership"
-        );
-        assert_eq!(prior_after_authentication(1, || Ok(0)).unwrap(), 1);
+        for (prior, current) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            assert_eq!(
+                sleep_restored(prior, current),
+                !sleep_restore_needed(prior, current)
+            );
+        }
     }
 
     #[test]

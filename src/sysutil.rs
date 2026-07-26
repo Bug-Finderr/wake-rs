@@ -7,9 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, Process, System};
-#[cfg(not(windows))]
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
@@ -68,13 +66,21 @@ enum AppMatch {
     Substring,
 }
 
+fn app_process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_cmd(UpdateKind::Always)
+        .with_exe(UpdateKind::Always)
+        .without_tasks()
+}
+
 pub fn find_app_pid(raw: &str) -> Result<Option<u32>> {
     let query = raw.trim();
     if query.is_empty() {
         return Err(AppError::usage("app/process name cannot be empty"));
     }
     let self_pid = std::process::id();
-    let system = System::new_all();
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, app_process_refresh_kind());
     let parent_pid = system
         .process(Pid::from_u32(self_pid))
         .and_then(|process| process.parent())
@@ -699,6 +705,21 @@ mod tests {
     #[test]
     fn empty_app_query_is_usage() {
         assert!(matches!(find_app_pid("  \t"), Err(AppError::Usage(_))));
+    }
+
+    #[test]
+    fn app_lookup_refreshes_only_command_and_executable_metadata() {
+        let refresh = app_process_refresh_kind();
+        assert_eq!(refresh.cmd(), sysinfo::UpdateKind::Always);
+        assert_eq!(refresh.exe(), sysinfo::UpdateKind::Always);
+        assert!(!refresh.tasks());
+        assert!(!refresh.cpu());
+        assert!(!refresh.disk_usage());
+        assert!(!refresh.memory());
+        assert_eq!(refresh.user(), sysinfo::UpdateKind::Never);
+        assert_eq!(refresh.cwd(), sysinfo::UpdateKind::Never);
+        assert_eq!(refresh.root(), sysinfo::UpdateKind::Never);
+        assert_eq!(refresh.environ(), sysinfo::UpdateKind::Never);
     }
 
     #[test]

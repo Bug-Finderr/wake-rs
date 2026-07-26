@@ -30,11 +30,11 @@ The inhibitor owns the session lifetime. `status` and `stop` validate its proces
 Conditions that require polling use a detached copy of `wake` as a supervisor:
 
 - `--until-charge` polls battery state.
-- macOS `--even-lid` owns the `SleepDisabled` change and its restoration.
+- macOS `--even-lid` restores only its `SleepDisabled` 0-to-1 change.
 
 The supervisor owns the native inhibitor child, publishes itself as the session process, handles termination signals, and tears down toward allowing sleep. Repeated battery-read failures also end the session rather than leaving an unbounded inhibitor.
 
-Linux `--even-lid` requires the exact systemd-logind inhibitor scope for the session: `idle:sleep:handle-lid-switch` for the default display+system session, `sleep:handle-lid-switch` with `--no-display`. The scope is probed at startup; if logind refuses it, the session errors instead of degrading. Sessions without `--even-lid` probe the same lid-inclusive scope first and may degrade to a narrower scope with an explicit note. There is no `sudo` and no persistent setting: the lock is a file descriptor held by the `systemd-inhibit` process and releases when that process exits, so Linux needs no restoration lifecycle. macOS and Windows retain theirs: macOS restores `SleepDisabled` and Windows restores the recorded power-plan values. The Linux boundary is logind-managed suspend only; root bypasses, direct `/sys/power/state` writes, custom acpid handlers, WSL, containers, and non-logind stacks are out of scope.
+Linux `--even-lid` requires the exact systemd-logind inhibitor scope for the session: `idle:sleep:handle-lid-switch` for the default display+system session, `sleep:handle-lid-switch` with `--no-display`. The scope is probed at startup; if logind refuses it, the session errors instead of degrading. Sessions without `--even-lid` probe the same lid-inclusive scope first and may degrade to a narrower scope with an explicit note. There is no `sudo` and no persistent setting: the lock is a file descriptor held by the `systemd-inhibit` process and releases when that process exits, so Linux needs no restoration lifecycle. macOS and Windows retain theirs: macOS restores only its wake-owned `SleepDisabled` 0-to-1 transition and Windows restores the recorded power-plan values. The Linux boundary is logind-managed suspend only; root bypasses, direct `/sys/power/state` writes, custom acpid handlers, WSL, containers, and non-logind stacks are out of scope.
 
 ### Windows
 
@@ -43,8 +43,8 @@ Every session uses a detached non-elevated `wake` worker. Its main thread calls 
 `--even-lid` additionally launches one elevated guardian through `ShellExecuteExW`:
 
 1. The foreground captures the active power-scheme GUID and raw AC/DC lid actions.
-2. The worker and guardian identities plus that exact snapshot are atomically published.
-3. The guardian accepts its write authority only from immutable launch arguments and waits for the durable record to match them.
+2. The worker first publishes ordinary, non-lid session state before the UAC prompt.
+3. The guardian validates that provisional worker identity, rechecks the active scheme and captured values, rejects an elapsed absolute deadline, then atomically publishes durable restoration authority immediately before its first power write.
 4. It sets the recorded scheme to Do Nothing and verifies the active scheme and values before startup succeeds.
 5. It holds an exact handle to the worker, then restores wake-owned AC/DC fields when that worker exits.
 
@@ -61,7 +61,7 @@ A guardian crash or power loss can require one later UAC-approved recovery. No u
 - start and optional end timestamps
 - whether lid coverage was requested (`evenLid`)
 
-Windows lid sessions also record guardian identity, the exact power-scheme GUID, and raw AC/DC values. macOS lid sessions record the prior `SleepDisabled` value.
+Windows lid sessions also record guardian identity, the exact power-scheme GUID, and raw AC/DC values. macOS lid sessions record the prior `SleepDisabled` value; `0` marks the wake-owned transition that recovery may reverse, while `1` grants no restoration write.
 
 State operations follow these rules:
 
@@ -69,8 +69,9 @@ State operations follow these rules:
 - Records are written to a new temporary file, flushed, and atomically renamed.
 - Unknown, duplicate, missing, or inconsistent fields make a record malformed.
 - Malformed lid-hinted state is retained and never authorizes an OS write.
+- A pre-transition macOS startup marker is deliberately non-authoritative and requires manual recovery if the foreground dies before supervisor publication.
 - A stale ordinary session is deleted only after its process identity is no longer live.
-- A valid stale macOS or Windows lid session is deleted only after exact restoration verifies; those records are persistent because the OS change outlives the process.
+- A valid stale macOS or Windows lid session is deleted only after any wake-owned restoration verifies; on macOS, a prior value of `1` means no transition was owned and no write is allowed.
 - A stale Linux lid session holds no restoration value — the inhibitor is a file descriptor that dies with its process — so it is treated as ordinary stale state.
 
 There is no compatibility parser for older state schemas because the product has no released state-compatibility requirement.

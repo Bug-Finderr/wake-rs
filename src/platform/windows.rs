@@ -255,6 +255,28 @@ pub fn restore_lid_snapshot(snapshot: &LidSnapshot) -> Result<()> {
     )))
 }
 
+fn validate_lid_enable_preflight(
+    active: bool,
+    current: (u32, u32),
+    original: (u32, u32),
+) -> Result<()> {
+    if !active {
+        Err(AppError::fail("active power scheme changed before enable"))
+    } else if current != original {
+        Err(AppError::fail("lid values changed before enable"))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn preflight_lid_enable(snapshot: &LidSnapshot) -> Result<()> {
+    validate_lid_enable_preflight(
+        scheme_is_active(&snapshot.scheme)?,
+        read_lid_values(&snapshot.scheme)?,
+        (snapshot.ac, snapshot.dc),
+    )
+}
+
 fn enable_field(current: u32, original: u32) -> Result<bool> {
     if current == 0 {
         Ok(false)
@@ -445,6 +467,14 @@ mod tests {
         assert!(!should_reactivate_lid(false, (3, 2), (1, 2), true));
         assert!(should_reactivate_lid(true, (3, 2), (1, 2), true));
         assert!(!should_reactivate_lid(true, (3, 2), (1, 2), false));
+    }
+
+    #[test]
+    fn startup_preflight_rejects_changes_before_authority_publication() {
+        assert!(validate_lid_enable_preflight(true, (1, 2), (1, 2)).is_ok());
+        assert!(validate_lid_enable_preflight(false, (1, 2), (1, 2)).is_err());
+        assert!(validate_lid_enable_preflight(true, (0, 2), (1, 2)).is_err());
+        assert!(validate_lid_enable_preflight(true, (1, 0), (1, 2)).is_err());
     }
 
     #[test]

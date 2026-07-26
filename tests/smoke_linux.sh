@@ -104,9 +104,17 @@ expect_scopes() {
 }
 
 wait_dead() {
-  local pid="$1" label="$2"
+  local pid="$1" label="$2" recorded keep
   for ((attempt = 0; attempt < 80; attempt++)); do
     if ! kill -0 "$pid" 2>/dev/null; then
+      if [[ -f "$WAKE_SHIM_PIDS" ]]; then
+        keep="$WAKE_SHIM_PIDS.keep"
+        : >"$keep"
+        while IFS= read -r recorded; do
+          [[ "$recorded" == "$pid" ]] || printf '%s\n' "$recorded" >>"$keep"
+        done <"$WAKE_SHIM_PIDS"
+        mv "$keep" "$WAKE_SHIM_PIDS"
+      fi
       printf 'ok: %s process exited\n' "$label"
       return
     fi
@@ -204,11 +212,28 @@ strict_refusal "explicit system-only refusal" "sleep:handle-lid-switch" --no-dis
 
 : >"$WAKE_INHIBIT_LOG"
 : >"$WAKE_SHIM_PIDS"
+export WAKE_INHIBIT_REFUSE_LID=1
+expect 1 "--even-lid requires systemd inhibitor scope idle:sleep:handle-lid-switch" --until-charge 80 --even-lid
+expect_scopes "charge preflight refusal" "idle:sleep:handle-lid-switch"
+expect_no_state "charge preflight refusal"
+[[ ! -s "$WAKE_SHIM_PIDS" ]] || fail "charge preflight refusal launched a payload"
+
+: >"$WAKE_INHIBIT_LOG"
+: >"$WAKE_SHIM_PIDS"
+export WAKE_INHIBIT_REFUSE_LID=1
 expect 0 "session active" forever
 expect_scopes "ordinary fallback" $'idle:sleep:handle-lid-switch\nidle:sleep\nidle:sleep'
 expect_state_value "evenLid=false"
+ordinary_pid=""
+IFS= read -r ordinary_pid <"$WAKE_SHIM_PIDS"
 expect 0 "stopped" stop
 expect_no_state "ordinary fallback stop"
+if [[ "$ordinary_pid" =~ ^[1-9][0-9]*$ ]]; then
+  wait_dead "$ordinary_pid" "ordinary fallback"
+else
+  fail "ordinary fallback did not record a valid payload pid"
+fi
+unset WAKE_INHIBIT_REFUSE_LID
 
 : >"$WAKE_INHIBIT_LOG"
 : >"$WAKE_SHIM_PIDS"
@@ -223,6 +248,7 @@ if [[ ! "$worker_pid" =~ ^[1-9][0-9]*$ ]] || ! kill -KILL "$worker_pid" 2>/dev/n
   fail "could not kill the managed strict process"
 else
   wait_inactive "strict stale session cleaned"
+  wait_dead "$worker_pid" "strict stale session"
   expect_no_state "strict stale session"
   if [[ "$last_output" == *"restore"* || "$last_output" == *"recovery"* || "$last_output" == *"run 'wake stop'"* ]]; then
     fail "strict stale cleanup emitted restoration guidance: $last_output"

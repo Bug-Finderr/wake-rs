@@ -150,12 +150,28 @@ fn is_wake_name(name: &str) -> bool {
 
 #[cfg(not(windows))]
 pub fn terminate_session(session: &Session) -> Result<()> {
-    if !signal_session(session, false)? || wait_gone(session.pid, Duration::from_secs(5)) {
+    terminate_with(
+        session.pid,
+        |force| signal_session(session, force),
+        |within| wait_gone(session, within),
+    )
+}
+
+#[cfg(not(windows))]
+fn terminate_with(
+    pid: u32,
+    mut signal: impl FnMut(bool) -> Result<bool>,
+    mut wait: impl FnMut(Duration) -> bool,
+) -> Result<()> {
+    if !signal(false)? || wait(Duration::from_secs(5)) {
         return Ok(());
     }
-    signal_session(session, true)?;
-    wait_gone(session.pid, Duration::from_secs(1));
-    Ok(())
+    if !signal(true)? || wait(Duration::from_secs(1)) {
+        return Ok(());
+    }
+    Err(AppError::fail(format!(
+        "session process {pid} survived force termination; state retained"
+    )))
 }
 
 #[cfg(not(windows))]
@@ -174,22 +190,54 @@ fn signal_session(session: &Session, force: bool) -> Result<bool> {
             session.pid
         )));
     }
-    if force || process.kill_with(Signal::Term).is_none() {
-        process.kill();
-    }
-    Ok(true)
+    let delivered = if force {
+        process.kill()
+    } else {
+        process
+            .kill_with(Signal::Term)
+            .unwrap_or_else(|| process.kill())
+    };
+    signal_delivery(
+        delivered,
+        session.matches_live_process(),
+        force,
+        session.pid,
+    )
 }
 
 #[cfg(not(windows))]
-fn wait_gone(pid: u32, within: Duration) -> bool {
+fn signal_delivery(
+    delivered: bool,
+    exact_still_alive: bool,
+    force: bool,
+    pid: u32,
+) -> Result<bool> {
+    if delivered {
+        Ok(true)
+    } else if !exact_still_alive {
+        Ok(false)
+    } else {
+        Err(AppError::fail(format!(
+            "could not {} session process {pid}; state retained",
+            if force {
+                "force-terminate"
+            } else {
+                "terminate"
+            }
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_gone(session: &Session, within: Duration) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
-        if !is_alive(pid) {
+        if !session.matches_live_process() {
             return true;
         }
         sleep(Duration::from_millis(100));
     }
-    !is_alive(pid)
+    !session.matches_live_process()
 }
 
 #[cfg(not(windows))]
@@ -252,8 +300,8 @@ fn detach(command: &mut Command) {
 
 #[cfg(windows)]
 pub use win::{
-    ProcessHandle, child_identity, current_identity, open_exact_process, open_process_for_wait,
-    spawn_elevated_guardian, spawn_worker,
+    GuardianMode, ProcessHandle, child_identity, current_identity, open_exact_process,
+    open_process_for_wait, spawn_elevated_guardian, spawn_worker,
 };
 
 #[cfg(windows)]
@@ -566,14 +614,24 @@ mod win {
         })
     }
 
+    pub enum GuardianMode {
+        Startup(Option<chrono::DateTime<chrono::Utc>>),
+        Recovery,
+    }
+
     pub fn spawn_elevated_guardian(
         worker_pid: u32,
         worker_start: u64,
         scheme: &str,
         ac: u32,
         dc: u32,
+        mode: GuardianMode,
         state_path: &Path,
     ) -> Result<ProcessHandle> {
+        let (restore_without_worker, deadline) = match mode {
+            GuardianMode::Startup(deadline) => (false, deadline),
+            GuardianMode::Recovery => (true, None),
+        };
         let exe = std::env::current_exe()
             .map_err(|error| AppError::fail(format!("can't determine executable path: {error}")))?;
         if !state_path.is_absolute() {
@@ -586,6 +644,8 @@ mod win {
             scheme.to_string(),
             ac.to_string(),
             dc.to_string(),
+            restore_without_worker.to_string(),
+            deadline.map(|value| value.to_rfc3339()).unwrap_or_default(),
             state_path.to_string_lossy().into_owned(),
         ]
         .iter()
@@ -675,6 +735,54 @@ mod tests {
     fn wake_exclusion_is_exact() {
         assert!(is_wake_name("WAKE.EXE"));
         assert!(!is_wake_name("wake-helper.exe"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_signal_is_success_only_when_the_exact_process_is_gone() {
+        assert!(!signal_delivery(false, false, false, 42).unwrap());
+        let error = signal_delivery(false, true, true, 42).unwrap_err();
+        assert!(error.message().contains("force-terminate"));
+        assert!(error.message().contains("state retained"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surviving_force_termination_is_an_error() {
+        let mut signals = Vec::new();
+        let mut waits = [false, false].into_iter();
+        let error = terminate_with(
+            42,
+            |force| {
+                signals.push(force);
+                Ok(true)
+            },
+            |_| waits.next().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(signals, [false, true]);
+        assert!(error.message().contains("42"));
+        assert!(error.message().contains("state retained"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_exit_tracks_the_recorded_identity_not_pid_occupancy() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let saved = Session {
+            pid: child.id(),
+            mode: "display+system".into(),
+            trigger: "indefinite".into(),
+            detail: "indefinite".into(),
+            started_at: Some(chrono::Utc::now()),
+            process_start: u64::MAX,
+            process_command: "/usr/bin/wake".into(),
+            ..Session::default()
+        };
+        let gone = wait_gone(&saved, Duration::ZERO);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(gone);
     }
 
     #[cfg(unix)]

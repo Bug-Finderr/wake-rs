@@ -40,7 +40,7 @@ Only one session can be active. `wake stop` is safe to repeat.
 
 | Platform | Sleep inhibition | Battery | `--even-lid` |
 |---|---|---|---|
-| macOS | `caffeinate` | `pmset` | Temporarily changes `SleepDisabled` through `sudo` |
+| macOS | `caffeinate` | `pmset` | Changes `SleepDisabled` 0 to 1 with `sudo` |
 | Linux | `systemd-inhibit` | `/sys/class/power_supply` | Requires the exact systemd-logind `handle-lid-switch` inhibitor and errors if logind refuses it |
 | Windows | Native `SetThreadExecutionState` worker | `GetSystemPowerStatus` | One UAC prompt starts a narrow guardian that restores the exact power-plan values |
 
@@ -57,7 +57,7 @@ Session state is stored at:
 
 Set `WAKE_STATE_DIR` to use another directory.
 
-State writes are locked and atomic. On macOS and Windows, a valid stale lid record restores only the exact value recorded before `wake` changed it. Linux lid sessions record no persistent value; a stale Linux lid record is deleted once its inhibitor process is dead, because the lock dies with that process. Malformed lid recovery state is retained and reported without changing system settings.
+State writes are locked and atomic. On macOS, recovery restores `SleepDisabled=0` only when `wake` owned the 0-to-1 transition; if it was already `1`, the record grants no later write. A crash before that ownership is published retains a non-authoritative pending record for manual inspection. Windows restores only the exact power-plan values recorded before `wake` changed them. Linux lid sessions record no persistent value; a stale Linux lid record is deleted once its inhibitor process is dead, because the lock dies with that process. Malformed lid recovery state is retained and reported without changing system settings.
 
 ## Verification
 

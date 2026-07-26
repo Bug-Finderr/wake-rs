@@ -447,6 +447,14 @@ pub(crate) fn retain_malformed_state(lid_hints: bool) -> bool {
     cfg!(target_os = "macos") || lid_hints
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn pending_lid_recovery_bytes(prior_disable_sleep: i32) -> Vec<u8> {
+    format!(
+        "version={STATE_VERSION}\nevenLid=true\npriorDisableSleep={prior_disable_sleep}\nstartupPending=true\n"
+    )
+    .into_bytes()
+}
+
 fn lid_hints(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     let persistent_recovery = [
@@ -459,7 +467,7 @@ fn lid_hints(bytes: &[u8]) -> bool {
     ]
     .iter()
     .any(|hint| text.contains(hint));
-    persistent_recovery || (!cfg!(target_os = "linux") && text.contains("evenLid=true"))
+    persistent_recovery || text.contains("evenLid=true")
 }
 
 fn io_error(path: &Path, error: std::io::Error) -> AppError {
@@ -498,9 +506,30 @@ fn atomic_rename(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 pub fn write(session: &Session) -> Result<()> {
-    let path = state_file();
-    let dir = state_dir();
-    fs::create_dir_all(&dir).map_err(|error| io_error(&dir, error))?;
+    write_bytes_at(&state_file(), &serialize(session)?)
+}
+
+#[cfg(windows)]
+pub fn write_at(path: &Path, session: &Session) -> Result<()> {
+    write_bytes_at(path, &serialize(session)?)
+}
+
+#[cfg(target_os = "macos")]
+pub fn write_pending_lid_recovery(prior_disable_sleep: i32) -> Result<()> {
+    if !matches!(prior_disable_sleep, 0 | 1) {
+        return Err(AppError::fail("priorDisableSleep must be 0 or 1"));
+    }
+    write_bytes_at(
+        &state_file(),
+        &pending_lid_recovery_bytes(prior_disable_sleep),
+    )
+}
+
+fn write_bytes_at(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| AppError::fail("state path has no parent directory"))?;
+    fs::create_dir_all(dir).map_err(|error| io_error(dir, error))?;
     let tmp = dir.join(format!("session.properties.tmp-{}", std::process::id()));
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -508,10 +537,10 @@ pub fn write(session: &Session) -> Result<()> {
             .write(true)
             .open(&tmp)
             .map_err(|error| io_error(&tmp, error))?;
-        file.write_all(&serialize(session)?)
+        file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .map_err(|error| io_error(&tmp, error))?;
-        atomic_rename(&tmp, &path).map_err(|error| io_error(&path, error))
+        atomic_rename(&tmp, path).map_err(|error| io_error(path, error))
     })();
     if result.is_err() {
         let _ = fs::remove_file(tmp);
@@ -541,6 +570,15 @@ impl Drop for LockGuard {
     }
 }
 
+fn lock_error(error: std::fs::TryLockError) -> AppError {
+    match error {
+        std::fs::TryLockError::WouldBlock => {
+            AppError::fail("another wake invocation is in progress; try again")
+        }
+        std::fs::TryLockError::Error(error) => AppError::fail(error.to_string()),
+    }
+}
+
 pub fn acquire_lock() -> Result<LockGuard> {
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|error| io_error(&dir, error))?;
@@ -551,13 +589,9 @@ pub fn acquire_lock() -> Result<LockGuard> {
         .write(true)
         .open(&path)
         .map_err(|error| io_error(&path, error))?;
-    match file.try_lock() {
-        Ok(()) => Ok(LockGuard { file }),
-        Err(std::fs::TryLockError::WouldBlock) => Err(AppError::usage(
-            "another wake invocation is in progress; try again",
-        )),
-        Err(std::fs::TryLockError::Error(error)) => Err(AppError::fail(error.to_string())),
-    }
+    file.try_lock()
+        .map(|()| LockGuard { file })
+        .map_err(lock_error)
 }
 
 #[cfg(test)]
@@ -585,6 +619,13 @@ mod tests {
             "version=2\npid=4321\nmode=display+system\ntrigger=timed\ndetail=1h\nstartedAt=2024-01-02T03:04:05+00:00\nendsAt=2024-01-02T04:04:05+00:00\nprocessStart=1700000000\nprocessCommand={command}\nevenLid={even_lid}\n{platform_fields}"
         )
     }
+    #[test]
+    fn pending_lid_recovery_is_retained_without_becoming_write_authority() {
+        let bytes = pending_lid_recovery_bytes(0);
+        assert!(parse_session(&bytes).is_err());
+        assert!(lid_hints(&bytes));
+    }
+
     #[test]
     fn strict_state_accepts_only_complete_versioned_records() {
         assert_eq!(parse_session(valid(false).as_bytes()).unwrap().pid, 4321);
@@ -651,16 +692,20 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn malformed_retention_requires_persistent_recovery_fields_on_linux() {
+    fn malformed_retention_preserves_even_lid_management_breadcrumbs() {
         assert!(retain_malformed_state(lid_hints(b"priorDisableSleep=0\n")));
         assert!(retain_malformed_state(lid_hints(b"guardianStart=broken\n")));
         assert!(retain_malformed_state(lid_hints(
             b"originalScheme=broken\n"
         )));
-        assert_eq!(
-            retain_malformed_state(lid_hints(b"evenLid=true\n")),
-            cfg!(target_os = "macos")
-        );
+        assert!(retain_malformed_state(lid_hints(b"evenLid=true\n")));
         assert_eq!(retain_malformed_state(false), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn lock_contention_is_a_runtime_failure() {
+        let error = lock_error(std::fs::TryLockError::WouldBlock);
+        assert!(matches!(error, AppError::Fail(_)));
+        assert_eq!(error.exit_code(), 1);
     }
 }

@@ -17,23 +17,70 @@ pub fn static_start_note() -> Option<String> {
     None
 }
 
-pub fn keep_awake_command(
-    no_display: bool,
-    even_lid: bool,
-    timeout_sec: Option<i64>,
-    wait_pid: Option<u32>,
-) -> Result<KeepAwake> {
-    let systemd_inhibit = super::resolve_on_path(
-        "systemd-inhibit",
-        "systemd-inhibit not found on PATH; wake requires systemd on Linux",
-    )?;
+pub struct PreparedInhibitor {
+    systemd_inhibit: String,
+    what: &'static str,
+    note: Option<String>,
+}
+
+impl PreparedInhibitor {
+    pub fn scope(&self) -> &'static str {
+        self.what
+    }
+
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+
+    pub fn command(&self, timeout_sec: Option<i64>, wait_pid: Option<u32>) -> KeepAwake {
+        KeepAwake {
+            cmd: inhibitor_command(
+                self.systemd_inhibit.clone(),
+                self.what,
+                timeout_sec,
+                wait_pid,
+            ),
+            note: self.note.clone(),
+        }
+    }
+}
+
+pub fn prepare_keep_awake(no_display: bool, even_lid: bool) -> Result<PreparedInhibitor> {
+    let systemd_inhibit = resolve_systemd_inhibit()?;
     let (what, note) = select_inhibitor(no_display, even_lid, |what| {
         probe_inhibitor(&systemd_inhibit, what)
     })?;
-    Ok(KeepAwake {
-        cmd: inhibitor_command(systemd_inhibit, what, timeout_sec, wait_pid),
+    Ok(PreparedInhibitor {
+        systemd_inhibit,
+        what,
         note,
     })
+}
+
+pub fn keep_awake_command_for_scope(
+    no_display: bool,
+    even_lid: bool,
+    what: &str,
+    timeout_sec: Option<i64>,
+    wait_pid: Option<u32>,
+) -> Result<KeepAwake> {
+    let candidates = inhibitor_candidates(no_display);
+    if !candidates.contains(&what) || (even_lid && what != candidates[0]) {
+        return Err(AppError::fail(
+            "supervisor received an invalid inhibitor scope",
+        ));
+    }
+    Ok(KeepAwake {
+        cmd: inhibitor_command(resolve_systemd_inhibit()?, what, timeout_sec, wait_pid),
+        note: None,
+    })
+}
+
+fn resolve_systemd_inhibit() -> Result<String> {
+    super::resolve_on_path(
+        "systemd-inhibit",
+        "systemd-inhibit not found on PATH; wake requires systemd on Linux",
+    )
 }
 
 fn inhibitor_command(
@@ -99,16 +146,20 @@ fn read_battery_from(base: &Path) -> Result<BatteryStatus> {
     })
 }
 
+fn inhibitor_candidates(no_display: bool) -> &'static [&'static str] {
+    if no_display {
+        SYSTEM_INHIBITORS
+    } else {
+        DISPLAY_INHIBITORS
+    }
+}
+
 fn select_inhibitor(
     no_display: bool,
     even_lid: bool,
     mut probe: impl FnMut(&str) -> bool,
 ) -> Result<(&'static str, Option<String>)> {
-    let candidates = if no_display {
-        SYSTEM_INHIBITORS
-    } else {
-        DISPLAY_INHIBITORS
-    };
+    let candidates = inhibitor_candidates(no_display);
     if even_lid {
         let what = candidates[0];
         return if probe(what) {
@@ -121,8 +172,15 @@ fn select_inhibitor(
     }
     for (index, &what) in candidates.iter().enumerate() {
         if probe(what) {
-            let note = (index > 0)
-                .then(|| format!("note: inhibitor degraded to {what}; lid closure may suspend"));
+            let note = (index > 0).then(|| {
+                if !no_display && what == "sleep" {
+                    format!(
+                        "note: inhibitor degraded to {what}; idle/display inhibition and lid-switch handling were lost, so the display may sleep and lid closure may suspend"
+                    )
+                } else {
+                    format!("note: inhibitor degraded to {what}; lid closure may suspend")
+                }
+            });
             return Ok((what, note));
         }
     }
@@ -258,6 +316,29 @@ mod tests {
     }
 
     #[test]
+    fn prepared_inhibitor_keeps_scope_and_note_together() {
+        let prepared = PreparedInhibitor {
+            systemd_inhibit: "systemd-inhibit".into(),
+            what: "sleep",
+            note: Some("degraded".into()),
+        };
+        let keep_awake = prepared.command(None, Some(42));
+        assert_eq!(keep_awake.cmd[1], "--what=sleep");
+        assert_eq!(keep_awake.note.as_deref(), Some("degraded"));
+    }
+
+    #[test]
+    fn preselected_explicit_scope_rejects_a_weaker_fallback() {
+        let error = keep_awake_command_for_scope(false, true, "idle:sleep", None, Some(42))
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.message(),
+            "supervisor received an invalid inhibitor scope"
+        );
+    }
+
+    #[test]
     fn non_explicit_inhibitor_probes_keep_order_and_explain_lid_degradation() {
         let mut probed = Vec::new();
         let selected = select_inhibitor(false, false, |what| {
@@ -284,6 +365,14 @@ mod tests {
             selected.1.as_deref(),
             Some("note: inhibitor degraded to sleep; lid closure may suspend")
         );
+    }
+
+    #[test]
+    fn display_fallback_to_sleep_names_every_lost_inhibition() {
+        let selected = select_inhibitor(false, false, |what| what == "sleep").unwrap();
+        let note = selected.1.unwrap();
+        assert!(note.contains("idle/display inhibition"));
+        assert!(note.contains("lid"));
     }
 
     #[test]

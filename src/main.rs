@@ -23,7 +23,7 @@ fn main() {
 
 fn dispatch(args: &[String]) -> Result<(), AppError> {
     let internal = args.first().is_some_and(|arg| arg.starts_with("__"));
-    if !internal && args.len() > 1 && args.iter().any(|arg| is_help_or_version(arg)) {
+    if !internal && has_mixed_help_or_version(args) {
         return Err(AppError::usage("help and version must be used alone"));
     }
     let Some((first, rest)) = args.split_first() else {
@@ -31,10 +31,12 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
     };
     match first.as_str() {
         "-h" | "--help" | "help" => {
+            reject_trailing(first, rest)?;
             print_help();
             Ok(())
         }
         "-v" | "--version" | "version" => {
+            reject_trailing(first, rest)?;
             println!("wake {VERSION}");
             Ok(())
         }
@@ -48,6 +50,8 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
         }
         #[cfg(not(windows))]
         "__supervise_charge__" => supervisor::run_charge(args),
+        #[cfg(not(windows))]
+        "__supervise_until__" => supervisor::run_until(args),
         #[cfg(target_os = "macos")]
         "__supervise_lid__" => supervisor::run_lid(args),
         #[cfg(windows)]
@@ -63,6 +67,26 @@ fn is_help_or_version(arg: &str) -> bool {
         arg,
         "-h" | "--help" | "help" | "-v" | "--version" | "version"
     )
+}
+
+fn has_mixed_help_or_version(args: &[String]) -> bool {
+    if args.len() <= 1 {
+        return false;
+    }
+    let mut value = false;
+    for arg in args {
+        if value {
+            value = false;
+        } else if matches!(
+            arg.as_str(),
+            "-t" | "--for" | "--until" | "--until-charge" | "--while-pid" | "--while-app"
+        ) {
+            value = true;
+        } else if is_help_or_version(arg) {
+            return true;
+        }
+    }
+    false
 }
 
 fn reject_trailing(command: &str, args: &[String]) -> Result<(), AppError> {
@@ -136,5 +160,21 @@ mod tests {
         for values in [&["1h", "--help"][..], &["--no-display", "--version"]] {
             assert!(matches!(dispatch(&args(values)), Err(AppError::Usage(_))));
         }
+    }
+
+    #[test]
+    fn help_and_version_values_are_not_top_level_commands() {
+        for values in [
+            &["--while-app", "help"][..],
+            &["--while-app", "version"],
+            &["--while-app", "--help"],
+        ] {
+            assert!(!has_mixed_help_or_version(&args(values)));
+        }
+        assert!(has_mixed_help_or_version(&args(&[
+            "--while-app",
+            "help",
+            "--version",
+        ])));
     }
 }

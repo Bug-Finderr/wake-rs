@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BATTERY_FAILURES: u8 = 3;
 
+#[cfg(any(not(windows), test))]
 fn poll_interval(
     deadline: Option<chrono::DateTime<Utc>>,
     now: chrono::DateTime<Utc>,
@@ -720,15 +721,45 @@ mod windows {
         session: Session,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum WorkerWait {
+        Forever,
+        Duration(Duration),
+        Process,
+        Charge,
+    }
+
     impl WorkerSpec {
-        fn lifetime_elapsed(&self, started: Instant) -> bool {
-            if self.session.trigger == "until-time" {
-                self.session
+        fn deadline_elapsed(&self, now: chrono::DateTime<Utc>) -> bool {
+            self.session.trigger == "until-time"
+                && self.session.ends_at.is_some_and(|deadline| now >= deadline)
+        }
+
+        fn wait_strategy(&self, now: chrono::DateTime<Utc>) -> Result<WorkerWait> {
+            match self.session.trigger.as_str() {
+                "indefinite" => Ok(WorkerWait::Forever),
+                "timed" => self
+                    .timeout
+                    .map(WorkerWait::Duration)
+                    .ok_or_else(|| AppError::fail("timed Windows worker is missing its timeout")),
+                "until-time" => self
+                    .session
                     .ends_at
-                    .is_some_and(|deadline| Utc::now() >= deadline)
-            } else {
-                self.timeout
-                    .is_some_and(|timeout| started.elapsed() >= timeout)
+                    .map(|deadline| {
+                        WorkerWait::Duration((deadline - now).to_std().unwrap_or(Duration::ZERO))
+                    })
+                    .ok_or_else(|| {
+                        AppError::fail("until-time Windows worker is missing its deadline")
+                    }),
+                "while-pid" | "while-app" if self.target.is_some() => Ok(WorkerWait::Process),
+                "until-charge" if self.charge.is_some() => Ok(WorkerWait::Charge),
+                "while-pid" | "while-app" => Err(AppError::fail(
+                    "process-bound Windows worker is missing its target",
+                )),
+                "until-charge" => Err(AppError::fail(
+                    "charge-bound Windows worker is missing its target",
+                )),
+                _ => Err(AppError::fail("Windows worker has an invalid trigger")),
             }
         }
     }
@@ -778,7 +809,7 @@ mod windows {
     pub fn run_worker(args: &[String]) -> Result<()> {
         let spec = parse_worker_args(args)?;
         let _execution_state = platform::ExecutionStateGuard::acquire(spec.no_display)?;
-        if spec.lifetime_elapsed(Instant::now()) {
+        if spec.deadline_elapsed(Utc::now()) {
             return Ok(());
         }
         session::write(&spec.session)?;
@@ -864,40 +895,33 @@ mod windows {
     }
 
     fn run_worker_lifetime(spec: &WorkerSpec) -> Result<()> {
-        let start = Instant::now();
-        let mut last_battery = Instant::now();
-        let mut failures = 0;
-        loop {
-            if spec.lifetime_elapsed(start) {
-                break;
-            }
-            if let Some(target) = &spec.target
-                && !target.is_running()?
-            {
-                break;
-            }
-            if let Some((target, up)) = spec.charge
-                && last_battery.elapsed() >= POLL_INTERVAL
-            {
-                last_battery = Instant::now();
-                match poll_battery(target, up, &mut failures) {
-                    BatteryPoll::Continue => {}
-                    BatteryPoll::Reached => break,
-                    BatteryPoll::Failed => {
-                        return Err(AppError::fail("battery status remained unavailable"));
+        match spec.wait_strategy(Utc::now())? {
+            WorkerWait::Forever => loop {
+                // Only process termination ends an indefinite worker; park may wake spuriously.
+                std::thread::park();
+            },
+            WorkerWait::Duration(duration) => sleep(duration),
+            WorkerWait::Process => spec
+                .target
+                .as_ref()
+                .expect("process wait strategy requires a target")
+                .wait_forever()?,
+            WorkerWait::Charge => {
+                let (target, up) = spec
+                    .charge
+                    .expect("charge wait strategy requires a battery target");
+                let mut failures = 0;
+                loop {
+                    sleep(POLL_INTERVAL);
+                    match poll_battery(target, up, &mut failures) {
+                        BatteryPoll::Continue => {}
+                        BatteryPoll::Reached => break,
+                        BatteryPoll::Failed => {
+                            return Err(AppError::fail("battery status remained unavailable"));
+                        }
                     }
                 }
             }
-            let deadline = if spec.session.trigger == "until-time" {
-                spec.session.ends_at
-            } else {
-                None
-            };
-            let Some(interval) = poll_interval(deadline, Utc::now(), Duration::from_millis(250))
-            else {
-                break;
-            };
-            sleep(interval);
         }
         Ok(())
     }
@@ -949,9 +973,7 @@ mod windows {
         }
         session::write_at(&args.state_path, &authority)?;
         platform::enable_lid(&snapshot)?;
-        while worker.is_running()? {
-            sleep(Duration::from_millis(250));
-        }
+        worker.wait_forever()?;
         platform::restore_lid_snapshot(&snapshot)
     }
 
@@ -1126,7 +1148,8 @@ mod windows {
         }
 
         #[test]
-        fn until_worker_uses_the_absolute_end_without_changing_relative_timeouts() {
+        fn until_worker_checks_the_absolute_end_without_shortening_relative_timeouts() {
+            let now = Utc::now();
             let mut spec = WorkerSpec {
                 no_display: false,
                 timeout: Some(Duration::from_secs(3_600)),
@@ -1134,13 +1157,70 @@ mod windows {
                 charge: None,
                 session: Session {
                     trigger: "until-time".into(),
-                    ends_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+                    ends_at: Some(now - chrono::Duration::seconds(1)),
                     ..Session::default()
                 },
             };
-            assert!(spec.lifetime_elapsed(Instant::now()));
+            assert!(spec.deadline_elapsed(now));
             spec.session.trigger = "timed".into();
-            assert!(!spec.lifetime_elapsed(Instant::now()));
+            assert!(!spec.deadline_elapsed(now));
+        }
+
+        #[test]
+        fn non_charge_workers_choose_one_blocking_wait_strategy() {
+            let now = session::parse_utc("2024-01-02T03:04:05+00:00", "test time").unwrap();
+            let spec = |trigger: &str| WorkerSpec {
+                no_display: false,
+                timeout: None,
+                target: None,
+                charge: None,
+                session: Session {
+                    trigger: trigger.into(),
+                    ..Session::default()
+                },
+            };
+
+            assert_eq!(
+                spec("indefinite").wait_strategy(now).unwrap(),
+                WorkerWait::Forever
+            );
+
+            let mut timed = spec("timed");
+            timed.timeout = Some(Duration::from_secs(42));
+            assert_eq!(
+                timed.wait_strategy(now).unwrap(),
+                WorkerWait::Duration(Duration::from_secs(42))
+            );
+
+            let mut until = spec("until-time");
+            until.session.ends_at = Some(now + chrono::Duration::milliseconds(1_250));
+            assert_eq!(
+                until.wait_strategy(now).unwrap(),
+                WorkerWait::Duration(Duration::from_millis(1_250))
+            );
+
+            for trigger in ["while-pid", "while-app"] {
+                let mut process = spec(trigger);
+                process.target = Some(sysutil::open_process_for_wait(std::process::id()).unwrap());
+                assert_eq!(process.wait_strategy(now).unwrap(), WorkerWait::Process);
+            }
+        }
+
+        #[test]
+        fn charge_worker_is_the_only_periodic_strategy() {
+            let now = session::parse_utc("2024-01-02T03:04:05+00:00", "test time").unwrap();
+            let charge = WorkerSpec {
+                no_display: false,
+                timeout: None,
+                target: None,
+                charge: Some((80, true)),
+                session: Session {
+                    trigger: "until-charge".into(),
+                    ..Session::default()
+                },
+            };
+
+            assert_eq!(charge.wait_strategy(now).unwrap(), WorkerWait::Charge);
         }
 
         #[test]
@@ -1327,6 +1407,17 @@ mod tests {
         ] {
             assert!(plan_charge(80, &battery).is_err());
         }
+    }
+
+    #[test]
+    fn charge_stops_after_bounded_consecutive_battery_failures() {
+        let error = AppError::fail("battery unavailable");
+        let mut failures = 0;
+
+        assert!(!battery_failures_exhausted(&mut failures, &error));
+        assert!(!battery_failures_exhausted(&mut failures, &error));
+        assert!(battery_failures_exhausted(&mut failures, &error));
+        assert_eq!(failures, MAX_BATTERY_FAILURES);
     }
 
     #[test]

@@ -328,8 +328,9 @@ mod win {
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_NO_WINDOW, DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, GetProcessId,
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+        GetProcessTimes, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
+        WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -409,6 +410,13 @@ mod win {
                 WAIT_OBJECT_0 => Ok(true),
                 WAIT_TIMEOUT => Ok(false),
                 _ => unreachable!("wait_raw accepts only successful wait results"),
+            }
+        }
+
+        pub fn wait_forever(&self) -> Result<()> {
+            match wait_raw(self.handle.raw(), INFINITE)? {
+                WAIT_OBJECT_0 => Ok(()),
+                _ => unreachable!("an infinite process wait cannot time out"),
             }
         }
 
@@ -818,6 +826,26 @@ mod tests {
             .to_string();
         assert!(error.contains("exited immediately"));
         assert!(error.contains("17"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_process_handle_waits_for_exact_process_exit() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/D", "/C", "ping -n 2 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap();
+        let process = open_process_for_wait(child.id()).unwrap();
+
+        process.wait_forever().unwrap();
+
+        assert!(
+            child
+                .try_wait()
+                .unwrap()
+                .expect("wait_forever returned before the process exited")
+                .success()
+        );
     }
 
     #[cfg(windows)]

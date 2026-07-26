@@ -61,7 +61,6 @@ pub fn state_file() -> PathBuf {
     state_dir().join("session.properties")
 }
 
-#[cfg(any(not(windows), test))]
 pub fn mode_for(no_display: bool) -> &'static str {
     if no_display {
         "system-only"

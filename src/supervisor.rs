@@ -715,7 +715,6 @@ mod windows {
 
     struct WorkerSpec {
         no_display: bool,
-        timeout: Option<Duration>,
         target: Option<sysutil::ProcessHandle>,
         charge: Option<(i32, bool)>,
         session: Session,
@@ -724,7 +723,6 @@ mod windows {
     #[derive(Debug, PartialEq, Eq)]
     enum WorkerWait {
         Forever,
-        Duration(Duration),
         Deadline(chrono::DateTime<Utc>),
         Process,
         Charge,
@@ -732,7 +730,7 @@ mod windows {
 
     impl WorkerSpec {
         fn deadline_elapsed(&self, now: chrono::DateTime<Utc>) -> bool {
-            self.session.trigger == "until-time"
+            matches!(self.session.trigger.as_str(), "timed" | "until-time")
                 && self.session.ends_at.is_some_and(|deadline| now >= deadline)
         }
 
@@ -740,9 +738,10 @@ mod windows {
             match self.session.trigger.as_str() {
                 "indefinite" => Ok(WorkerWait::Forever),
                 "timed" => self
-                    .timeout
-                    .map(WorkerWait::Duration)
-                    .ok_or_else(|| AppError::fail("timed Windows worker is missing its timeout")),
+                    .session
+                    .ends_at
+                    .map(WorkerWait::Deadline)
+                    .ok_or_else(|| AppError::fail("timed Windows worker is missing its deadline")),
                 "until-time" => self
                     .session
                     .ends_at
@@ -765,13 +764,9 @@ mod windows {
 
     pub fn worker_command(
         session: &Session,
-        timeout_sec: Option<i64>,
         target: Option<(u32, u64)>,
         charge: Option<(i32, bool)>,
     ) -> Result<Vec<String>> {
-        if timeout_sec.is_some_and(|timeout| timeout <= 0) {
-            return Err(AppError::fail("worker timeout must be positive"));
-        }
         if !matches!(session.mode.as_str(), "system-only" | "display+system") {
             return Err(AppError::fail("invalid worker mode"));
         }
@@ -785,9 +780,6 @@ mod windows {
             sysutil::self_exe()?,
             "__worker_windows__".into(),
             session.mode.clone(),
-            timeout_sec
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
             target_pid,
             target_start,
             charge_target,
@@ -818,19 +810,16 @@ mod windows {
     }
 
     fn parse_worker_args(args: &[String]) -> Result<WorkerSpec> {
-        if args.len() != 11 {
-            return Err(AppError::fail(
-                "Windows worker expects exactly 10 arguments",
-            ));
+        if args.len() != 10 {
+            return Err(AppError::fail("Windows worker expects exactly 9 arguments"));
         }
         let no_display = match args[1].as_str() {
             "system-only" => true,
             "display+system" => false,
             _ => return Err(AppError::fail("Windows worker has an invalid mode")),
         };
-        let timeout = optional_positive(&args[2], "timeout")?.map(Duration::from_secs);
-        let target_pid = optional_positive(&args[3], "target pid")?;
-        let target_start = optional_positive(&args[4], "target creation time")?;
+        let target_pid = optional_positive(&args[2], "target pid")?;
+        let target_start = optional_positive(&args[3], "target creation time")?;
         if target_pid.is_some() != target_start.is_some() {
             return Err(AppError::fail(
                 "Windows worker target identity is incomplete",
@@ -843,12 +832,12 @@ mod windows {
             },
             None => None,
         };
-        let charge_target = if args[5].is_empty() {
+        let charge_target = if args[4].is_empty() {
             None
         } else {
-            Some(parse_charge_target(&args[5])?)
+            Some(parse_charge_target(&args[4])?)
         };
-        let charge_up = match args[6].as_str() {
+        let charge_up = match args[5].as_str() {
             "" => None,
             "up" => Some(true),
             "down" => Some(false),
@@ -866,19 +855,18 @@ mod windows {
         let identity = sysutil::current_identity()?;
         Ok(WorkerSpec {
             no_display,
-            timeout,
             target,
             charge: charge_target.zip(charge_up),
             session: Session {
                 pid: std::process::id(),
                 mode: args[1].clone(),
-                trigger: args[7].clone(),
-                detail: args[8].clone(),
-                started_at: Some(session::parse_utc(&args[9], "start time")?),
-                ends_at: if args[10].is_empty() {
+                trigger: args[6].clone(),
+                detail: args[7].clone(),
+                started_at: Some(session::parse_utc(&args[8], "start time")?),
+                ends_at: if args[9].is_empty() {
                     None
                 } else {
-                    Some(session::parse_utc(&args[10], "end time")?)
+                    Some(session::parse_utc(&args[9], "end time")?)
                 },
                 process_start: identity.start,
                 process_command: identity.command,
@@ -899,7 +887,6 @@ mod windows {
                 // Only process termination ends an indefinite worker; park may wake spuriously.
                 std::thread::park();
             },
-            WorkerWait::Duration(duration) => sleep(duration),
             WorkerWait::Deadline(deadline) => sysutil::wait_until(deadline)?,
             WorkerWait::Process => spec
                 .target
@@ -1095,7 +1082,6 @@ mod windows {
             let valid = strings(&[
                 "__worker_windows__",
                 "system-only",
-                "60",
                 "",
                 "",
                 "80",
@@ -1106,17 +1092,17 @@ mod windows {
                 "",
             ]);
             assert!(!parse_worker_args(&valid).unwrap().session.even_lid);
-            assert!(parse_worker_args(&valid[..10]).is_err());
+            assert!(parse_worker_args(&valid[..9]).is_err());
             let mut extra = valid.clone();
             extra.push("true".into());
             assert!(parse_worker_args(&extra).is_err());
             let mut incomplete = valid;
-            incomplete[3] = "42".into();
+            incomplete[2] = "42".into();
             assert!(parse_worker_args(&incomplete).is_err());
         }
 
         #[test]
-        fn worker_command_omits_publish_and_parses_as_provisional_non_lid_state() {
+        fn worker_command_omits_timeout_and_publish_authority() {
             let session = Session {
                 mode: "system-only".into(),
                 trigger: "until-charge".into(),
@@ -1126,14 +1112,13 @@ mod windows {
                 ),
                 ..Session::default()
             };
-            let command = worker_command(&session, Some(60), None, Some((80, true))).unwrap();
-            assert_eq!(command.len(), 12);
+            let command = worker_command(&session, None, Some((80, true))).unwrap();
+            assert_eq!(command.len(), 11);
             assert_eq!(
                 &command[1..],
                 [
                     "__worker_windows__",
                     "system-only",
-                    "60",
                     "",
                     "",
                     "80",
@@ -1148,11 +1133,33 @@ mod windows {
         }
 
         #[test]
-        fn until_worker_checks_the_absolute_end_without_shortening_relative_timeouts() {
+        fn timed_worker_command_round_trips_its_exact_absolute_end() {
+            let started_at = session::parse_utc("2024-01-02T03:04:05+00:00", "start time").unwrap();
+            let ends_at = session::parse_utc("2024-01-02T03:05:05.250+00:00", "end time").unwrap();
+            let session = Session {
+                mode: "display+system".into(),
+                trigger: "timed".into(),
+                detail: "60s".into(),
+                started_at: Some(started_at),
+                ends_at: Some(ends_at),
+                ..Session::default()
+            };
+
+            let command = worker_command(&session, None, None).unwrap();
+            let parsed = parse_worker_args(&command[1..]).unwrap();
+
+            assert_eq!(parsed.session.ends_at, Some(ends_at));
+            assert_eq!(
+                parsed.wait_strategy().unwrap(),
+                WorkerWait::Deadline(ends_at)
+            );
+        }
+
+        #[test]
+        fn deadline_workers_skip_publication_after_their_exact_end() {
             let now = Utc::now();
             let mut spec = WorkerSpec {
                 no_display: false,
-                timeout: Some(Duration::from_secs(3_600)),
                 target: None,
                 charge: None,
                 session: Session {
@@ -1163,14 +1170,13 @@ mod windows {
             };
             assert!(spec.deadline_elapsed(now));
             spec.session.trigger = "timed".into();
-            assert!(!spec.deadline_elapsed(now));
+            assert!(spec.deadline_elapsed(now));
         }
 
         #[test]
         fn non_charge_workers_choose_one_blocking_wait_strategy() {
             let spec = |trigger: &str| WorkerSpec {
                 no_display: false,
-                timeout: None,
                 target: None,
                 charge: None,
                 session: Session {
@@ -1184,16 +1190,16 @@ mod windows {
                 WorkerWait::Forever
             );
 
+            let deadline =
+                session::parse_utc("2024-01-02T03:04:06.250+00:00", "test time").unwrap();
             let mut timed = spec("timed");
-            timed.timeout = Some(Duration::from_secs(42));
+            timed.session.ends_at = Some(deadline);
             assert_eq!(
                 timed.wait_strategy().unwrap(),
-                WorkerWait::Duration(Duration::from_secs(42))
+                WorkerWait::Deadline(deadline)
             );
 
             let mut until = spec("until-time");
-            let deadline =
-                session::parse_utc("2024-01-02T03:04:06.250+00:00", "test time").unwrap();
             until.session.ends_at = Some(deadline);
             assert_eq!(
                 until.wait_strategy().unwrap(),
@@ -1211,7 +1217,6 @@ mod windows {
         fn charge_worker_is_the_only_periodic_strategy() {
             let charge = WorkerSpec {
                 no_display: false,
-                timeout: None,
                 target: None,
                 charge: Some((80, true)),
                 session: Session {

@@ -33,7 +33,6 @@ struct Parsed {
 
 struct LaunchLifetime {
     started_at: DateTime<Utc>,
-    timeout_sec: Option<i64>,
     ends_at: Option<DateTime<Utc>>,
 }
 
@@ -52,13 +51,11 @@ fn launch_lifetime(
         }
         return Some(LaunchLifetime {
             started_at: now,
-            timeout_sec: Some((deadline - now).num_seconds().max(1)),
             ends_at: Some(deadline),
         });
     }
     Some(LaunchLifetime {
         started_at: now,
-        timeout_sec,
         ends_at: timeout_sec.map(|timeout| now + Duration::seconds(timeout)),
     })
 }
@@ -246,9 +243,9 @@ fn start_unix(p: Parsed) -> Result<()> {
     let lifetime = launch_lifetime(p.timeout_sec, None, Utc::now())
         .expect("relative and indefinite lifetimes are always pending");
     #[cfg(target_os = "linux")]
-    let keep_awake = prepared.command(lifetime.timeout_sec, p.wait_pid);
+    let keep_awake = prepared.command(p.timeout_sec, p.wait_pid);
     #[cfg(target_os = "macos")]
-    let keep_awake = platform::keep_awake_command(p.no_display, lifetime.timeout_sec, p.wait_pid)?;
+    let keep_awake = platform::keep_awake_command(p.no_display, p.timeout_sec, p.wait_pid)?;
     let mut child = sysutil::spawn_named(&keep_awake.cmd)?;
     sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
     let mut saved = Session {
@@ -705,12 +702,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
         return Ok(());
     };
     let mut saved = Session {
-        mode: if parsed.no_display {
-            "system-only"
-        } else {
-            "display+system"
-        }
-        .into(),
+        mode: session::mode_for(parsed.no_display).into(),
         trigger: parsed.trigger,
         detail: parsed.trigger_detail,
         started_at: Some(lifetime.started_at),
@@ -718,7 +710,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
         even_lid: parsed.even_lid,
         ..Session::default()
     };
-    let command = crate::supervisor::worker_command(&saved, lifetime.timeout_sec, target, charge)?;
+    let command = crate::supervisor::worker_command(&saved, target, charge)?;
     let mut worker = sysutil::spawn_worker(&command, &session::state_dir())?;
     saved.pid = worker.id();
     let identity = sysutil::child_identity(&worker)?;
@@ -1888,26 +1880,15 @@ mod tests {
     }
 
     #[test]
-    fn absolute_deadline_is_recomputed_at_the_owner_launch_point() {
+    fn launch_lifetime_preserves_exact_absolute_and_relative_ends() {
         let launch = DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
             .unwrap()
             .with_timezone(&Utc);
         let deadline = launch + Duration::seconds(5);
         let lifetime = launch_lifetime(None, Some(deadline), launch).unwrap();
-        assert_eq!(lifetime.timeout_sec, Some(5));
         assert_eq!(lifetime.started_at, launch);
         assert_eq!(lifetime.ends_at, Some(deadline));
         assert!(launch_lifetime(None, Some(deadline), deadline).is_none());
-        let fractional = launch_lifetime(
-            None,
-            Some(deadline),
-            deadline - Duration::milliseconds(4_100),
-        )
-        .unwrap();
-        assert_eq!(fractional.timeout_sec, Some(4));
-        let subsecond =
-            launch_lifetime(None, Some(deadline), deadline - Duration::milliseconds(100)).unwrap();
-        assert_eq!(subsecond.timeout_sec, Some(1));
         assert!(deadline_still_pending(
             deadline,
             deadline - Duration::milliseconds(1)
@@ -1915,7 +1896,7 @@ mod tests {
         assert!(!deadline_still_pending(deadline, deadline));
 
         let relative = launch_lifetime(Some(60), None, launch).unwrap();
-        assert_eq!(relative.timeout_sec, Some(60));
+        assert_eq!(relative.started_at, launch);
         assert_eq!(relative.ends_at, Some(launch + Duration::seconds(60)));
     }
 

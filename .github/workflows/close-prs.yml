@@ -9,11 +9,9 @@ permissions:
 jobs:
   close:
     runs-on: ubuntu-latest
-    env:
-      ALLOWED_USERS: Bug-Finderr
     steps:
       - name: Close if not allowed
-        if: ${{ !contains(env.ALLOWED_USERS, github.actor) }}
+        if: ${{ github.actor != 'Bug-Finderr' }}
         run: gh pr close ${{ github.event.number }} --comment "This repository does not accept external pull requests. Please open an issue instead." --repo ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

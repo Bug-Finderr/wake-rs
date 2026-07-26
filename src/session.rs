@@ -1,62 +1,67 @@
-//! Session state: the `session.properties` file, the advisory lock, and crash-recovery parsing.
-
 use crate::error::{AppError, Result};
-use crate::platform;
-use crate::sysutil;
+use crate::{platform, sysutil};
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-#[cfg(not(windows))]
-pub const PHASE_ENABLING: &str = "enabling";
-pub const PHASE_ACTIVE: &str = "active";
+const STATE_VERSION: &str = "2";
 
 pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("WAKE_STATE_DIR")
         && !dir.is_empty()
     {
-        return PathBuf::from(dir);
+        return absolute_path(PathBuf::from(dir));
     }
-    default_state_dir()
+    absolute_path(default_state_dir())
 }
 
-// NOTE: the Windows base moved from ~/.local/state to %LOCALAPPDATA%; any session written under the
-// old location is orphaned, but recovery is best-effort and a stale child dies on its own.
+fn absolute_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
 #[cfg(windows)]
 fn default_state_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
+    std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join("AppData").join("Local"));
-    base.join("wake")
+        .unwrap_or_else(|| home().join("AppData").join("Local"))
+        .join("wake")
 }
 
 #[cfg(unix)]
 fn default_state_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
-        let p = PathBuf::from(xdg);
-        if p.is_absolute() {
-            return p.join("wake");
+        let path = PathBuf::from(xdg);
+        if path.is_absolute() {
+            return path.join("wake");
         }
     }
     home().join(".local").join("state").join("wake")
+}
+
+fn home() -> PathBuf {
+    #[cfg(windows)]
+    let value = std::env::var_os("USERPROFILE");
+    #[cfg(unix)]
+    let value = std::env::var_os("HOME");
+    value
+        .map(PathBuf::from)
+        .or_else(std::env::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub fn state_file() -> PathBuf {
     state_dir().join("session.properties")
 }
 
-fn home() -> PathBuf {
-    #[cfg(windows)]
-    let var = std::env::var_os("USERPROFILE");
-    #[cfg(unix)]
-    let var = std::env::var_os("HOME");
-    var.map(PathBuf::from)
-        .or_else(std::env::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-#[derive(Default)]
+#[derive(Clone, Default, Debug)]
 pub struct Session {
     pub pid: u32,
     pub mode: String,
@@ -66,104 +71,107 @@ pub struct Session {
     pub ends_at: Option<DateTime<Utc>>,
     pub process_start: u64,
     pub process_command: String,
-    pub process_command_line: String,
     pub even_lid: bool,
+    #[cfg(target_os = "macos")]
     pub prior_disable_sleep: i32,
-    pub phase: String,
+    #[cfg(windows)]
+    pub guardian_pid: u32,
+    #[cfg(windows)]
+    pub guardian_start: u64,
+    #[cfg(windows)]
+    pub original_scheme: String,
+    #[cfg(windows)]
+    pub original_ac: u32,
+    #[cfg(windows)]
+    pub original_dc: u32,
 }
 
 impl Session {
-    pub fn new() -> Self {
-        Session {
-            phase: PHASE_ACTIVE.to_string(),
-            ..Default::default()
-        }
-    }
-
-    /// Fill identity fields from the live process at `self.pid`.
+    #[cfg(not(windows))]
     pub fn capture_process_identity(&mut self) -> Result<()> {
-        let id = sysutil::capture_identity(self.pid)?;
-        self.process_start = id.start;
-        self.process_command = id.command;
-        self.process_command_line = id.command_line;
+        let identity = sysutil::capture_identity(self.pid)?;
+        self.process_start = identity.start;
+        self.process_command = identity.command;
         Ok(())
     }
 
-    /// True if the recorded pid is still the same live process we started.
+    pub fn matches_identity(&self, live: &sysutil::Identity) -> bool {
+        let command_matches = if cfg!(windows) {
+            self.process_command.eq_ignore_ascii_case(&live.command)
+        } else {
+            self.process_command == live.command
+        };
+        self.process_start == live.start && command_matches && expected_command(&live.command)
+    }
+
+    #[cfg(not(windows))]
     pub fn matches_live_process(&self) -> bool {
-        match sysutil::live_identity(self.pid) {
-            None => false,
-            Some(live) => {
-                self.process_start == live.start
-                    && self.process_command == live.command
-                    && is_expected_command(&live.command, &live.command_line)
-            }
-        }
+        sysutil::live_identity(self.pid).is_some_and(|live| self.matches_identity(&live))
+    }
+
+    #[cfg(windows)]
+    pub fn matches_lid_authority(
+        &self,
+        worker: (u32, u64),
+        guardian: (u32, u64),
+        snapshot: (&str, u32, u32),
+    ) -> bool {
+        self.even_lid
+            && (self.pid, self.process_start) == worker
+            && (self.guardian_pid, self.guardian_start) == guardian
+            && (
+                self.original_scheme.as_str(),
+                self.original_ac,
+                self.original_dc,
+            ) == snapshot
+    }
+
+    #[cfg(windows)]
+    pub fn owned_non_lid_by(&self, pid: u32, start: u64) -> bool {
+        !self.even_lid && (self.pid, self.process_start) == (pid, start)
     }
 }
 
-fn is_expected_command(command: &str, command_line: &str) -> bool {
-    let base = std::path::Path::new(command)
+fn expected_command(command: &str) -> bool {
+    let base = Path::new(command)
         .file_name()
-        .map(|f| f.to_string_lossy().to_lowercase())
+        .map(|file| file.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    let line = command_line.to_lowercase();
-    platform::expected_command_basenames().contains(&base.as_str()) || line.contains("wake")
+    platform::expected_command_basenames().contains(&base.as_str())
 }
-
-// ---- read ----
 
 pub enum SavedState {
     Valid(Session),
-    Malformed(MalformedState),
-}
-
-pub struct MalformedState {
-    pub even_lid_true: bool,
-    pub has_prior_disable_sleep: bool,
-    // Only the macOS malformed-recovery path inspects the parsed prior; Windows recovery restores a
-    // safe default instead.
-    #[cfg_attr(windows, allow(dead_code))]
-    pub parsed_prior_disable_sleep: Option<i32>,
-}
-
-impl MalformedState {
-    pub fn has_lid_recovery_hints(&self) -> bool {
-        self.even_lid_true || self.has_prior_disable_sleep
-    }
+    Malformed(bool),
 }
 
 pub fn read_saved_for_recovery() -> Option<SavedState> {
-    let path = state_file();
-    if !path.exists() {
-        return None;
-    }
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return Some(SavedState::Malformed(malformed_from(&HashMap::new()))),
+    read_saved_at(&state_file())
+}
+
+pub fn read_saved_at(path: &Path) -> Option<SavedState> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(SavedState::Malformed(true)),
     };
-    let props = parse_properties(&text);
-    Some(match build_session(&props) {
-        Some(s) => SavedState::Valid(s),
-        None => SavedState::Malformed(malformed_from(&props)),
+    Some(match parse_session(&bytes) {
+        Ok(session) => SavedState::Valid(session),
+        Err(_) => SavedState::Malformed(lid_hints(&bytes)),
     })
 }
 
-/// Valid live-or-not session, deleting a stale/dead file. `may_delete_malformed` removes a malformed
-/// file only when it carries no lid-recovery hints.
-pub fn read_if_alive(may_delete_malformed: bool) -> Option<Session> {
+#[cfg(not(windows))]
+pub fn read_if_alive(delete_unhinted_malformed: bool) -> Option<Session> {
     match read_saved_for_recovery() {
-        Some(SavedState::Valid(s)) => {
-            if s.matches_live_process() {
-                Some(s)
-            } else {
-                let _ = fs::remove_file(state_file());
-                None
-            }
+        Some(SavedState::Valid(session)) if session.matches_live_process() => Some(session),
+        Some(SavedState::Valid(_)) => {
+            let _ = delete_state_file();
+            None
         }
-        Some(SavedState::Malformed(m)) => {
-            if may_delete_malformed && !m.has_lid_recovery_hints() {
-                let _ = fs::remove_file(state_file());
+        Some(SavedState::Malformed(lid_hints)) => {
+            if delete_unhinted_malformed && !retain_malformed_state(lid_hints) {
+                let _ = delete_state_file();
             }
             None
         }
@@ -171,161 +179,386 @@ pub fn read_if_alive(may_delete_malformed: bool) -> Option<Session> {
     }
 }
 
-fn parse_properties(text: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim_start();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            map.insert(k.trim().to_string(), v.to_string());
-        }
+fn parse_session(bytes: &[u8]) -> Result<Session> {
+    let text = std::str::from_utf8(bytes).map_err(|_| AppError::fail("state is not UTF-8"))?;
+    let properties = properties(text)?;
+    if field(&properties, "version")? != STATE_VERSION {
+        return Err(AppError::fail("unsupported state version"));
     }
-    map
-}
-
-fn build_session(p: &HashMap<String, String>) -> Option<Session> {
-    let pid = p.get("pid").map_or(Some(0), |v| v.trim().parse().ok())?;
-    let started_at = parse_ts(p.get("startedAt")?)?;
-    let ends_at = match p.get("endsAt").map(String::as_str) {
-        None | Some("") => None,
-        Some(s) => Some(parse_ts(s)?),
-    };
-    let process_start = p.get("processStartMs")?.trim().parse().ok()?;
-    let prior_disable_sleep = parse_disable_sleep(p.get("priorDisableSleep").map_or("0", |v| v))?;
-
-    Some(Session {
-        pid,
-        mode: p.get("mode").cloned().unwrap_or_default(),
-        trigger: p.get("trigger").cloned().unwrap_or_default(),
-        detail: p.get("detail").cloned().unwrap_or_default(),
-        started_at: Some(started_at),
-        ends_at,
-        process_start,
-        process_command: p.get("processCommand").cloned().unwrap_or_default(),
-        process_command_line: p.get("processCommandLine").cloned().unwrap_or_default(),
-        even_lid: p
-            .get("evenLid")
-            .map(|v| v.trim() == "true")
-            .unwrap_or(false),
-        prior_disable_sleep,
-        phase: p
-            .get("phase")
-            .cloned()
-            .unwrap_or_else(|| PHASE_ACTIVE.to_string()),
-    })
-}
-
-fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s.trim())
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
-}
-
-// The `priorDisableSleep` field is reused on Windows to store the encoded prior lid action
-// (`ac | (dc << 4)`, each nibble 0..=3), so accept that range there; elsewhere it is macOS's
-// SleepDisabled which is strictly 0 or 1.
-#[cfg(not(windows))]
-fn parse_disable_sleep(raw: &str) -> Option<i32> {
-    match raw.trim().parse::<i32>().ok()? {
-        v @ (0 | 1) => Some(v),
-        _ => None,
-    }
-}
-
-#[cfg(windows)]
-fn parse_disable_sleep(raw: &str) -> Option<i32> {
-    let v = raw.trim().parse::<i32>().ok()?;
-    let (ac, dc) = (v & 0xF, (v >> 4) & 0xF);
-    if v == (ac | (dc << 4)) && (0..=3).contains(&ac) && (0..=3).contains(&dc) {
-        Some(v)
+    let even_lid = parse_bool(field(&properties, "evenLid")?, "evenLid")?;
+    #[cfg(target_os = "linux")]
+    let platform_keys: &[&str] = &[];
+    #[cfg(target_os = "macos")]
+    let platform_keys: &[&str] = if even_lid {
+        &["priorDisableSleep"]
     } else {
-        None
-    }
-}
-
-fn malformed_from(p: &HashMap<String, String>) -> MalformedState {
-    MalformedState {
-        even_lid_true: p
-            .get("evenLid")
-            .map(|v| v.trim() == "true")
-            .unwrap_or(false),
-        has_prior_disable_sleep: p.contains_key("priorDisableSleep"),
-        parsed_prior_disable_sleep: p
-            .get("priorDisableSleep")
-            .and_then(|v| parse_disable_sleep(v)),
-    }
-}
-
-// ---- write ----
-
-/// Wrap a state-file IO error with the offending path and the `WAKE_STATE_DIR` escape hatch, so
-/// permission/quota failures point at the directory instead of surfacing a bare OS error.
-fn state_io_err(path: &std::path::Path, e: std::io::Error) -> AppError {
-    AppError::fail(format!(
-        "state IO failed at {}: {e}; set WAKE_STATE_DIR to a writable directory",
-        path.display()
-    ))
-}
-
-pub fn write(s: &Session) -> Result<()> {
-    let dir = state_dir();
-    fs::create_dir_all(&dir).map_err(|e| state_io_err(&dir, e))?;
-    let mut out = String::new();
-    let push = |out: &mut String, k: &str, v: &str| {
-        out.push_str(k);
-        out.push('=');
-        out.push_str(v);
-        out.push('\n');
+        &[]
     };
-    push(&mut out, "pid", &s.pid.to_string());
-    push(&mut out, "mode", &s.mode);
-    push(&mut out, "trigger", &s.trigger);
-    push(&mut out, "detail", &s.detail);
-    push(&mut out, "startedAt", &ts(s.started_at));
-    push(
-        &mut out,
+    #[cfg(windows)]
+    let platform_keys: &[&str] = if even_lid {
+        &[
+            "guardianPid",
+            "guardianStart",
+            "originalScheme",
+            "originalAc",
+            "originalDc",
+        ]
+    } else {
+        &[]
+    };
+    let keys: HashSet<&str> = [
+        "version",
+        "pid",
+        "mode",
+        "trigger",
+        "detail",
+        "startedAt",
         "endsAt",
-        &s.ends_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
-    );
-    push(&mut out, "processStartMs", &s.process_start.to_string());
-    push(&mut out, "processCommand", &s.process_command);
-    push(&mut out, "processCommandLine", &s.process_command_line);
-    push(&mut out, "evenLid", &s.even_lid.to_string());
-    push(
-        &mut out,
-        "priorDisableSleep",
-        &s.prior_disable_sleep.to_string(),
-    );
-    push(
-        &mut out,
-        "phase",
-        if s.phase.is_empty() {
-            PHASE_ACTIVE
-        } else {
-            &s.phase
-        },
-    );
+        "processStart",
+        "processCommand",
+        "evenLid",
+    ]
+    .into_iter()
+    .chain(platform_keys.iter().copied())
+    .collect();
+    if properties.len() != keys.len() || properties.keys().any(|key| !keys.contains(key.as_str())) {
+        return Err(AppError::fail("state has missing or unknown fields"));
+    }
 
-    let tmp = dir.join("session.properties.tmp");
-    fs::write(&tmp, out).map_err(|e| state_io_err(&tmp, e))?;
-    if let Err(e) = fs::rename(&tmp, state_file()) {
-        let _ = fs::remove_file(&tmp);
-        return Err(state_io_err(&state_file(), e));
+    let session = Session {
+        pid: parse_positive(field(&properties, "pid")?, "pid")?,
+        mode: field(&properties, "mode")?.into(),
+        trigger: field(&properties, "trigger")?.into(),
+        detail: field(&properties, "detail")?.into(),
+        started_at: Some(parse_utc(field(&properties, "startedAt")?, "startedAt")?),
+        ends_at: match field(&properties, "endsAt")? {
+            "" => None,
+            value => Some(parse_utc(value, "endsAt")?),
+        },
+        process_start: parse_positive(field(&properties, "processStart")?, "processStart")?,
+        process_command: field(&properties, "processCommand")?.into(),
+        even_lid,
+        #[cfg(target_os = "macos")]
+        prior_disable_sleep: if even_lid {
+            disable_sleep(field(&properties, "priorDisableSleep")?)?
+        } else {
+            0
+        },
+        #[cfg(windows)]
+        guardian_pid: if even_lid {
+            parse_positive(field(&properties, "guardianPid")?, "guardianPid")?
+        } else {
+            0
+        },
+        #[cfg(windows)]
+        guardian_start: if even_lid {
+            parse_positive(field(&properties, "guardianStart")?, "guardianStart")?
+        } else {
+            0
+        },
+        #[cfg(windows)]
+        original_scheme: if even_lid {
+            let value = field(&properties, "originalScheme")?;
+            platform::parse_guid(value)?;
+            value.into()
+        } else {
+            String::new()
+        },
+        #[cfg(windows)]
+        original_ac: if even_lid {
+            parse_u32(field(&properties, "originalAc")?, "originalAc")?
+        } else {
+            0
+        },
+        #[cfg(windows)]
+        original_dc: if even_lid {
+            parse_u32(field(&properties, "originalDc")?, "originalDc")?
+        } else {
+            0
+        },
+    };
+    validate(&session)?;
+    Ok(session)
+}
+
+fn properties(text: &str) -> Result<HashMap<String, String>> {
+    let mut output = HashMap::new();
+    for line in text.lines() {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| AppError::fail("state contains a line without '='"))?;
+        if key.is_empty() || key.trim() != key || output.insert(key.into(), value.into()).is_some()
+        {
+            return Err(AppError::fail("state contains an invalid or duplicate key"));
+        }
+    }
+    if output.is_empty() {
+        Err(AppError::fail("state is empty"))
+    } else {
+        Ok(output)
+    }
+}
+
+fn validate(session: &Session) -> Result<()> {
+    for value in [
+        &session.mode,
+        &session.trigger,
+        &session.detail,
+        &session.process_command,
+    ] {
+        if value.is_empty() || value.contains(['\r', '\n']) {
+            return Err(AppError::fail("state contains an invalid required value"));
+        }
+    }
+    if !matches!(session.mode.as_str(), "system-only" | "display+system")
+        || !matches!(
+            session.trigger.as_str(),
+            "indefinite" | "timed" | "until-time" | "until-charge" | "while-pid" | "while-app"
+        )
+        || !expected_command(&session.process_command)
+    {
+        return Err(AppError::fail("state contains invalid session metadata"));
+    }
+    let timed = matches!(session.trigger.as_str(), "timed" | "until-time");
+    if session.ends_at.is_some() != timed
+        || session
+            .ends_at
+            .zip(session.started_at)
+            .is_some_and(|(end, start)| end <= start)
+    {
+        return Err(AppError::fail("state contains inconsistent timestamps"));
     }
     Ok(())
 }
 
-fn ts(t: Option<DateTime<Utc>>) -> String {
-    t.map(|t| t.to_rfc3339()).unwrap_or_default()
+fn serialize(session: &Session) -> Result<Vec<u8>> {
+    validate(session)?;
+    if session.pid == 0 || session.process_start == 0 || session.started_at.is_none() {
+        return Err(AppError::fail("session identity or start time is missing"));
+    }
+    let fields = vec![
+        ("version", STATE_VERSION.to_string()),
+        ("pid", session.pid.to_string()),
+        ("mode", session.mode.clone()),
+        ("trigger", session.trigger.clone()),
+        ("detail", session.detail.clone()),
+        ("startedAt", session.started_at.unwrap().to_rfc3339()),
+        (
+            "endsAt",
+            session
+                .ends_at
+                .map(|time| time.to_rfc3339())
+                .unwrap_or_default(),
+        ),
+        ("processStart", session.process_start.to_string()),
+        ("processCommand", session.process_command.clone()),
+        ("evenLid", session.even_lid.to_string()),
+    ];
+    #[cfg(target_os = "macos")]
+    let fields = {
+        let mut fields = fields;
+        if session.even_lid {
+            disable_sleep(&session.prior_disable_sleep.to_string())?;
+            fields.push(("priorDisableSleep", session.prior_disable_sleep.to_string()));
+        }
+        fields
+    };
+    #[cfg(windows)]
+    let fields = {
+        let mut fields = fields;
+        if session.even_lid {
+            if session.guardian_pid == 0 || session.guardian_start == 0 {
+                return Err(AppError::fail("guardian identity is missing"));
+            }
+            platform::parse_guid(&session.original_scheme)?;
+            fields.extend([
+                ("guardianPid", session.guardian_pid.to_string()),
+                ("guardianStart", session.guardian_start.to_string()),
+                ("originalScheme", session.original_scheme.clone()),
+                ("originalAc", session.original_ac.to_string()),
+                ("originalDc", session.original_dc.to_string()),
+            ]);
+        }
+        fields
+    };
+    Ok(fields
+        .into_iter()
+        .flat_map(|(key, value)| format!("{key}={value}\n").into_bytes())
+        .collect())
 }
 
-pub fn delete_state_file() {
-    let _ = fs::remove_file(state_file());
+fn field<'a>(properties: &'a HashMap<String, String>, key: &str) -> Result<&'a str> {
+    properties
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| AppError::fail(format!("state is missing {key}")))
 }
 
-// ---- lock ----
+pub(crate) fn parse_bool(raw: &str, name: &str) -> Result<bool> {
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(AppError::fail(format!("invalid {name}"))),
+    }
+}
+pub(crate) fn parse_positive<T>(raw: &str, name: &str) -> Result<T>
+where
+    T: std::str::FromStr + Default + PartialEq + ToString,
+{
+    let value = raw
+        .parse::<T>()
+        .map_err(|_| AppError::fail(format!("invalid {name}")))?;
+    if value == T::default() || value.to_string() != raw {
+        Err(AppError::fail(format!("invalid {name}")))
+    } else {
+        Ok(value)
+    }
+}
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn parse_u32(raw: &str, name: &str) -> Result<u32> {
+    let value = raw
+        .parse::<u32>()
+        .map_err(|_| AppError::fail(format!("invalid {name}")))?;
+    if value.to_string() == raw {
+        Ok(value)
+    } else {
+        Err(AppError::fail(format!("invalid {name}")))
+    }
+}
+pub(crate) fn parse_utc(raw: &str, name: &str) -> Result<DateTime<Utc>> {
+    let value = DateTime::parse_from_rfc3339(raw)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|_| AppError::fail(format!("invalid {name}")))?;
+    if value.to_rfc3339() == raw {
+        Ok(value)
+    } else {
+        Err(AppError::fail(format!("{name} is not canonical UTC")))
+    }
+}
+#[cfg(target_os = "macos")]
+fn disable_sleep(raw: &str) -> Result<i32> {
+    match parse_u32(raw, "priorDisableSleep")? {
+        value @ (0 | 1) => Ok(value as i32),
+        _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
+    }
+}
+#[cfg(not(windows))]
+pub(crate) fn retain_malformed_state(lid_hints: bool) -> bool {
+    cfg!(target_os = "macos") || lid_hints
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn pending_lid_recovery_bytes(prior_disable_sleep: i32) -> Vec<u8> {
+    format!(
+        "version={STATE_VERSION}\nevenLid=true\npriorDisableSleep={prior_disable_sleep}\nstartupPending=true\n"
+    )
+    .into_bytes()
+}
+
+fn lid_hints(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let persistent_recovery = [
+        "priorDisableSleep=",
+        "guardianPid=",
+        "guardianStart=",
+        "originalScheme=",
+        "originalAc=",
+        "originalDc=",
+    ]
+    .iter()
+    .any(|hint| text.contains(hint));
+    persistent_recovery || text.contains("evenLid=true")
+}
+
+fn io_error(path: &Path, error: std::io::Error) -> AppError {
+    AppError::fail(format!(
+        "state IO failed at {}: {error}; set WAKE_STATE_DIR to a writable directory",
+        path.display()
+    ))
+}
+
+#[cfg(not(windows))]
+fn atomic_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: Both NUL-terminated path buffers remain valid for the call.
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn write(session: &Session) -> Result<()> {
+    write_bytes_at(&state_file(), &serialize(session)?)
+}
+
+#[cfg(windows)]
+pub fn write_at(path: &Path, session: &Session) -> Result<()> {
+    write_bytes_at(path, &serialize(session)?)
+}
+
+#[cfg(target_os = "macos")]
+pub fn write_pending_lid_recovery(prior_disable_sleep: i32) -> Result<()> {
+    if !matches!(prior_disable_sleep, 0 | 1) {
+        return Err(AppError::fail("priorDisableSleep must be 0 or 1"));
+    }
+    write_bytes_at(
+        &state_file(),
+        &pending_lid_recovery_bytes(prior_disable_sleep),
+    )
+}
+
+fn write_bytes_at(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| AppError::fail("state path has no parent directory"))?;
+    fs::create_dir_all(dir).map_err(|error| io_error(dir, error))?;
+    let tmp = dir.join(format!("session.properties.tmp-{}", std::process::id()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|error| io_error(&tmp, error))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| io_error(&tmp, error))?;
+        atomic_rename(&tmp, path).map_err(|error| io_error(path, error))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
+}
+
+pub fn delete_state_file() -> Result<()> {
+    delete_path(&state_file())
+}
+
+fn delete_path(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(path, error)),
+    }
+}
 
 pub struct LockGuard {
     file: File,
@@ -337,79 +570,142 @@ impl Drop for LockGuard {
     }
 }
 
+fn lock_error(error: std::fs::TryLockError) -> AppError {
+    match error {
+        std::fs::TryLockError::WouldBlock => {
+            AppError::fail("another wake invocation is in progress; try again")
+        }
+        std::fs::TryLockError::Error(error) => AppError::fail(error.to_string()),
+    }
+}
+
 pub fn acquire_lock() -> Result<LockGuard> {
     let dir = state_dir();
-    fs::create_dir_all(&dir).map_err(|e| state_io_err(&dir, e))?;
+    fs::create_dir_all(&dir).map_err(|error| io_error(&dir, error))?;
     let path = dir.join("wake.lock");
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&path)
-        .map_err(|e| state_io_err(&path, e))?;
-    match file.try_lock() {
-        Ok(()) => Ok(LockGuard { file }),
-        Err(std::fs::TryLockError::WouldBlock) => Err(AppError::usage(
-            "another wake invocation is in progress; try again",
-        )),
-        Err(std::fs::TryLockError::Error(e)) => Err(AppError::fail(e.to_string())),
-    }
+        .map_err(|error| io_error(&path, error))?;
+    file.try_lock()
+        .map(|()| LockGuard { file })
+        .map_err(lock_error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn valid(even_lid: bool) -> String {
+        let command = if cfg!(windows) {
+            "C:\\tools\\wake.exe"
+        } else if cfg!(target_os = "macos") {
+            "/usr/bin/caffeinate"
+        } else {
+            "/usr/bin/systemd-inhibit"
+        };
+        let platform_fields = if !even_lid {
+            ""
+        } else if cfg!(target_os = "macos") {
+            "priorDisableSleep=0\n"
+        } else if cfg!(windows) {
+            "guardianPid=99\nguardianStart=1800000000\noriginalScheme=381b4222-f694-41f0-9685-ff5bb260df2e\noriginalAc=4294967295\noriginalDc=2\n"
+        } else {
+            ""
+        };
+        format!(
+            "version=2\npid=4321\nmode=display+system\ntrigger=timed\ndetail=1h\nstartedAt=2024-01-02T03:04:05+00:00\nendsAt=2024-01-02T04:04:05+00:00\nprocessStart=1700000000\nprocessCommand={command}\nevenLid={even_lid}\n{platform_fields}"
+        )
+    }
     #[test]
-    fn properties_round_trip_builds_session() {
-        let text = "pid=4321\n\
-             mode=display+system\n\
-             trigger=timed\n\
-             detail=1h\n\
-             startedAt=2024-01-02T03:04:05+00:00\n\
-             endsAt=2024-01-02T04:04:05+00:00\n\
-             processStartMs=1700000000\n\
-             processCommand=/usr/bin/caffeinate\n\
-             processCommandLine=/usr/bin/caffeinate -d\n\
-             evenLid=false\n\
-             priorDisableSleep=0\n\
-             phase=active\n";
-        let s = build_session(&parse_properties(text)).expect("valid session");
-        assert_eq!(s.pid, 4321);
-        assert_eq!(s.mode, "display+system");
-        assert_eq!(s.trigger, "timed");
-        assert_eq!(s.detail, "1h");
-        assert_eq!(s.process_start, 1_700_000_000);
-        assert_eq!(s.process_command, "/usr/bin/caffeinate");
-        assert!(s.started_at.is_some());
-        assert!(s.ends_at.is_some());
-        assert!(!s.even_lid);
-        assert_eq!(s.phase, PHASE_ACTIVE);
+    fn pending_lid_recovery_is_retained_without_becoming_write_authority() {
+        let bytes = pending_lid_recovery_bytes(0);
+        assert!(parse_session(&bytes).is_err());
+        assert!(lid_hints(&bytes));
     }
 
     #[test]
-    fn missing_started_at_is_none() {
-        let text = "pid=1\nprocessStartMs=10\n";
-        assert!(build_session(&parse_properties(text)).is_none());
+    fn strict_state_accepts_only_complete_versioned_records() {
+        assert_eq!(parse_session(valid(false).as_bytes()).unwrap().pid, 4321);
+        assert!(parse_session(valid(true).as_bytes()).unwrap().even_lid);
+        for invalid in [
+            valid(false).replacen("version=2", "version=1", 1),
+            format!("{}unknown=x\n", valid(false)),
+            valid(false).replace("detail=1h\n", ""),
+            format!("{}pid=4321\n", valid(false)),
+        ] {
+            assert!(parse_session(invalid.as_bytes()).is_err());
+        }
+        let session = parse_session(valid(false).as_bytes()).unwrap();
+        assert!(!session.matches_identity(&sysutil::Identity {
+            start: session.process_start + 1,
+            command: session.process_command.clone(),
+        }));
+        assert!(!lid_hints(b"broken=true\n"));
+        assert!(lid_hints(b"originalScheme=broken\n"));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_even_lid_round_trips_without_restoration_state() {
+        let text = valid(true);
+        let session = parse_session(text.as_bytes()).unwrap();
+        assert!(session.even_lid);
+        assert_eq!(serialize(&session).unwrap(), text.as_bytes());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn parse_properties_skips_comments_and_blanks() {
-        let text = "# a comment\n! also a comment\n\n  \nkey=value\n  spaced = trimmed-key\n";
-        let p = parse_properties(text);
-        assert_eq!(p.get("key").map(String::as_str), Some("value"));
-        assert_eq!(p.get("spaced").map(String::as_str), Some(" trimmed-key"));
-        assert!(!p.contains_key("# a comment"));
-        assert_eq!(p.len(), 2);
+    fn macos_even_lid_requires_and_round_trips_prior_sleep_state() {
+        let text = valid(true);
+        let session = parse_session(text.as_bytes()).unwrap();
+        assert_eq!(session.prior_disable_sleep, 0);
+        assert_eq!(serialize(&session).unwrap(), text.as_bytes());
+        assert!(parse_session(text.replace("priorDisableSleep=0\n", "").as_bytes()).is_err());
     }
 
     #[cfg(windows)]
     #[test]
-    fn parse_disable_sleep_packed_nibbles() {
-        // 0x21 = 33 -> ac=1, dc=2 (both in 0..=3): accepted.
-        assert_eq!(parse_disable_sleep("33"), Some(33));
-        assert_eq!(platform::decode_lid(33), (1, 2));
-        // 0x44 = 68 -> ac=4, dc=4 (out of 0..=3): rejected.
-        assert_eq!(parse_disable_sleep("68"), None);
+    fn windows_even_lid_round_trips_guardian_and_power_plan_state() {
+        let text = valid(true);
+        let session = parse_session(text.as_bytes()).unwrap();
+        assert_eq!(session.guardian_pid, 99);
+        assert_eq!(session.guardian_start, 1_800_000_000);
+        assert_eq!(
+            session.original_scheme,
+            "381b4222-f694-41f0-9685-ff5bb260df2e"
+        );
+        assert_eq!((session.original_ac, session.original_dc), (u32::MAX, 2));
+        assert_eq!(serialize(&session).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    fn relative_paths_are_absolute_and_delete_failures_are_preserved() {
+        assert!(absolute_path(PathBuf::from("relative state")).is_absolute());
+        let path = std::env::temp_dir().join(format!("wake-delete-test-{}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        assert!(delete_path(&path).is_err());
+        assert!(path.is_dir());
+        fs::remove_dir(path).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn malformed_retention_preserves_even_lid_management_breadcrumbs() {
+        assert!(retain_malformed_state(lid_hints(b"priorDisableSleep=0\n")));
+        assert!(retain_malformed_state(lid_hints(b"guardianStart=broken\n")));
+        assert!(retain_malformed_state(lid_hints(
+            b"originalScheme=broken\n"
+        )));
+        assert!(retain_malformed_state(lid_hints(b"evenLid=true\n")));
+        assert_eq!(retain_malformed_state(false), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn lock_contention_is_a_runtime_failure() {
+        let error = lock_error(std::fs::TryLockError::WouldBlock);
+        assert!(matches!(error, AppError::Fail(_)));
+        assert_eq!(error.exit_code(), 1);
     }
 }

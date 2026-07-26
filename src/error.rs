@@ -1,12 +1,8 @@
-//! Error type carrying the process exit code, mirroring the reference's UsageError vs other split.
-
 use std::fmt;
 
 #[derive(Debug)]
 pub enum AppError {
-    /// Bad usage: prints `try 'wake --help'` and exits 2.
     Usage(String),
-    /// Any other failure: exits 1.
     Fail(String),
 }
 

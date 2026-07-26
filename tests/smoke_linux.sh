@@ -1,45 +1,263 @@
 #!/usr/bin/env bash
-# Linux smoke test for wake-rs. Validates CLI + error-path behavior that does NOT need systemd,
-# a real battery, or a TTY (so it runs in a plain container). Usage: smoke_linux.sh [path/to/wake]
 set -u
-wake="${1:-${CARGO_TARGET_DIR:-target}/release/wake}"
-export WAKE_STATE_DIR="$(mktemp -d)"
-trap '"$wake" stop >/dev/null 2>&1; rm -rf "$WAKE_STATE_DIR"' EXIT
-echo "wake = $wake"
 
-fail=0
-run() { # run <expect-exit:ok|fail> <needle> -- <args...>
-  local mode="$1" needle="$2"; shift 3
-  local out code
-  out="$("$wake" "$@" 2>&1)"; code=$?
-  local ok=1
-  if [ "$mode" = ok ] && [ "$code" -ne 0 ]; then ok=0; fi
-  if [ "$mode" = fail ] && [ "$code" -eq 0 ]; then ok=0; fi
-  case "$out" in *"$needle"*) ;; *) ok=0;; esac
-  case "$out" in *panicked*|*RUST_BACKTRACE*) ok=0;; esac
-  if [ "$ok" = 1 ]; then printf 'ok   : wake %s  [exit %s]\n' "$*" "$code"
-  else printf 'FAIL : wake %s  [exit %s]\n%s\n' "$*" "$code" "$out"; fail=1; fi
+wake="${1:-${CARGO_TARGET_DIR:-target}/release/wake}"
+tmp="$(mktemp -d)"
+export WAKE_STATE_DIR="$tmp/state"
+mkdir -p "$WAKE_STATE_DIR"
+
+cleanup() {
+  "$wake" stop >/dev/null 2>&1 || true
+  if [[ -n "${WAKE_SHIM_PIDS:-}" && -f "$WAKE_SHIM_PIDS" ]]; then
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill "$pid" 2>/dev/null || true
+    done <"$WAKE_SHIM_PIDS"
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+if ! command -v systemd-inhibit >/dev/null 2>&1 ||
+  ! systemd-inhibit --what=sleep --who=wake-smoke --why=probe true >/dev/null 2>&1; then
+  mkdir "$tmp/bin"
+  cat >"$tmp/bin/systemd-inhibit" <<'SH'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --*) shift ;;
+    *) exec "$@" ;;
+  esac
+done
+exit 64
+SH
+  chmod +x "$tmp/bin/systemd-inhibit"
+  export PATH="$tmp/bin:$PATH"
+fi
+
+failed=0
+last_output=""
+fail() {
+  printf 'FAIL: %s\n' "$1"
+  failed=1
 }
 
-run ok   "wake 0.1.1"               -- --version
-run ok   "wake --until-charge N"    -- --help
-run fail "conflicting triggers"     -- --until-charge 80 --while-pid 1
-run fail "unknown flag"             -- --bogus
-run fail "invalid duration"         -- 5x
-run fail "no usable battery found"  -- --until-charge 80
-run ok   "no active session"        -- status
-run ok   "no active session"        -- stop
+expect() {
+  local expected="$1" needle="$2"
+  shift 2
+  local output code
+  output="$("$wake" "$@" 2>&1)"
+  code=$?
+  if [[ "$code" -ne "$expected" || "$output" != *"$needle"* ]]; then
+    printf 'FAIL: wake %s [expected %s, got %s]\n%s\n' "$*" "$expected" "$code" "$output"
+    failed=1
+  else
+    printf 'ok: wake %s [exit %s]\n' "$*" "$code"
+  fi
+}
 
-# `forever` depends on whether this host can take systemd inhibitor locks: a plain container has no
-# systemd-inhibit; CI runners have it but polkit may deny. Accept a started session OR any graceful
-# "wake:" error; only a panic (or empty output) is a failure. Always clean up afterwards.
-fout="$("$wake" forever 2>&1)"; fcode=$?
-"$wake" stop >/dev/null 2>&1
-case "$fout" in
-  *panicked*|*RUST_BACKTRACE*) printf 'FAIL : wake forever panicked [exit %s]\n%s\n' "$fcode" "$fout"; fail=1 ;;
-  *"session active"*|*"wake:"*) printf 'ok   : wake forever  [exit %s, graceful]\n' "$fcode" ;;
-  *) printf 'FAIL : wake forever - unrecognized output [exit %s]\n%s\n' "$fcode" "$fout"; fail=1 ;;
+wait_inactive() {
+  local label="$1" output code
+  for ((attempt = 0; attempt < 80; attempt++)); do
+    output="$("$wake" status 2>&1)"
+    code=$?
+    if [[ "$code" -ne 0 ]]; then
+      printf 'FAIL: %s status [expected 0, got %s]\n%s\n' "$label" "$code" "$output"
+      failed=1
+      return
+    fi
+    if [[ "$output" == *"no active session"* ]]; then
+      last_output="$output"
+      printf 'ok: %s\n' "$label"
+      return
+    fi
+    sleep 0.1
+  done
+  last_output="$output"
+  printf 'FAIL: %s did not become inactive\n%s\n' "$label" "$output"
+  failed=1
+}
+
+expect_state_value() {
+  local expected="$1" line found=0
+  if [[ -f "$WAKE_STATE_DIR/session.properties" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" == "$expected" ]] && found=1
+    done <"$WAKE_STATE_DIR/session.properties"
+  fi
+  [[ "$found" -eq 1 ]] || fail "state does not contain $expected"
+}
+
+expect_no_state() {
+  local label="$1"
+  [[ ! -e "$WAKE_STATE_DIR/session.properties" ]] || fail "$label left state"
+}
+
+expect_scopes() {
+  local label="$1" expected="$2" actual=""
+  [[ -f "$WAKE_INHIBIT_LOG" ]] && actual="$(<"$WAKE_INHIBIT_LOG")"
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'FAIL: %s scopes\nexpected:\n%s\nactual:\n%s\n' "$label" "$expected" "$actual"
+    failed=1
+  else
+    printf 'ok: %s scopes\n' "$label"
+  fi
+}
+
+wait_dead() {
+  local pid="$1" label="$2" recorded keep
+  for ((attempt = 0; attempt < 80; attempt++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      if [[ -f "$WAKE_SHIM_PIDS" ]]; then
+        keep="$WAKE_SHIM_PIDS.keep"
+        : >"$keep"
+        while IFS= read -r recorded; do
+          [[ "$recorded" == "$pid" ]] || printf '%s\n' "$recorded" >>"$keep"
+        done <"$WAKE_SHIM_PIDS"
+        mv "$keep" "$WAKE_SHIM_PIDS"
+      fi
+      printf 'ok: %s process exited\n' "$label"
+      return
+    fi
+    sleep 0.1
+  done
+  fail "$label process $pid is still running"
+}
+
+expect 0 "wake " --version
+expect 2 "conflicting triggers" 1s --while-pid "$$"
+expect 2 "unknown flag" --bogus
+expect 2 "does not accept arguments" status extra
+expect 0 "no active session" status
+
+expect 0 "session active" forever
+expect 0 "session active" status
+expect 1 "session already active" 5s
+expect 0 "stopped" stop
+expect 0 "no active session" status
+
+expect 0 "session active" 1s
+wait_inactive "short session expired"
+expect_no_state "expired session"
+
+policy_bin="$tmp/policy-bin"
+mkdir "$policy_bin"
+export WAKE_INHIBIT_LOG="$tmp/inhibit-scopes"
+export WAKE_SHIM_PIDS="$tmp/inhibit-pids"
+cat >"$policy_bin/systemd-inhibit" <<'SH'
+#!/bin/sh
+what=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --what=*) what=${1#--what=} ;;
+    --) shift; break ;;
+    --*) ;;
+    *) break ;;
+  esac
+  shift
+done
+[ -n "$what" ] || exit 64
+printf '%s\n' "$what" >>"$WAKE_INHIBIT_LOG"
+case "${WAKE_INHIBIT_REFUSE_LID:-0}:$what" in
+  1:*handle-lid-switch*) exit 1 ;;
 esac
+[ "$#" -gt 0 ] || exit 64
+if [ "${1##*/}" != true ]; then
+  printf '%s\n' "$$" >>"$WAKE_SHIM_PIDS"
+fi
+exec "$@"
+SH
+chmod +x "$policy_bin/systemd-inhibit"
+export PATH="$policy_bin:$PATH"
 
-if [ "$fail" = 0 ]; then echo; echo "ALL LINUX SMOKE TESTS PASSED"; else echo; echo "LINUX SMOKE FAILED"; fi
-exit "$fail"
+strict_lifecycle() {
+  local label="$1" scope="$2" worker_pid="" key value
+  shift 2
+  : >"$WAKE_INHIBIT_LOG"
+  : >"$WAKE_SHIM_PIDS"
+  unset WAKE_INHIBIT_REFUSE_LID
+  expect 0 "session active" forever --even-lid "$@"
+  expect_scopes "$label" "$scope"$'\n'"$scope"
+  expect_state_value "evenLid=true"
+  expect 0 "session active" status
+  expect 0 "even lid  : logind inhibitor active" status
+  while IFS='=' read -r key value; do
+    [[ "$key" == pid ]] && worker_pid="$value"
+  done <"$WAKE_STATE_DIR/session.properties"
+  expect 0 "stopped" stop
+  expect_no_state "$label stop"
+  if [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]]; then
+    wait_dead "$worker_pid" "$label"
+  else
+    fail "$label state did not contain a valid pid"
+  fi
+}
+
+strict_lifecycle "explicit display" "idle:sleep:handle-lid-switch"
+strict_lifecycle "explicit system-only" "sleep:handle-lid-switch" --no-display
+
+strict_refusal() {
+  local label="$1" scope="$2"
+  shift 2
+  : >"$WAKE_INHIBIT_LOG"
+  : >"$WAKE_SHIM_PIDS"
+  export WAKE_INHIBIT_REFUSE_LID=1
+  expect 1 "--even-lid requires systemd inhibitor scope $scope" forever --even-lid "$@"
+  expect_scopes "$label" "$scope"
+  expect_no_state "$label"
+  [[ ! -s "$WAKE_SHIM_PIDS" ]] || fail "$label launched a payload"
+}
+
+strict_refusal "explicit display refusal" "idle:sleep:handle-lid-switch"
+strict_refusal "explicit system-only refusal" "sleep:handle-lid-switch" --no-display
+
+: >"$WAKE_INHIBIT_LOG"
+: >"$WAKE_SHIM_PIDS"
+export WAKE_INHIBIT_REFUSE_LID=1
+expect 1 "--even-lid requires systemd inhibitor scope idle:sleep:handle-lid-switch" --until-charge 80 --even-lid
+expect_scopes "charge preflight refusal" "idle:sleep:handle-lid-switch"
+expect_no_state "charge preflight refusal"
+[[ ! -s "$WAKE_SHIM_PIDS" ]] || fail "charge preflight refusal launched a payload"
+
+: >"$WAKE_INHIBIT_LOG"
+: >"$WAKE_SHIM_PIDS"
+export WAKE_INHIBIT_REFUSE_LID=1
+expect 0 "session active" forever
+expect_scopes "ordinary fallback" $'idle:sleep:handle-lid-switch\nidle:sleep\nidle:sleep'
+expect_state_value "evenLid=false"
+ordinary_pid=""
+IFS= read -r ordinary_pid <"$WAKE_SHIM_PIDS"
+expect 0 "stopped" stop
+expect_no_state "ordinary fallback stop"
+if [[ "$ordinary_pid" =~ ^[1-9][0-9]*$ ]]; then
+  wait_dead "$ordinary_pid" "ordinary fallback"
+else
+  fail "ordinary fallback did not record a valid payload pid"
+fi
+unset WAKE_INHIBIT_REFUSE_LID
+
+: >"$WAKE_INHIBIT_LOG"
+: >"$WAKE_SHIM_PIDS"
+unset WAKE_INHIBIT_REFUSE_LID
+expect 0 "session active" forever --even-lid
+expect_scopes "strict stale session" $'idle:sleep:handle-lid-switch\nidle:sleep:handle-lid-switch'
+worker_pid=""
+while IFS='=' read -r key value; do
+  [[ "$key" == pid ]] && worker_pid="$value"
+done <"$WAKE_STATE_DIR/session.properties"
+if [[ ! "$worker_pid" =~ ^[1-9][0-9]*$ ]] || ! kill -KILL "$worker_pid" 2>/dev/null; then
+  fail "could not kill the managed strict process"
+else
+  wait_inactive "strict stale session cleaned"
+  wait_dead "$worker_pid" "strict stale session"
+  expect_no_state "strict stale session"
+  if [[ "$last_output" == *"restore"* || "$last_output" == *"recovery"* || "$last_output" == *"run 'wake stop'"* ]]; then
+    fail "strict stale cleanup emitted restoration guidance: $last_output"
+  fi
+fi
+
+if [[ "$failed" -eq 0 ]]; then
+  echo "ALL LINUX SMOKE TESTS PASSED"
+else
+  echo "LINUX SMOKE TEST FAILED"
+fi
+exit "$failed"

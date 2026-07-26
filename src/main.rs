@@ -1,5 +1,3 @@
-//! wake - keep your machine awake from the CLI. Rust port of wake-cli (binary name: `wake`).
-
 mod commands;
 mod durations;
 mod error;
@@ -7,9 +5,6 @@ mod platform;
 mod session;
 mod supervisor;
 mod sysutil;
-
-#[cfg(unix)]
-mod interactive;
 
 use error::AppError;
 
@@ -27,94 +22,159 @@ fn main() {
 }
 
 fn dispatch(args: &[String]) -> Result<(), AppError> {
-    if let Some(first) = args.first() {
-        match first.as_str() {
-            "-h" | "--help" | "help" => {
-                print_help();
-                return Ok(());
-            }
-            "-v" | "--version" | "version" => {
-                println!("wake {VERSION}");
-                return Ok(());
-            }
-            "status" => return commands::status(),
-            "stop" => return commands::stop(),
-            "forever" | "indefinite" => return commands::start_forever(args),
-            "__supervise_charge__" => return supervisor::run_charge(args),
-            "__supervise_lid__" => return supervisor::run_lid(args),
-            #[cfg(windows)]
-            "__set_lid__" => return set_lid(&args[1..]),
-            _ => return commands::start(args),
-        }
+    let internal = args.first().is_some_and(|arg| arg.starts_with("__"));
+    if !internal && has_mixed_help_or_version(args) {
+        return Err(AppError::usage("help and version must be used alone"));
     }
-
-    commands::recover_stale_lid_session_foreground()?;
-
-    #[cfg(unix)]
-    {
-        if commands::is_console() && platform::supports_interactive() {
-            return interactive::run();
+    let Some((first, rest)) = args.split_first() else {
+        return commands::start(args);
+    };
+    match first.as_str() {
+        "-h" | "--help" | "help" => {
+            reject_trailing(first, rest)?;
+            print_help();
+            Ok(())
         }
+        "-v" | "--version" | "version" => {
+            reject_trailing(first, rest)?;
+            println!("wake {VERSION}");
+            Ok(())
+        }
+        "status" => {
+            reject_trailing(first, rest)?;
+            commands::status()
+        }
+        "stop" => {
+            reject_trailing(first, rest)?;
+            commands::stop()
+        }
+        #[cfg(not(windows))]
+        "__supervise_charge__" => supervisor::run_charge(args),
+        #[cfg(not(windows))]
+        "__supervise_until__" => supervisor::run_until(args),
+        #[cfg(target_os = "macos")]
+        "__supervise_lid__" => supervisor::run_lid(args),
+        #[cfg(windows)]
+        "__worker_windows__" => supervisor::run_worker(args),
+        #[cfg(windows)]
+        "__guard_windows__" => supervisor::run_guardian(args),
+        _ => commands::start(args),
     }
-    commands::start(&[])
 }
 
-/// Hidden, Windows-only helper meant to run elevated: set the power-plan lid action to `<ac> <dc>`.
-/// Success is a silent exit 0; failure prints to stderr (via `main`) and exits non-zero.
-#[cfg(windows)]
-fn set_lid(args: &[String]) -> Result<(), AppError> {
-    fn parse(raw: &str) -> Result<u32, AppError> {
-        match raw.trim().parse::<u32>() {
-            Ok(v @ 0..=3) => Ok(v),
-            _ => Err(AppError::fail(
-                "__set_lid__ expects two lid actions in 0..=3",
-            )),
+fn is_help_or_version(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-h" | "--help" | "help" | "-v" | "--version" | "version"
+    )
+}
+
+fn has_mixed_help_or_version(args: &[String]) -> bool {
+    if args.len() <= 1 {
+        return false;
+    }
+    let mut value = false;
+    for arg in args {
+        if value {
+            value = false;
+        } else if matches!(
+            arg.as_str(),
+            "-t" | "--for" | "--until" | "--until-charge" | "--while-pid" | "--while-app"
+        ) {
+            value = true;
+        } else if is_help_or_version(arg) {
+            return true;
         }
     }
-    let (Some(ac), Some(dc)) = (args.first(), args.get(1)) else {
-        return Err(AppError::fail("__set_lid__ expects <ac> <dc>"));
-    };
-    platform::write_lid_action(parse(ac)?, parse(dc)?)
+    false
+}
+
+fn reject_trailing(command: &str, args: &[String]) -> Result<(), AppError> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::usage(format!(
+            "{command} does not accept arguments"
+        )))
+    }
 }
 
 pub(crate) fn print_help() {
     println!(
         r#"wake - keep your machine awake from the CLI
 
-platforms:
-  macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;
-  Windows uses PowerShell + SetThreadExecutionState
-  note: closing the lid still sleeps the mac unless you use --even-lid
-
-interactive:
-  wake                       open the picker on macOS/Linux; on Windows, start indefinitely
-                             (macOS/Linux: a non-interactive or piped 'wake' starts indefinitely)
-
-direct:
-  wake forever               stay awake indefinitely (no menu)
-  wake <duration>            e.g. wake 1h, wake 30m, wake 1h30m, wake 90s
-  wake -t <duration>         same as above with explicit flag
-  wake --until HH:MM         stay awake until clock time
-  wake --until-charge N      stay awake until battery hits N% (1-100)
-  wake --while-pid PID       stay awake while PID is running
-  wake --while-app NAME      stay awake while named app/process is running
-  wake --no-display          prevent system sleep only, allow display sleep
-  wake --even-lid            stay awake with the lid closed (macOS uses sudo; Windows sets
-                             the lid-close action to Do Nothing)
-  wake status                show current session
-  wake stop                  end current session
+usage:
+  wake                       stay awake indefinitely
+  wake forever               stay awake indefinitely
+  wake <duration>            e.g. 90s, 30m, 1h30m, or 1d
+  wake -t, --for <duration>  stay awake for a duration
+  wake --until HH:MM         stay awake until the next local clock time
+  wake --until-charge N      stay awake until battery reaches N% (1-100)
+  wake --while-pid PID       stay awake while a process is running
+  wake --while-app NAME      stay awake while a matching app is running
+  wake --no-display          allow display sleep
+  wake --even-lid            include lid closure
+  wake status                show the current session
+  wake stop                  stop the current session
   wake version, -v           print version
-  wake help, -h              this message
+  wake help, -h              print help
 
-duration syntax:
-  90s, 5m, 1h, 1h30m, 2h45m30s, 1d, or plain seconds (3600)
-  maximum: 30d
+platforms:
+  macOS: caffeinate; --even-lid uses sudo
+  Linux: systemd-inhibit; --even-lid requires the logind handle-lid-switch inhibitor
+  Windows: native power APIs; --even-lid uses one UAC guardian
+
+durations:
+  plain seconds or ordered d/h/m/s units; maximum 30d
 
 exit codes:
   2 usage, 1 error
 
-state file:
-  ~/.local/state/wake/session.properties (override dir with WAKE_STATE_DIR)
-  Windows: %LOCALAPPDATA%\wake\session.properties"#
+state:
+  WAKE_STATE_DIR overrides the platform state directory"#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn fixed_commands_reject_trailing_args() {
+        for values in [
+            &["help", "extra"][..],
+            &["version", "extra"],
+            &["status", "extra"],
+            &["stop", "extra"],
+        ] {
+            assert!(matches!(dispatch(&args(values)), Err(AppError::Usage(_))));
+        }
+    }
+
+    #[test]
+    fn start_help_and_version_must_be_alone() {
+        for values in [&["1h", "--help"][..], &["--no-display", "--version"]] {
+            assert!(matches!(dispatch(&args(values)), Err(AppError::Usage(_))));
+        }
+    }
+
+    #[test]
+    fn help_and_version_values_are_not_top_level_commands() {
+        for values in [
+            &["--while-app", "help"][..],
+            &["--while-app", "version"],
+            &["--while-app", "--help"],
+        ] {
+            assert!(!has_mixed_help_or_version(&args(values)));
+        }
+        assert!(has_mixed_help_or_version(&args(&[
+            "--while-app",
+            "help",
+            "--version",
+        ])));
+    }
 }

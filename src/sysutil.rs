@@ -307,19 +307,21 @@ fn detach(command: &mut Command) {
 #[cfg(windows)]
 pub use win::{
     GuardianMode, ProcessHandle, child_identity, current_identity, open_exact_process,
-    open_process_for_wait, spawn_elevated_guardian, spawn_worker,
+    open_process_for_wait, spawn_elevated_guardian, spawn_worker, wait_until,
 };
 
 #[cfg(windows)]
 mod win {
     use super::Identity;
     use crate::error::{AppError, Result};
+    use chrono::{DateTime, Utc};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
+    use std::ptr::null;
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_CANCELLED, ERROR_INVALID_PARAMETER, FILETIME, GetHandleInformation,
@@ -327,10 +329,10 @@ mod win {
         WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, GetProcessId,
-        GetProcessTimes, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
-        WaitForSingleObject,
+        CREATE_NO_WINDOW, CreateWaitableTimerW, DETACHED_PROCESS, GetCurrentProcess,
+        GetExitCodeProcess, GetProcessId, GetProcessTimes, INFINITE, OpenProcess,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        QueryFullProcessImageNameW, SetWaitableTimer, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -341,7 +343,7 @@ mod win {
     impl OwnedHandle {
         fn new(handle: HANDLE) -> Result<Self> {
             if handle.is_null() {
-                Err(last_error("received a null process handle"))
+                Err(last_error("received a null handle"))
             } else {
                 Ok(Self(handle))
             }
@@ -354,7 +356,7 @@ mod win {
 
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
-            // SAFETY: `self.0` is an owned process handle and is closed exactly once.
+            // SAFETY: `self.0` is an owned Windows handle and is closed exactly once.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -449,6 +451,43 @@ mod win {
         }
     }
 
+    pub(super) fn utc_to_filetime(deadline: DateTime<Utc>) -> Result<i64> {
+        const EPOCH_OFFSET_SECONDS: i128 = 11_644_473_600;
+        const TICKS_PER_SECOND: i128 = 10_000_000;
+
+        let subsecond_ticks = (i128::from(deadline.timestamp_subsec_nanos()) + 99) / 100;
+        let ticks = (i128::from(deadline.timestamp()) + EPOCH_OFFSET_SECONDS) * TICKS_PER_SECOND
+            + subsecond_ticks;
+        if ticks <= 0 || ticks > i128::from(i64::MAX) {
+            return Err(AppError::fail(
+                "deadline is outside the positive Windows FILETIME range",
+            ));
+        }
+        Ok(ticks as i64)
+    }
+
+    pub fn wait_until(deadline: DateTime<Utc>) -> Result<()> {
+        if deadline <= Utc::now() {
+            return Ok(());
+        }
+        let due_time = utc_to_filetime(deadline)?;
+        // SAFETY: Null security attributes and name create a private auto-reset timer handle.
+        let raw = unsafe { CreateWaitableTimerW(null(), 0, null()) };
+        if raw.is_null() {
+            return Err(last_error("could not create deadline timer"));
+        }
+        let timer = OwnedHandle(raw);
+        // SAFETY: `timer` and `due_time` remain valid through the call. A positive due time is an
+        // absolute UTC FILETIME; the timer is one-shot and does not request system resume.
+        if unsafe { SetWaitableTimer(timer.raw(), &due_time, 0, None, null(), 0) } == 0 {
+            return Err(last_error("could not arm deadline timer"));
+        }
+        match wait_raw(timer.raw(), INFINITE)? {
+            WAIT_OBJECT_0 => Ok(()),
+            _ => unreachable!("an infinite timer wait cannot time out"),
+        }
+    }
+
     pub fn open_process(pid: u32, terminate: bool) -> Result<Option<ProcessHandle>> {
         let access = PROCESS_QUERY_LIMITED_INFORMATION
             | PROCESS_SYNCHRONIZE
@@ -532,12 +571,12 @@ mod win {
         // SAFETY: `handle` is retained for the duration of the wait.
         let result = unsafe { WaitForSingleObject(handle, timeout_ms) };
         if result == WAIT_FAILED {
-            Err(last_error("process wait failed"))
+            Err(last_error("Windows wait failed"))
         } else if result == WAIT_OBJECT_0 || result == WAIT_TIMEOUT {
             Ok(result)
         } else {
             Err(AppError::fail(format!(
-                "process wait returned unexpected status {result}"
+                "Windows wait returned unexpected status {result}"
             )))
         }
     }
@@ -826,6 +865,50 @@ mod tests {
             .to_string();
         assert!(error.contains("exited immediately"));
         assert!(error.contains("17"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn utc_deadlines_convert_to_positive_filetime_ticks_at_boundaries() {
+        let filetime_epoch = chrono::DateTime::parse_from_rfc3339("1601-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(win::utc_to_filetime(filetime_epoch).is_err());
+        assert_eq!(
+            win::utc_to_filetime(filetime_epoch + chrono::Duration::nanoseconds(1)).unwrap(),
+            1
+        );
+
+        let unix_epoch = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        assert_eq!(
+            win::utc_to_filetime(unix_epoch).unwrap(),
+            116_444_736_000_000_000
+        );
+
+        let max_filetime = i64::MAX;
+        let max_deadline = chrono::DateTime::from_timestamp(
+            max_filetime / 10_000_000 - 11_644_473_600,
+            ((max_filetime % 10_000_000) * 100) as u32,
+        )
+        .unwrap();
+        assert_eq!(win::utc_to_filetime(max_deadline).unwrap(), max_filetime);
+        assert!(win::utc_to_filetime(max_deadline + chrono::Duration::nanoseconds(1)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elapsed_absolute_deadline_completes_cleanly() {
+        wait_until(chrono::Utc::now() - chrono::Duration::seconds(1)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_timer_waits_for_short_utc_deadline() {
+        let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(40);
+
+        wait_until(deadline).unwrap();
+
+        assert!(chrono::Utc::now() >= deadline);
     }
 
     #[cfg(windows)]

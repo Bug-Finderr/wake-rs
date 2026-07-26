@@ -725,6 +725,7 @@ mod windows {
     enum WorkerWait {
         Forever,
         Duration(Duration),
+        Deadline(chrono::DateTime<Utc>),
         Process,
         Charge,
     }
@@ -735,7 +736,7 @@ mod windows {
                 && self.session.ends_at.is_some_and(|deadline| now >= deadline)
         }
 
-        fn wait_strategy(&self, now: chrono::DateTime<Utc>) -> Result<WorkerWait> {
+        fn wait_strategy(&self) -> Result<WorkerWait> {
             match self.session.trigger.as_str() {
                 "indefinite" => Ok(WorkerWait::Forever),
                 "timed" => self
@@ -745,9 +746,7 @@ mod windows {
                 "until-time" => self
                     .session
                     .ends_at
-                    .map(|deadline| {
-                        WorkerWait::Duration((deadline - now).to_std().unwrap_or(Duration::ZERO))
-                    })
+                    .map(WorkerWait::Deadline)
                     .ok_or_else(|| {
                         AppError::fail("until-time Windows worker is missing its deadline")
                     }),
@@ -895,12 +894,13 @@ mod windows {
     }
 
     fn run_worker_lifetime(spec: &WorkerSpec) -> Result<()> {
-        match spec.wait_strategy(Utc::now())? {
+        match spec.wait_strategy()? {
             WorkerWait::Forever => loop {
                 // Only process termination ends an indefinite worker; park may wake spuriously.
                 std::thread::park();
             },
             WorkerWait::Duration(duration) => sleep(duration),
+            WorkerWait::Deadline(deadline) => sysutil::wait_until(deadline)?,
             WorkerWait::Process => spec
                 .target
                 .as_ref()
@@ -1168,7 +1168,6 @@ mod windows {
 
         #[test]
         fn non_charge_workers_choose_one_blocking_wait_strategy() {
-            let now = session::parse_utc("2024-01-02T03:04:05+00:00", "test time").unwrap();
             let spec = |trigger: &str| WorkerSpec {
                 no_display: false,
                 timeout: None,
@@ -1181,34 +1180,35 @@ mod windows {
             };
 
             assert_eq!(
-                spec("indefinite").wait_strategy(now).unwrap(),
+                spec("indefinite").wait_strategy().unwrap(),
                 WorkerWait::Forever
             );
 
             let mut timed = spec("timed");
             timed.timeout = Some(Duration::from_secs(42));
             assert_eq!(
-                timed.wait_strategy(now).unwrap(),
+                timed.wait_strategy().unwrap(),
                 WorkerWait::Duration(Duration::from_secs(42))
             );
 
             let mut until = spec("until-time");
-            until.session.ends_at = Some(now + chrono::Duration::milliseconds(1_250));
+            let deadline =
+                session::parse_utc("2024-01-02T03:04:06.250+00:00", "test time").unwrap();
+            until.session.ends_at = Some(deadline);
             assert_eq!(
-                until.wait_strategy(now).unwrap(),
-                WorkerWait::Duration(Duration::from_millis(1_250))
+                until.wait_strategy().unwrap(),
+                WorkerWait::Deadline(deadline)
             );
 
             for trigger in ["while-pid", "while-app"] {
                 let mut process = spec(trigger);
                 process.target = Some(sysutil::open_process_for_wait(std::process::id()).unwrap());
-                assert_eq!(process.wait_strategy(now).unwrap(), WorkerWait::Process);
+                assert_eq!(process.wait_strategy().unwrap(), WorkerWait::Process);
             }
         }
 
         #[test]
         fn charge_worker_is_the_only_periodic_strategy() {
-            let now = session::parse_utc("2024-01-02T03:04:05+00:00", "test time").unwrap();
             let charge = WorkerSpec {
                 no_display: false,
                 timeout: None,
@@ -1220,7 +1220,7 @@ mod windows {
                 },
             };
 
-            assert_eq!(charge.wait_strategy(now).unwrap(), WorkerWait::Charge);
+            assert_eq!(charge.wait_strategy().unwrap(), WorkerWait::Charge);
         }
 
         #[test]

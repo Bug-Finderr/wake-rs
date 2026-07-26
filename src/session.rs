@@ -61,6 +61,15 @@ pub fn state_file() -> PathBuf {
     state_dir().join("session.properties")
 }
 
+#[cfg(any(not(windows), test))]
+pub fn mode_for(no_display: bool) -> &'static str {
+    if no_display {
+        "system-only"
+    } else {
+        "display+system"
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct Session {
     pub pid: u32,
@@ -597,6 +606,12 @@ pub fn acquire_lock() -> Result<LockGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_is_derived_from_no_display() {
+        assert_eq!(mode_for(false), "display+system");
+        assert_eq!(mode_for(true), "system-only");
+    }
 
     fn valid(even_lid: bool) -> String {
         let command = if cfg!(windows) {

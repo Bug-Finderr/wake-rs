@@ -236,25 +236,20 @@ fn start_unix(p: Parsed) -> Result<()> {
             existing.pid, existing.trigger, existing.detail
         )));
     }
-    let mode = if p.no_display {
-        "system-only"
-    } else {
-        "display+system"
-    }
-    .to_string();
+    let mode = session::mode_for(p.no_display).to_string();
     if let Some(charge) = p.charge_target {
         #[cfg(target_os = "macos")]
         if p.even_lid {
             return start_lid_supervisor(&p, &mode, Some(charge));
         }
-        return start_charge_supervisor(charge, &mode, p.no_display, p.even_lid);
+        return start_charge_supervisor(charge, p.no_display, p.even_lid);
     }
     #[cfg(target_os = "macos")]
     if p.even_lid {
         return start_lid_supervisor(&p, &mode, None);
     }
     if p.until_deadline.is_some() {
-        return start_until_supervisor(&p, &mode);
+        return start_until_supervisor(&p);
     }
 
     #[cfg(target_os = "linux")]
@@ -291,7 +286,7 @@ fn start_unix(p: Parsed) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn start_until_supervisor(p: &Parsed, mode: &str) -> Result<()> {
+fn start_until_supervisor(p: &Parsed) -> Result<()> {
     let deadline = p.until_deadline.expect("until route requires a deadline");
     if !deadline_still_pending(deadline, Utc::now()) {
         print_deadline_elapsed();
@@ -313,7 +308,6 @@ fn start_until_supervisor(p: &Parsed, mode: &str) -> Result<()> {
     let command = until_supervisor_command(
         deadline,
         p.no_display,
-        mode,
         &p.trigger_detail,
         p.even_lid,
         inhibitor_scope,
@@ -346,7 +340,6 @@ fn start_until_supervisor(p: &Parsed, mode: &str) -> Result<()> {
 fn until_supervisor_command(
     deadline: DateTime<Utc>,
     no_display: bool,
-    mode: &str,
     detail: &str,
     even_lid: bool,
     inhibitor_scope: &str,
@@ -356,7 +349,6 @@ fn until_supervisor_command(
         "__supervise_until__".into(),
         deadline.to_rfc3339(),
         no_display.to_string(),
-        mode.to_string(),
         detail.to_string(),
         even_lid.to_string(),
         inhibitor_scope.to_string(),
@@ -364,12 +356,7 @@ fn until_supervisor_command(
 }
 
 #[cfg(not(windows))]
-fn start_charge_supervisor(
-    target: i32,
-    mode: &str,
-    no_display: bool,
-    even_lid: bool,
-) -> Result<()> {
+fn start_charge_supervisor(target: i32, no_display: bool, even_lid: bool) -> Result<()> {
     // Strict Linux policy errors must reach the foreground before battery probing can mask them.
     #[cfg(target_os = "linux")]
     let strict_preflight = if even_lid {
@@ -395,13 +382,12 @@ fn start_charge_supervisor(
     let launch = charge_supervisor_launch(
         target,
         no_display,
-        mode,
         even_lid,
         prepared.scope(),
         prepared.note(),
     )?;
     #[cfg(target_os = "macos")]
-    let launch = charge_supervisor_launch(target, no_display, mode, even_lid, "", None)?;
+    let launch = charge_supervisor_launch(target, no_display, even_lid, "", None)?;
     let mut child = sysutil::spawn_named(&launch.command)?;
     if let Some(published) = wait_for_supervisor_session(&mut child, even_lid)? {
         print_start_confirmation(&published, launch.note.as_deref());
@@ -430,7 +416,6 @@ struct ChargeSupervisorLaunch {
 fn charge_supervisor_launch(
     target: i32,
     no_display: bool,
-    mode: &str,
     even_lid: bool,
     inhibitor_scope: &str,
     note: Option<&str>,
@@ -441,7 +426,6 @@ fn charge_supervisor_launch(
             "__supervise_charge__".into(),
             target.to_string(),
             no_display.to_string(),
-            mode.to_string(),
             even_lid.to_string(),
             inhibitor_scope.to_string(),
         ],
@@ -733,8 +717,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
         even_lid: parsed.even_lid,
         ..Session::default()
     };
-    let command =
-        crate::supervisor::worker_command(&saved, lifetime.timeout_sec, target, charge, true)?;
+    let command = crate::supervisor::worker_command(&saved, lifetime.timeout_sec, target, charge)?;
     let mut worker = sysutil::spawn_worker(&command, &session::state_dir())?;
     saved.pid = worker.id();
     let identity = sysutil::child_identity(&worker)?;
@@ -1706,23 +1689,16 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn charge_supervisor_launch_carries_the_preselected_scope_and_note() {
-        let explicit = charge_supervisor_launch(
-            80,
-            true,
-            "system-only",
-            true,
-            "sleep:handle-lid-switch",
-            None,
-        )
-        .unwrap();
+    fn charge_supervisor_launch_omits_mode_but_preserves_lid_intent_and_scope() {
+        let explicit =
+            charge_supervisor_launch(80, true, true, "sleep:handle-lid-switch", None).unwrap();
+        assert_eq!(explicit.command.len(), 6);
         assert_eq!(
             &explicit.command[1..],
             [
                 "__supervise_charge__",
                 "80",
                 "true",
-                "system-only",
                 "true",
                 "sleep:handle-lid-switch",
             ]
@@ -1731,47 +1707,52 @@ mod tests {
         let ordinary = charge_supervisor_launch(
             80,
             false,
-            "display+system",
             false,
-            "idle:sleep",
-            Some("note: inhibitor degraded to idle:sleep"),
+            "sleep:handle-lid-switch",
+            Some("note: best-effort inhibitor includes lid scope"),
         )
         .unwrap();
+        assert_eq!(ordinary.command.len(), 6);
         assert_eq!(
-            ordinary.command.last().map(String::as_str),
-            Some("idle:sleep")
+            &ordinary.command[1..],
+            [
+                "__supervise_charge__",
+                "80",
+                "false",
+                "false",
+                "sleep:handle-lid-switch",
+            ]
         );
         assert_eq!(
             ordinary.note.as_deref(),
-            Some("note: inhibitor degraded to idle:sleep")
+            Some("note: best-effort inhibitor includes lid scope")
         );
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn until_supervisor_command_carries_the_absolute_deadline_and_scope() {
+    fn until_supervisor_command_omits_mode_but_preserves_deadline_and_scope() {
         let deadline = DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
             .unwrap()
             .with_timezone(&Utc);
         let command = until_supervisor_command(
             deadline,
             false,
-            "display+system",
             "until 03:04",
-            true,
-            "idle:sleep",
+            false,
+            "sleep:handle-lid-switch",
         )
         .unwrap();
+        assert_eq!(command.len(), 7);
         assert_eq!(
             &command[1..],
             [
                 "__supervise_until__",
                 "2024-01-02T03:04:05+00:00",
                 "false",
-                "display+system",
                 "until 03:04",
-                "true",
-                "idle:sleep",
+                "false",
+                "sleep:handle-lid-switch",
             ]
         );
     }

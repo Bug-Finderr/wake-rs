@@ -181,35 +181,41 @@ mod unix {
         (None, Some(std::process::id()))
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    fn reject_macos_ordinary_even_lid(even_lid: bool) -> Result<()> {
+        if even_lid {
+            Err(AppError::fail(
+                "ordinary supervisor received unexpected lid authority",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     struct UntilArgs {
         deadline: chrono::DateTime<Utc>,
         no_display: bool,
-        mode: String,
         detail: String,
         even_lid: bool,
         inhibitor_scope: String,
     }
 
     fn parse_until_args(args: &[String]) -> Result<UntilArgs> {
-        if args.len() != 7 {
-            return Err(AppError::fail("until supervisor expects 6 arguments"));
+        if args.len() != 6 {
+            return Err(AppError::fail("until supervisor expects 5 arguments"));
         }
+        let deadline = session::parse_utc(&args[1], "until deadline")?;
         let no_display = session::parse_bool(&args[2], "no-display")?;
-        let expected_mode = if no_display {
-            "system-only"
-        } else {
-            "display+system"
-        };
-        if args[3] != expected_mode {
-            return Err(AppError::fail("until supervisor received an invalid mode"));
-        }
+        let detail = args[3].clone();
+        let even_lid = session::parse_bool(&args[4], "even-lid")?;
+        #[cfg(target_os = "macos")]
+        reject_macos_ordinary_even_lid(even_lid)?;
         Ok(UntilArgs {
-            deadline: session::parse_utc(&args[1], "until deadline")?,
+            deadline,
             no_display,
-            mode: args[3].clone(),
-            detail: args[4].clone(),
-            even_lid: session::parse_bool(&args[5], "even-lid")?,
-            inhibitor_scope: args[6].clone(),
+            detail,
+            even_lid,
+            inhibitor_scope: args[5].clone(),
         })
     }
 
@@ -246,7 +252,7 @@ mod unix {
         }
         let mut published = Session {
             pid: std::process::id(),
-            mode: args.mode,
+            mode: session::mode_for(args.no_display).into(),
             trigger: "until-time".into(),
             detail: args.detail,
             started_at: Some(now),
@@ -287,21 +293,24 @@ mod unix {
     struct ChargeArgs {
         target: i32,
         no_display: bool,
-        mode: String,
         even_lid: bool,
         inhibitor_scope: String,
     }
 
     fn parse_charge_args(args: &[String]) -> Result<ChargeArgs> {
-        if args.len() != 6 {
-            return Err(AppError::fail("charge supervisor expects 5 arguments"));
+        if args.len() != 5 {
+            return Err(AppError::fail("charge supervisor expects 4 arguments"));
         }
+        let target = parse_charge_target(&args[1])?;
+        let no_display = session::parse_bool(&args[2], "no-display")?;
+        let even_lid = session::parse_bool(&args[3], "even-lid")?;
+        #[cfg(target_os = "macos")]
+        reject_macos_ordinary_even_lid(even_lid)?;
         Ok(ChargeArgs {
-            target: parse_charge_target(&args[1])?,
-            no_display: session::parse_bool(&args[2], "no-display")?,
-            mode: args[3].clone(),
-            even_lid: session::parse_bool(&args[4], "even-lid")?,
-            inhibitor_scope: args[5].clone(),
+            target,
+            no_display,
+            even_lid,
+            inhibitor_scope: args[4].clone(),
         })
     }
 
@@ -343,7 +352,7 @@ mod unix {
 
         let mut session = Session {
             pid: std::process::id(),
-            mode: args.mode,
+            mode: session::mode_for(args.no_display).into(),
             trigger: "until-charge".into(),
             detail: charge_detail(args.target, &charge),
             started_at: Some(Utc::now()),
@@ -560,33 +569,103 @@ mod unix {
         }
 
         #[test]
-        fn charge_supervisor_protocol_parses_canonical_even_lid_and_scope() {
-            let explicit = parse_charge_args(&strings(&[
+        fn charge_supervisor_protocol_uses_exact_arity_without_mode() {
+            let parsed = parse_charge_args(&strings(&[
                 "__supervise_charge__",
                 "80",
                 "true",
-                "system-only",
+                "false",
+                "",
+            ]))
+            .unwrap();
+            assert_eq!(parsed.target, 80);
+            assert!(parsed.no_display);
+            assert!(!parsed.even_lid);
+            assert!(parsed.inhibitor_scope.is_empty());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_lid_inclusive_scope_does_not_imply_explicit_even_lid() {
+            let charge = parse_charge_args(&strings(&[
+                "__supervise_charge__",
+                "80",
+                "false",
+                "false",
+                "sleep:handle-lid-switch",
+            ]))
+            .unwrap();
+            assert!(!charge.even_lid);
+            assert_eq!(charge.inhibitor_scope, "sleep:handle-lid-switch");
+
+            let until = parse_until_args(&strings(&[
+                "__supervise_until__",
+                "2024-01-02T03:04:05+00:00",
+                "false",
+                "until 03:04",
+                "false",
+                "sleep:handle-lid-switch",
+            ]))
+            .unwrap();
+            assert!(!until.even_lid);
+            assert_eq!(until.inhibitor_scope, "sleep:handle-lid-switch");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_protocol_preserves_explicit_even_lid() {
+            let charge = parse_charge_args(&strings(&[
+                "__supervise_charge__",
+                "80",
+                "true",
                 "true",
                 "sleep:handle-lid-switch",
             ]))
             .unwrap();
-            assert_eq!(explicit.target, 80);
-            assert!(explicit.no_display);
-            assert_eq!(explicit.mode, "system-only");
-            assert!(explicit.even_lid);
-            assert_eq!(explicit.inhibitor_scope, "sleep:handle-lid-switch");
+            assert!(charge.even_lid);
 
-            let ordinary = parse_charge_args(&strings(&[
-                "__supervise_charge__",
-                "80",
-                "false",
-                "display+system",
-                "false",
-                "idle:sleep",
+            let until = parse_until_args(&strings(&[
+                "__supervise_until__",
+                "2024-01-02T03:04:05+00:00",
+                "true",
+                "until 03:04",
+                "true",
+                "sleep:handle-lid-switch",
             ]))
             .unwrap();
-            assert!(!ordinary.even_lid);
-            assert_eq!(ordinary.inhibitor_scope, "idle:sleep");
+            assert!(until.even_lid);
+        }
+
+        #[test]
+        fn macos_ordinary_authority_policy_rejects_even_lid() {
+            assert!(reject_macos_ordinary_even_lid(true).is_err());
+            assert!(reject_macos_ordinary_even_lid(false).is_ok());
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn macos_ordinary_hidden_protocols_reject_even_lid() {
+            assert!(
+                parse_charge_args(&strings(&[
+                    "__supervise_charge__",
+                    "80",
+                    "false",
+                    "true",
+                    "",
+                ]))
+                .is_err()
+            );
+            assert!(
+                parse_until_args(&strings(&[
+                    "__supervise_until__",
+                    "2024-01-02T03:04:05+00:00",
+                    "false",
+                    "until 03:04",
+                    "true",
+                    "",
+                ]))
+                .is_err()
+            );
         }
 
         #[test]
@@ -595,7 +674,6 @@ mod unix {
                 "__supervise_until__",
                 "2024-01-02T03:04:05+00:00",
                 "false",
-                "display+system",
                 "until 03:04",
                 "false",
                 "idle:sleep",
@@ -603,7 +681,6 @@ mod unix {
             .unwrap();
             assert_eq!(parsed.deadline.to_rfc3339(), "2024-01-02T03:04:05+00:00");
             assert!(!parsed.no_display);
-            assert_eq!(parsed.mode, "display+system");
             assert_eq!(parsed.detail, "until 03:04");
             assert!(!parsed.even_lid);
             assert_eq!(parsed.inhibitor_scope, "idle:sleep");
@@ -612,7 +689,6 @@ mod unix {
                 "__supervise_until__",
                 "not-a-deadline",
                 "false",
-                "display+system",
                 "until 03:04",
                 "false",
                 "idle:sleep",
@@ -622,34 +698,20 @@ mod unix {
 
         #[test]
         fn charge_supervisor_protocol_rejects_wrong_arity_or_malformed_even_lid() {
-            let missing = strings(&[
-                "__supervise_charge__",
-                "80",
-                "false",
-                "display+system",
-                "false",
-            ]);
+            let missing = strings(&["__supervise_charge__", "80", "false", "false"]);
             assert!(parse_charge_args(&missing).is_err());
 
             let extra = strings(&[
                 "__supervise_charge__",
                 "80",
                 "false",
-                "display+system",
                 "false",
                 "idle:sleep",
                 "extra",
             ]);
             assert!(parse_charge_args(&extra).is_err());
 
-            let malformed = strings(&[
-                "__supervise_charge__",
-                "80",
-                "false",
-                "display+system",
-                "True",
-                "idle:sleep",
-            ]);
+            let malformed = strings(&["__supervise_charge__", "80", "false", "True", "idle:sleep"]);
             assert!(parse_charge_args(&malformed).is_err());
         }
     }
@@ -671,7 +733,6 @@ mod windows {
         timeout: Option<Duration>,
         target: Option<sysutil::ProcessHandle>,
         charge: Option<(i32, bool)>,
-        publish: bool,
         session: Session,
     }
 
@@ -693,7 +754,6 @@ mod windows {
         timeout_sec: Option<i64>,
         target: Option<(u32, u64)>,
         charge: Option<(i32, bool)>,
-        publish: bool,
     ) -> Result<Vec<String>> {
         if timeout_sec.is_some_and(|timeout| timeout <= 0) {
             return Err(AppError::fail("worker timeout must be positive"));
@@ -728,7 +788,6 @@ mod windows {
                 .ends_at
                 .map(|time| time.to_rfc3339())
                 .unwrap_or_default(),
-            publish.to_string(),
         ])
     }
 
@@ -738,20 +797,16 @@ mod windows {
         if spec.lifetime_elapsed(Instant::now()) {
             return Ok(());
         }
-        if spec.publish {
-            session::write(&spec.session)?;
-        }
+        session::write(&spec.session)?;
         run_worker_lifetime(&spec)?;
-        if spec.publish {
-            delete_owned_worker_state(&spec.session);
-        }
+        delete_owned_worker_state(&spec.session);
         Ok(())
     }
 
     fn parse_worker_args(args: &[String]) -> Result<WorkerSpec> {
-        if args.len() != 12 {
+        if args.len() != 11 {
             return Err(AppError::fail(
-                "Windows worker expects exactly 11 arguments",
+                "Windows worker expects exactly 10 arguments",
             ));
         }
         let no_display = match args[1].as_str() {
@@ -795,13 +850,11 @@ mod windows {
             ));
         }
         let identity = sysutil::current_identity()?;
-        let publish = session::parse_bool(&args[11], "publish")?;
         Ok(WorkerSpec {
             no_display,
             timeout,
             target,
             charge: charge_target.zip(charge_up),
-            publish,
             session: Session {
                 pid: std::process::id(),
                 mode: args[1].clone(),
@@ -815,7 +868,8 @@ mod windows {
                 },
                 process_start: identity.start,
                 process_command: identity.command,
-                even_lid: !publish,
+                // Only guardian promotion can grant even-lid authority.
+                even_lid: false,
                 guardian_pid: 0,
                 guardian_start: 0,
                 original_scheme: String::new(),
@@ -1031,7 +1085,7 @@ mod windows {
         }
 
         #[test]
-        fn worker_argument_parser_is_strict() {
+        fn worker_argument_parser_is_strict_without_publish() {
             let valid = strings(&[
                 "__worker_windows__",
                 "system-only",
@@ -1044,13 +1098,47 @@ mod windows {
                 "80%",
                 "2024-01-02T03:04:05+00:00",
                 "",
-                "true",
             ]);
-            assert!(parse_worker_args(&valid).unwrap().publish);
-            assert!(parse_worker_args(&valid[..11]).is_err());
+            assert!(!parse_worker_args(&valid).unwrap().session.even_lid);
+            assert!(parse_worker_args(&valid[..10]).is_err());
+            let mut extra = valid.clone();
+            extra.push("true".into());
+            assert!(parse_worker_args(&extra).is_err());
             let mut incomplete = valid;
             incomplete[3] = "42".into();
             assert!(parse_worker_args(&incomplete).is_err());
+        }
+
+        #[test]
+        fn worker_command_omits_publish_and_parses_as_provisional_non_lid_state() {
+            let session = Session {
+                mode: "system-only".into(),
+                trigger: "until-charge".into(),
+                detail: "80%".into(),
+                started_at: Some(
+                    session::parse_utc("2024-01-02T03:04:05+00:00", "start time").unwrap(),
+                ),
+                ..Session::default()
+            };
+            let command = worker_command(&session, Some(60), None, Some((80, true))).unwrap();
+            assert_eq!(command.len(), 12);
+            assert_eq!(
+                &command[1..],
+                [
+                    "__worker_windows__",
+                    "system-only",
+                    "60",
+                    "",
+                    "",
+                    "80",
+                    "up",
+                    "until-charge",
+                    "80%",
+                    "2024-01-02T03:04:05+00:00",
+                    "",
+                ]
+            );
+            assert!(!parse_worker_args(&command[1..]).unwrap().session.even_lid);
         }
 
         #[test]
@@ -1060,7 +1148,6 @@ mod windows {
                 timeout: Some(Duration::from_secs(3_600)),
                 target: None,
                 charge: None,
-                publish: true,
                 session: Session {
                     trigger: "until-time".into(),
                     ends_at: Some(Utc::now() - chrono::Duration::seconds(1)),

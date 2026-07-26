@@ -10,7 +10,26 @@ Build with Cargo:
 cargo build --release
 ```
 
-The binary is `target/release/wake` (`wake.exe` on Windows). Releases provide Unix binaries in `.tar.gz` archives and Windows as `.exe`. On Linux or macOS, extract the archive before putting `wake` on your `PATH`.
+The binary is `target/release/wake` (`wake.exe` on Windows). Release assets are:
+
+- `wake-linux-x64.tar.gz` (glibc 2.35 or newer)
+- `wake-macos-x64.tar.gz`
+- `wake-macos-arm64.tar.gz`
+- `wake.exe`
+
+On Linux or macOS, extract the matching archive and put `wake` on your `PATH`:
+
+```sh
+mkdir -p ~/.local/bin
+tar -xzf wake-linux-x64.tar.gz
+install -m 0755 wake ~/.local/bin/wake
+```
+
+On Windows, place `wake.exe` in a directory on your `PATH`. Optionally verify any downloaded asset's provenance:
+
+```sh
+gh attestation verify <asset> --repo Bug-Finderr/wake-rs
+```
 
 ## Usage
 

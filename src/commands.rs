@@ -662,6 +662,28 @@ enum WindowsState {
 }
 
 #[cfg(windows)]
+pub(crate) fn session_uses_deadline(saved: &Session) -> bool {
+    matches!(saved.trigger.as_str(), "timed" | "until-time")
+}
+
+#[cfg(windows)]
+pub(crate) fn session_deadline_elapsed(saved: &Session, now: DateTime<Utc>) -> bool {
+    session_uses_deadline(saved)
+        && saved
+            .ends_at
+            .is_some_and(|deadline| !deadline_still_pending(deadline, now))
+}
+
+#[cfg(windows)]
+fn startup_guardian_mode(saved: &Session) -> sysutil::GuardianMode {
+    sysutil::GuardianMode::Startup(if session_uses_deadline(saved) {
+        saved.ends_at
+    } else {
+        None
+    })
+}
+
+#[cfg(windows)]
 fn start_windows(mut parsed: Parsed) -> Result<()> {
     let state_path = session::state_file();
     let _lock = session::acquire_lock()?;
@@ -732,11 +754,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
             return Err(error);
         }
     };
-    if saved.trigger == "until-time"
-        && saved
-            .ends_at
-            .is_some_and(|deadline| !deadline_still_pending(deadline, Utc::now()))
-    {
+    if session_deadline_elapsed(&saved, Utc::now()) {
         cleanup_provisional_worker(&mut worker, &saved)?;
         print_deadline_elapsed();
         return Ok(());
@@ -754,11 +772,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
         &scheme,
         snapshot.ac,
         snapshot.dc,
-        sysutil::GuardianMode::Startup(if saved.trigger == "until-time" {
-            saved.ends_at
-        } else {
-            None
-        }),
+        startup_guardian_mode(&saved),
         &state_path,
     ) {
         Ok(guardian) => guardian,
@@ -837,11 +851,7 @@ fn windows_condition_completed(
     } else {
         "during startup"
     };
-    if saved.trigger == "until-time"
-        && saved
-            .ends_at
-            .is_some_and(|deadline| !deadline_still_pending(deadline, Utc::now()))
-    {
+    if session_deadline_elapsed(saved, Utc::now()) {
         return Some(format!("wake: requested end time passed {timing}"));
     }
     if !worker_succeeded {
@@ -1627,25 +1637,59 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn completed_windows_condition_uses_the_matching_startup_message() {
-        let mut saved = Session {
-            trigger: "until-time".into(),
-            ends_at: Some(Utc::now() - Duration::seconds(1)),
+    fn timed_and_until_sessions_share_deadline_expiry() {
+        let now = Utc::now();
+        for trigger in ["timed", "until-time"] {
+            let saved = Session {
+                trigger: trigger.into(),
+                ends_at: Some(now),
+                ..Session::default()
+            };
+            assert!(session_deadline_elapsed(&saved, now));
+        }
+        let untimed = Session {
+            trigger: "until-charge".into(),
+            ends_at: Some(now),
             ..Session::default()
         };
-        assert_eq!(
-            windows_condition_completed(true, &saved, None).as_deref(),
-            Some("wake: requested end time passed during startup")
-        );
-        saved.even_lid = true;
-        assert_eq!(
-            windows_condition_completed(true, &saved, None).as_deref(),
-            Some("wake: requested end time passed before --even-lid became ready")
-        );
-        assert_eq!(
-            windows_condition_completed(false, &saved, None).as_deref(),
-            Some("wake: requested end time passed before --even-lid became ready")
-        );
+        assert!(!session_deadline_elapsed(&untimed, now));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn timed_guardian_command_carries_ends_at() {
+        let ends_at = Utc::now() + Duration::minutes(1);
+        let saved = Session {
+            trigger: "timed".into(),
+            ends_at: Some(ends_at),
+            ..Session::default()
+        };
+
+        let sysutil::GuardianMode::Startup(deadline) = startup_guardian_mode(&saved) else {
+            panic!("startup must use startup guardian mode");
+        };
+        assert_eq!(deadline, Some(ends_at));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deadline_backed_windows_condition_uses_the_matching_startup_message() {
+        for trigger in ["timed", "until-time"] {
+            let mut saved = Session {
+                trigger: trigger.into(),
+                ends_at: Some(Utc::now() - Duration::seconds(1)),
+                ..Session::default()
+            };
+            assert_eq!(
+                windows_condition_completed(false, &saved, None).as_deref(),
+                Some("wake: requested end time passed during startup")
+            );
+            saved.even_lid = true;
+            assert_eq!(
+                windows_condition_completed(false, &saved, None).as_deref(),
+                Some("wake: requested end time passed before --even-lid became ready")
+            );
+        }
     }
 
     #[test]

@@ -730,8 +730,7 @@ mod windows {
 
     impl WorkerSpec {
         fn deadline_elapsed(&self, now: chrono::DateTime<Utc>) -> bool {
-            matches!(self.session.trigger.as_str(), "timed" | "until-time")
-                && self.session.ends_at.is_some_and(|deadline| now >= deadline)
+            crate::commands::session_deadline_elapsed(&self.session, now)
         }
 
         fn wait_strategy(&self) -> Result<WorkerWait> {
@@ -984,13 +983,15 @@ mod windows {
         guardian: (u32, u64),
         worker_identity: &sysutil::Identity,
     ) -> Result<Session> {
-        let expected_deadline = if saved.trigger == "until-time" {
+        let requires_deadline = crate::commands::session_uses_deadline(&saved);
+        let expected_deadline = if requires_deadline {
             saved.ends_at
         } else {
             None
         };
         if !saved.owned_non_lid_by(args.worker_pid, args.worker_start)
             || !saved.matches_identity(worker_identity)
+            || requires_deadline && expected_deadline.is_none()
             || args.deadline != expected_deadline
         {
             return Err(AppError::fail(
@@ -1252,17 +1253,21 @@ mod windows {
         }
 
         #[test]
-        fn startup_guardian_checks_the_deadline_at_the_transition() {
-            let now = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
+        fn startup_guardian_rejects_elapsed_timed_deadline() {
+            let timed_deadline = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
                 .unwrap()
                 .with_timezone(&Utc);
             assert!(startup_guardian_should_enable(
-                Some(now + chrono::Duration::seconds(1)),
-                now,
+                Some(timed_deadline),
+                timed_deadline - chrono::Duration::milliseconds(1),
                 true,
             ));
-            assert!(!startup_guardian_should_enable(Some(now), now, true));
-            assert!(!startup_guardian_should_enable(None, now, false));
+            assert!(!startup_guardian_should_enable(
+                Some(timed_deadline),
+                timed_deadline,
+                true,
+            ));
+            assert!(!startup_guardian_should_enable(None, timed_deadline, false));
         }
 
         #[test]
@@ -1307,6 +1312,54 @@ mod windows {
                 ),
                 (args.scheme.as_str(), 1, 2)
             );
+        }
+
+        #[test]
+        fn timed_startup_guardian_requires_matching_deadline() {
+            let deadline = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
+                .unwrap()
+                .with_timezone(&Utc);
+            let identity = sysutil::Identity {
+                start: 9,
+                command: "C:\\tools\\wake.exe".into(),
+            };
+            let mut args = GuardianArgs {
+                worker_pid: 7,
+                worker_start: 9,
+                scheme: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+                ac: 1,
+                dc: 2,
+                restore_without_worker: false,
+                deadline: Some(deadline),
+                state_path: PathBuf::from("C:\\state\\session.properties"),
+            };
+            let mut saved = Session {
+                pid: 7,
+                mode: "display+system".into(),
+                trigger: "timed".into(),
+                detail: "60s".into(),
+                started_at: Some(deadline - chrono::Duration::minutes(1)),
+                ends_at: Some(deadline),
+                process_start: 9,
+                process_command: identity.command.clone(),
+                ..Session::default()
+            };
+
+            assert!(
+                promote_startup_guardian_authority(saved.clone(), &args, (11, 13), &identity,)
+                    .is_ok()
+            );
+
+            saved.ends_at = None;
+            args.deadline = None;
+            assert!(
+                promote_startup_guardian_authority(saved.clone(), &args, (11, 13), &identity,)
+                    .is_err()
+            );
+
+            saved.ends_at = Some(deadline);
+            args.deadline = Some(deadline + chrono::Duration::seconds(1));
+            assert!(promote_startup_guardian_authority(saved, &args, (11, 13), &identity).is_err());
         }
 
         #[test]

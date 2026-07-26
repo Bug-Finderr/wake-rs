@@ -22,10 +22,6 @@ fn main() {
 }
 
 fn dispatch(args: &[String]) -> Result<(), AppError> {
-    let internal = args.first().is_some_and(|arg| arg.starts_with("__"));
-    if !internal && has_mixed_help_or_version(args) {
-        return Err(AppError::usage("help and version must be used alone"));
-    }
     let Some((first, rest)) = args.split_first() else {
         return commands::start(args);
     };
@@ -60,33 +56,6 @@ fn dispatch(args: &[String]) -> Result<(), AppError> {
         "__guard_windows__" => supervisor::run_guardian(args),
         _ => commands::start(args),
     }
-}
-
-fn is_help_or_version(arg: &str) -> bool {
-    matches!(
-        arg,
-        "-h" | "--help" | "help" | "-v" | "--version" | "version"
-    )
-}
-
-fn has_mixed_help_or_version(args: &[String]) -> bool {
-    if args.len() <= 1 {
-        return false;
-    }
-    let mut value = false;
-    for arg in args {
-        if value {
-            value = false;
-        } else if matches!(
-            arg.as_str(),
-            "-t" | "--for" | "--until" | "--until-charge" | "--while-pid" | "--while-app"
-        ) {
-            value = true;
-        } else if is_help_or_version(arg) {
-            return true;
-        }
-    }
-    false
 }
 
 fn reject_trailing(command: &str, args: &[String]) -> Result<(), AppError> {
@@ -160,21 +129,5 @@ mod tests {
         for values in [&["1h", "--help"][..], &["--no-display", "--version"]] {
             assert!(matches!(dispatch(&args(values)), Err(AppError::Usage(_))));
         }
-    }
-
-    #[test]
-    fn help_and_version_values_are_not_top_level_commands() {
-        for values in [
-            &["--while-app", "help"][..],
-            &["--while-app", "version"],
-            &["--while-app", "--help"],
-        ] {
-            assert!(!has_mixed_help_or_version(&args(values)));
-        }
-        assert!(has_mixed_help_or_version(&args(&[
-            "--while-app",
-            "help",
-            "--version",
-        ])));
     }
 }

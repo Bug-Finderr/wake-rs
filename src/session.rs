@@ -61,6 +61,14 @@ pub fn state_file() -> PathBuf {
     state_dir().join("session.properties")
 }
 
+pub fn mode_for(no_display: bool) -> &'static str {
+    if no_display {
+        "system-only"
+    } else {
+        "display+system"
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct Session {
     pub pid: u32,
@@ -240,7 +248,7 @@ fn parse_session(bytes: &[u8]) -> Result<Session> {
         even_lid,
         #[cfg(target_os = "macos")]
         prior_disable_sleep: if even_lid {
-            disable_sleep(field(&properties, "priorDisableSleep")?)?
+            parse_disable_sleep(field(&properties, "priorDisableSleep")?)?
         } else {
             0
         },
@@ -358,7 +366,7 @@ fn serialize(session: &Session) -> Result<Vec<u8>> {
     let fields = {
         let mut fields = fields;
         if session.even_lid {
-            disable_sleep(&session.prior_disable_sleep.to_string())?;
+            parse_disable_sleep(&session.prior_disable_sleep.to_string())?;
             fields.push(("priorDisableSleep", session.prior_disable_sleep.to_string()));
         }
         fields
@@ -414,7 +422,7 @@ where
         Ok(value)
     }
 }
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", windows, test))]
 pub(crate) fn parse_u32(raw: &str, name: &str) -> Result<u32> {
     let value = raw
         .parse::<u32>()
@@ -435,8 +443,8 @@ pub(crate) fn parse_utc(raw: &str, name: &str) -> Result<DateTime<Utc>> {
         Err(AppError::fail(format!("{name} is not canonical UTC")))
     }
 }
-#[cfg(target_os = "macos")]
-fn disable_sleep(raw: &str) -> Result<i32> {
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_disable_sleep(raw: &str) -> Result<i32> {
     match parse_u32(raw, "priorDisableSleep")? {
         value @ (0 | 1) => Ok(value as i32),
         _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
@@ -516,9 +524,7 @@ pub fn write_at(path: &Path, session: &Session) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub fn write_pending_lid_recovery(prior_disable_sleep: i32) -> Result<()> {
-    if !matches!(prior_disable_sleep, 0 | 1) {
-        return Err(AppError::fail("priorDisableSleep must be 0 or 1"));
-    }
+    parse_disable_sleep(&prior_disable_sleep.to_string())?;
     write_bytes_at(
         &state_file(),
         &pending_lid_recovery_bytes(prior_disable_sleep),
@@ -597,6 +603,21 @@ pub fn acquire_lock() -> Result<LockGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_is_derived_from_no_display() {
+        assert_eq!(mode_for(false), "display+system");
+        assert_eq!(mode_for(true), "system-only");
+    }
+
+    #[test]
+    fn disable_sleep_parser_accepts_only_zero_or_one() {
+        assert_eq!(parse_disable_sleep("0").unwrap(), 0);
+        assert_eq!(parse_disable_sleep("1").unwrap(), 1);
+        for invalid in ["", "2", "-1", "01", " 0"] {
+            assert!(parse_disable_sleep(invalid).is_err(), "value={invalid:?}");
+        }
+    }
 
     fn valid(even_lid: bool) -> String {
         let command = if cfg!(windows) {

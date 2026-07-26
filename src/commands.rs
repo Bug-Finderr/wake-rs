@@ -33,7 +33,6 @@ struct Parsed {
 
 struct LaunchLifetime {
     started_at: DateTime<Utc>,
-    timeout_sec: Option<i64>,
     ends_at: Option<DateTime<Utc>>,
 }
 
@@ -52,13 +51,11 @@ fn launch_lifetime(
         }
         return Some(LaunchLifetime {
             started_at: now,
-            timeout_sec: Some((deadline - now).num_seconds().max(1)),
             ends_at: Some(deadline),
         });
     }
     Some(LaunchLifetime {
         started_at: now,
-        timeout_sec,
         ends_at: timeout_sec.map(|timeout| now + Duration::seconds(timeout)),
     })
 }
@@ -70,19 +67,7 @@ pub(crate) fn sleep_restore_needed(prior: i32, current: i32) -> bool {
 
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn sleep_restored(prior: i32, current: i32) -> bool {
-    prior != 0 || current == 0
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn prior_after_authentication(
-    prior: i32,
-    read_current: impl FnOnce() -> Result<i32>,
-) -> Result<i32> {
-    if prior == 0 {
-        read_current()
-    } else {
-        Ok(prior)
-    }
+    !sleep_restore_needed(prior, current)
 }
 
 fn parse_start_args(args: &[String]) -> Result<Parsed> {
@@ -103,6 +88,9 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
+            "-h" | "--help" | "help" | "-v" | "--version" | "version" => {
+                return Err(AppError::usage("help and version must be used alone"));
+            }
             "--no-display" => claim_boolean(&mut p.no_display, a)?,
             "--even-lid" => claim_boolean(&mut p.even_lid, a)?,
             "-t" | "--for" => {
@@ -169,8 +157,6 @@ fn parse_start_args(args: &[String]) -> Result<Parsed> {
             }
             "forever" | "indefinite" => {
                 trigger_flag = claim_trigger(trigger_flag, a)?;
-                p.trigger_detail = "indefinite".into();
-                p.trigger = "indefinite".into();
             }
             other => {
                 if other.starts_with('-') {
@@ -236,25 +222,20 @@ fn start_unix(p: Parsed) -> Result<()> {
             existing.pid, existing.trigger, existing.detail
         )));
     }
-    let mode = if p.no_display {
-        "system-only"
-    } else {
-        "display+system"
-    }
-    .to_string();
+    let mode = session::mode_for(p.no_display).to_string();
     if let Some(charge) = p.charge_target {
         #[cfg(target_os = "macos")]
         if p.even_lid {
-            return start_lid_supervisor(&p, &mode, Some(charge));
+            return start_lid_supervisor(&p, Some(charge));
         }
-        return start_charge_supervisor(charge, &mode, p.no_display, p.even_lid);
+        return start_charge_supervisor(charge, p.no_display, p.even_lid);
     }
     #[cfg(target_os = "macos")]
     if p.even_lid {
-        return start_lid_supervisor(&p, &mode, None);
+        return start_lid_supervisor(&p, None);
     }
     if p.until_deadline.is_some() {
-        return start_until_supervisor(&p, &mode);
+        return start_until_supervisor(&p);
     }
 
     #[cfg(target_os = "linux")]
@@ -262,10 +243,9 @@ fn start_unix(p: Parsed) -> Result<()> {
     let lifetime = launch_lifetime(p.timeout_sec, None, Utc::now())
         .expect("relative and indefinite lifetimes are always pending");
     #[cfg(target_os = "linux")]
-    let keep_awake = prepared.command(lifetime.timeout_sec, p.wait_pid);
+    let keep_awake = prepared.command(p.timeout_sec, p.wait_pid);
     #[cfg(target_os = "macos")]
-    let keep_awake =
-        platform::keep_awake_command(p.no_display, p.even_lid, lifetime.timeout_sec, p.wait_pid)?;
+    let keep_awake = platform::keep_awake_command(p.no_display, p.timeout_sec, p.wait_pid)?;
     let mut child = sysutil::spawn_named(&keep_awake.cmd)?;
     sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
     let mut saved = Session {
@@ -291,7 +271,7 @@ fn start_unix(p: Parsed) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn start_until_supervisor(p: &Parsed, mode: &str) -> Result<()> {
+fn start_until_supervisor(p: &Parsed) -> Result<()> {
     let deadline = p.until_deadline.expect("until route requires a deadline");
     if !deadline_still_pending(deadline, Utc::now()) {
         print_deadline_elapsed();
@@ -309,11 +289,10 @@ fn start_until_supervisor(p: &Parsed, mode: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     let (inhibitor_scope, note) = (prepared.scope(), prepared.note().map(str::to_string));
     #[cfg(target_os = "macos")]
-    let (inhibitor_scope, note) = ("", platform::static_start_note());
+    let (inhibitor_scope, note) = ("", None::<String>);
     let command = until_supervisor_command(
         deadline,
         p.no_display,
-        mode,
         &p.trigger_detail,
         p.even_lid,
         inhibitor_scope,
@@ -346,7 +325,6 @@ fn start_until_supervisor(p: &Parsed, mode: &str) -> Result<()> {
 fn until_supervisor_command(
     deadline: DateTime<Utc>,
     no_display: bool,
-    mode: &str,
     detail: &str,
     even_lid: bool,
     inhibitor_scope: &str,
@@ -356,7 +334,6 @@ fn until_supervisor_command(
         "__supervise_until__".into(),
         deadline.to_rfc3339(),
         no_display.to_string(),
-        mode.to_string(),
         detail.to_string(),
         even_lid.to_string(),
         inhibitor_scope.to_string(),
@@ -364,12 +341,7 @@ fn until_supervisor_command(
 }
 
 #[cfg(not(windows))]
-fn start_charge_supervisor(
-    target: i32,
-    mode: &str,
-    no_display: bool,
-    even_lid: bool,
-) -> Result<()> {
+fn start_charge_supervisor(target: i32, no_display: bool, even_lid: bool) -> Result<()> {
     // Strict Linux policy errors must reach the foreground before battery probing can mask them.
     #[cfg(target_os = "linux")]
     let strict_preflight = if even_lid {
@@ -395,13 +367,12 @@ fn start_charge_supervisor(
     let launch = charge_supervisor_launch(
         target,
         no_display,
-        mode,
         even_lid,
         prepared.scope(),
         prepared.note(),
     )?;
     #[cfg(target_os = "macos")]
-    let launch = charge_supervisor_launch(target, no_display, mode, even_lid, "", None)?;
+    let launch = charge_supervisor_launch(target, no_display, even_lid, "", None)?;
     let mut child = sysutil::spawn_named(&launch.command)?;
     if let Some(published) = wait_for_supervisor_session(&mut child, even_lid)? {
         print_start_confirmation(&published, launch.note.as_deref());
@@ -430,7 +401,6 @@ struct ChargeSupervisorLaunch {
 fn charge_supervisor_launch(
     target: i32,
     no_display: bool,
-    mode: &str,
     even_lid: bool,
     inhibitor_scope: &str,
     note: Option<&str>,
@@ -441,7 +411,6 @@ fn charge_supervisor_launch(
             "__supervise_charge__".into(),
             target.to_string(),
             no_display.to_string(),
-            mode.to_string(),
             even_lid.to_string(),
             inhibitor_scope.to_string(),
         ],
@@ -556,35 +525,48 @@ fn print_status(saved: &Session) {
     }
 }
 
-fn print_start_confirmation(s: &Session, note: Option<&str>) {
+fn start_confirmation_lines(s: &Session, note: Option<&str>) -> Vec<String> {
     let started = s.started_at.map(hms).unwrap_or_else(|| "-".into());
     let ends = s.ends_at.map(hms).unwrap_or_else(|| "-".into());
-    println!("wake: session active (pid {})", s.pid);
-    println!("  mode    : {}", s.mode);
-    println!("  trigger : {} ({})", s.trigger, s.detail);
-    println!("  started : {started}");
-    println!("  ends    : {ends}");
+    let mut lines = vec![
+        format!("wake: session active (pid {})", s.pid),
+        format!("  mode    : {}", s.mode),
+        format!("  trigger : {} ({})", s.trigger, s.detail),
+        format!("  started : {started}"),
+        format!("  ends    : {ends}"),
+    ];
     if s.even_lid {
         #[cfg(windows)]
-        println!(
+        lines.push(
             "note: --even-lid override verified; use 'wake status' to detect later power changes"
+                .into(),
         );
         #[cfg(target_os = "macos")]
-        println!(
+        lines.push(
             "note: --even-lid is active; this Mac should stay awake with the lid closed until the session ends"
+                .into(),
         );
         #[cfg(target_os = "linux")]
-        println!(
+        lines.push(
             "note: --even-lid holds a logind inhibitor for lid-switch handling; privileged or non-logind suspend paths are not covered"
+                .into(),
         );
-        println!(
+        lines.push(
             "caution: closed lid + battery + no external display can run hot and drain quickly"
+                .into(),
         );
-    } else if let Some(n) = note
+    } else if let Some(note) = note
         .map(str::to_string)
         .or_else(platform::static_start_note)
     {
-        println!("{n}");
+        lines.push(note);
+    }
+    lines
+}
+
+fn print_start_confirmation(s: &Session, note: Option<&str>) {
+    for line in start_confirmation_lines(s, note) {
+        println!("{line}");
     }
 }
 
@@ -680,6 +662,28 @@ enum WindowsState {
 }
 
 #[cfg(windows)]
+pub(crate) fn session_uses_deadline(saved: &Session) -> bool {
+    matches!(saved.trigger.as_str(), "timed" | "until-time")
+}
+
+#[cfg(windows)]
+pub(crate) fn session_deadline_elapsed(saved: &Session, now: DateTime<Utc>) -> bool {
+    session_uses_deadline(saved)
+        && saved
+            .ends_at
+            .is_some_and(|deadline| !deadline_still_pending(deadline, now))
+}
+
+#[cfg(windows)]
+fn startup_guardian_mode(saved: &Session) -> sysutil::GuardianMode {
+    sysutil::GuardianMode::Startup(if session_uses_deadline(saved) {
+        saved.ends_at
+    } else {
+        None
+    })
+}
+
+#[cfg(windows)]
 fn start_windows(mut parsed: Parsed) -> Result<()> {
     let state_path = session::state_file();
     let _lock = session::acquire_lock()?;
@@ -720,12 +724,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
         return Ok(());
     };
     let mut saved = Session {
-        mode: if parsed.no_display {
-            "system-only"
-        } else {
-            "display+system"
-        }
-        .into(),
+        mode: session::mode_for(parsed.no_display).into(),
         trigger: parsed.trigger,
         detail: parsed.trigger_detail,
         started_at: Some(lifetime.started_at),
@@ -733,8 +732,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
         even_lid: parsed.even_lid,
         ..Session::default()
     };
-    let command =
-        crate::supervisor::worker_command(&saved, lifetime.timeout_sec, target, charge, true)?;
+    let command = crate::supervisor::worker_command(&saved, target, charge)?;
     let mut worker = sysutil::spawn_worker(&command, &session::state_dir())?;
     saved.pid = worker.id();
     let identity = sysutil::child_identity(&worker)?;
@@ -756,11 +754,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
             return Err(error);
         }
     };
-    if saved.trigger == "until-time"
-        && saved
-            .ends_at
-            .is_some_and(|deadline| !deadline_still_pending(deadline, Utc::now()))
-    {
+    if session_deadline_elapsed(&saved, Utc::now()) {
         cleanup_provisional_worker(&mut worker, &saved)?;
         print_deadline_elapsed();
         return Ok(());
@@ -778,11 +772,7 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
         &scheme,
         snapshot.ac,
         snapshot.dc,
-        sysutil::GuardianMode::Startup(if saved.trigger == "until-time" {
-            saved.ends_at
-        } else {
-            None
-        }),
+        startup_guardian_mode(&saved),
         &state_path,
     ) {
         Ok(guardian) => guardian,
@@ -861,11 +851,7 @@ fn windows_condition_completed(
     } else {
         "during startup"
     };
-    if saved.trigger == "until-time"
-        && saved
-            .ends_at
-            .is_some_and(|deadline| !deadline_still_pending(deadline, Utc::now()))
-    {
+    if session_deadline_elapsed(saved, Utc::now()) {
         return Some(format!("wake: requested end time passed {timing}"));
     }
     if !worker_succeeded {
@@ -1217,7 +1203,7 @@ enum LidLaunch {
 }
 
 #[cfg(target_os = "macos")]
-fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> Result<()> {
+fn start_lid_supervisor(p: &Parsed, charge_target: Option<i32>) -> Result<()> {
     let mut supervisor_detail = p.trigger_detail.clone();
     let mut charging_up = None;
     if let Some(target) = charge_target {
@@ -1240,7 +1226,7 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
     let mut prior = platform::read_disable_sleep()?;
     if prior == 0 {
         ensure_sudo_for_even_lid()?;
-        prior = prior_after_authentication(prior, platform::read_disable_sleep)?;
+        prior = platform::read_disable_sleep()?;
     }
     if launch_lifetime(p.timeout_sec, p.until_deadline, Utc::now()).is_none() {
         print_deadline_elapsed();
@@ -1248,14 +1234,7 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
     }
     session::write_pending_lid_recovery(prior)?;
 
-    match lid_enable_and_launch(
-        p,
-        mode,
-        &supervisor_detail,
-        charge_target,
-        charging_up,
-        prior,
-    ) {
+    match lid_enable_and_launch(p, &supervisor_detail, charge_target, charging_up, prior) {
         Ok(LidLaunch::Published(s)) => {
             print_start_confirmation(&s, None);
             Ok(())
@@ -1292,7 +1271,6 @@ fn start_lid_supervisor(p: &Parsed, mode: &str, charge_target: Option<i32>) -> R
 #[cfg(target_os = "macos")]
 fn lid_enable_and_launch(
     p: &Parsed,
-    _mode: &str,
     supervisor_detail: &str,
     charge_target: Option<i32>,
     charging_up: Option<bool>,
@@ -1659,25 +1637,104 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn completed_windows_condition_uses_the_matching_startup_message() {
-        let mut saved = Session {
-            trigger: "until-time".into(),
-            ends_at: Some(Utc::now() - Duration::seconds(1)),
+    fn timed_and_until_sessions_share_deadline_expiry() {
+        let now = Utc::now();
+        for trigger in ["timed", "until-time"] {
+            let saved = Session {
+                trigger: trigger.into(),
+                ends_at: Some(now),
+                ..Session::default()
+            };
+            assert!(session_deadline_elapsed(&saved, now));
+        }
+        let untimed = Session {
+            trigger: "until-charge".into(),
+            ends_at: Some(now),
             ..Session::default()
         };
-        assert_eq!(
-            windows_condition_completed(true, &saved, None).as_deref(),
-            Some("wake: requested end time passed during startup")
-        );
-        saved.even_lid = true;
-        assert_eq!(
-            windows_condition_completed(true, &saved, None).as_deref(),
-            Some("wake: requested end time passed before --even-lid became ready")
-        );
-        assert_eq!(
-            windows_condition_completed(false, &saved, None).as_deref(),
-            Some("wake: requested end time passed before --even-lid became ready")
-        );
+        assert!(!session_deadline_elapsed(&untimed, now));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn timed_guardian_command_carries_ends_at() {
+        let ends_at = Utc::now() + Duration::minutes(1);
+        let saved = Session {
+            trigger: "timed".into(),
+            ends_at: Some(ends_at),
+            ..Session::default()
+        };
+
+        let sysutil::GuardianMode::Startup(deadline) = startup_guardian_mode(&saved) else {
+            panic!("startup must use startup guardian mode");
+        };
+        assert_eq!(deadline, Some(ends_at));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deadline_backed_windows_condition_uses_the_matching_startup_message() {
+        for trigger in ["timed", "until-time"] {
+            let mut saved = Session {
+                trigger: trigger.into(),
+                ends_at: Some(Utc::now() - Duration::seconds(1)),
+                ..Session::default()
+            };
+            assert_eq!(
+                windows_condition_completed(false, &saved, None).as_deref(),
+                Some("wake: requested end time passed during startup")
+            );
+            saved.even_lid = true;
+            assert_eq!(
+                windows_condition_completed(false, &saved, None).as_deref(),
+                Some("wake: requested end time passed before --even-lid became ready")
+            );
+        }
+    }
+
+    #[test]
+    fn start_confirmation_output_covers_direct_charge_and_until_paths() {
+        for (trigger, detail) in [
+            ("indefinite", "indefinite"),
+            ("until-charge", "80% (was 60%, charging up)"),
+            ("until-time", "until 23:59"),
+        ] {
+            let session = Session {
+                pid: 42,
+                mode: "display+system".into(),
+                trigger: trigger.into(),
+                detail: detail.into(),
+                ..Session::default()
+            };
+            assert_eq!(
+                start_confirmation_lines(&session, Some("note: route note")),
+                [
+                    "wake: session active (pid 42)".to_string(),
+                    "  mode    : display+system".to_string(),
+                    format!("  trigger : {trigger} ({detail})"),
+                    "  started : -".to_string(),
+                    "  ends    : -".to_string(),
+                    "note: route note".to_string(),
+                ]
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_note_covers_direct_charge_and_until_paths() {
+        for trigger in ["indefinite", "until-charge", "until-time"] {
+            let session = Session {
+                trigger: trigger.into(),
+                ..Session::default()
+            };
+            assert_eq!(
+                start_confirmation_lines(&session, None)
+                    .last()
+                    .map(String::as_str),
+                Some("note: closing the lid still sleeps the mac unless you use --even-lid")
+            );
+        }
     }
 
     #[test]
@@ -1696,6 +1753,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parser_rejects_mixed_help_and_version_with_the_top_level_message() {
+        for values in [&["1h", "--help"][..], &["--no-display", "version"]] {
+            let error = parse_start_args(&args(values)).err().unwrap();
+            assert_eq!(error.message(), "help and version must be used alone");
+        }
+    }
+
+    #[test]
+    fn parser_consumes_help_and_version_as_while_app_values() {
+        for value in ["help", "version", "--help"] {
+            if let Err(error) = parse_start_args(&args(&["--while-app", value])) {
+                assert_ne!(error.message(), "help and version must be used alone");
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_routes_until_charge_with_even_lid() {
@@ -1706,23 +1780,16 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn charge_supervisor_launch_carries_the_preselected_scope_and_note() {
-        let explicit = charge_supervisor_launch(
-            80,
-            true,
-            "system-only",
-            true,
-            "sleep:handle-lid-switch",
-            None,
-        )
-        .unwrap();
+    fn charge_supervisor_launch_omits_mode_but_preserves_lid_intent_and_scope() {
+        let explicit =
+            charge_supervisor_launch(80, true, true, "sleep:handle-lid-switch", None).unwrap();
+        assert_eq!(explicit.command.len(), 6);
         assert_eq!(
             &explicit.command[1..],
             [
                 "__supervise_charge__",
                 "80",
                 "true",
-                "system-only",
                 "true",
                 "sleep:handle-lid-switch",
             ]
@@ -1731,47 +1798,52 @@ mod tests {
         let ordinary = charge_supervisor_launch(
             80,
             false,
-            "display+system",
             false,
-            "idle:sleep",
-            Some("note: inhibitor degraded to idle:sleep"),
+            "sleep:handle-lid-switch",
+            Some("note: best-effort inhibitor includes lid scope"),
         )
         .unwrap();
+        assert_eq!(ordinary.command.len(), 6);
         assert_eq!(
-            ordinary.command.last().map(String::as_str),
-            Some("idle:sleep")
+            &ordinary.command[1..],
+            [
+                "__supervise_charge__",
+                "80",
+                "false",
+                "false",
+                "sleep:handle-lid-switch",
+            ]
         );
         assert_eq!(
             ordinary.note.as_deref(),
-            Some("note: inhibitor degraded to idle:sleep")
+            Some("note: best-effort inhibitor includes lid scope")
         );
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn until_supervisor_command_carries_the_absolute_deadline_and_scope() {
+    fn until_supervisor_command_omits_mode_but_preserves_deadline_and_scope() {
         let deadline = DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
             .unwrap()
             .with_timezone(&Utc);
         let command = until_supervisor_command(
             deadline,
             false,
-            "display+system",
             "until 03:04",
-            true,
-            "idle:sleep",
+            false,
+            "sleep:handle-lid-switch",
         )
         .unwrap();
+        assert_eq!(command.len(), 7);
         assert_eq!(
             &command[1..],
             [
                 "__supervise_until__",
                 "2024-01-02T03:04:05+00:00",
                 "false",
-                "display+system",
                 "until 03:04",
-                "true",
-                "idle:sleep",
+                "false",
+                "sleep:handle-lid-switch",
             ]
         );
     }
@@ -1852,26 +1924,15 @@ mod tests {
     }
 
     #[test]
-    fn absolute_deadline_is_recomputed_at_the_owner_launch_point() {
+    fn launch_lifetime_preserves_exact_absolute_and_relative_ends() {
         let launch = DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
             .unwrap()
             .with_timezone(&Utc);
         let deadline = launch + Duration::seconds(5);
         let lifetime = launch_lifetime(None, Some(deadline), launch).unwrap();
-        assert_eq!(lifetime.timeout_sec, Some(5));
         assert_eq!(lifetime.started_at, launch);
         assert_eq!(lifetime.ends_at, Some(deadline));
         assert!(launch_lifetime(None, Some(deadline), deadline).is_none());
-        let fractional = launch_lifetime(
-            None,
-            Some(deadline),
-            deadline - Duration::milliseconds(4_100),
-        )
-        .unwrap();
-        assert_eq!(fractional.timeout_sec, Some(4));
-        let subsecond =
-            launch_lifetime(None, Some(deadline), deadline - Duration::milliseconds(100)).unwrap();
-        assert_eq!(subsecond.timeout_sec, Some(1));
         assert!(deadline_still_pending(
             deadline,
             deadline - Duration::milliseconds(1)
@@ -1879,7 +1940,7 @@ mod tests {
         assert!(!deadline_still_pending(deadline, deadline));
 
         let relative = launch_lifetime(Some(60), None, launch).unwrap();
-        assert_eq!(relative.timeout_sec, Some(60));
+        assert_eq!(relative.started_at, launch);
         assert_eq!(relative.ends_at, Some(launch + Duration::seconds(60)));
     }
 
@@ -1894,13 +1955,12 @@ mod tests {
     fn prior_enabled_sleep_is_not_a_wake_owned_transition() {
         assert!(sleep_restore_needed(0, 1));
         assert!(!sleep_restore_needed(1, 0));
-        assert!(sleep_restored(1, 0));
-        assert_eq!(
-            prior_after_authentication(0, || Ok(1)).unwrap(),
-            1,
-            "the post-sudo value decides transition ownership"
-        );
-        assert_eq!(prior_after_authentication(1, || Ok(0)).unwrap(), 1);
+        for (prior, current) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            assert_eq!(
+                sleep_restored(prior, current),
+                !sleep_restore_needed(prior, current)
+            );
+        }
     }
 
     #[test]

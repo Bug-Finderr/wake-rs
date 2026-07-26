@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BATTERY_FAILURES: u8 = 3;
 
+#[cfg(any(not(windows), test))]
 fn poll_interval(
     deadline: Option<chrono::DateTime<Utc>>,
     now: chrono::DateTime<Utc>,
@@ -31,31 +32,16 @@ pub struct BatteryStatus {
     pub neutral_state: Option<String>,
 }
 
-pub struct ChargePlan {
-    pub already_met: bool,
-    pub charging_up: bool,
-}
-
-impl ChargePlan {
-    fn already_met() -> Self {
-        Self {
-            already_met: true,
-            charging_up: false,
-        }
-    }
-
-    fn waiting(charging_up: bool) -> Self {
-        Self {
-            already_met: false,
-            charging_up,
-        }
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChargePlan {
+    AlreadyMet,
+    Wait(bool),
 }
 
 pub fn plan_charge(target: i32, status: &BatteryStatus) -> Result<ChargePlan> {
     if status.discharging {
         if status.percent == target {
-            return Ok(ChargePlan::already_met());
+            return Ok(ChargePlan::AlreadyMet);
         }
         if status.percent < target {
             return Err(AppError::usage(format!(
@@ -63,17 +49,17 @@ pub fn plan_charge(target: i32, status: &BatteryStatus) -> Result<ChargePlan> {
                 status.percent
             )));
         }
-        return Ok(ChargePlan::waiting(false));
+        return Ok(ChargePlan::Wait(false));
     }
     if status.charging {
         return Ok(if status.percent >= target {
-            ChargePlan::already_met()
+            ChargePlan::AlreadyMet
         } else {
-            ChargePlan::waiting(true)
+            ChargePlan::Wait(true)
         });
     }
     if status.percent == target {
-        return Ok(ChargePlan::already_met());
+        return Ok(ChargePlan::AlreadyMet);
     }
     if let Some(state) = &status.neutral_state {
         return Err(AppError::usage(format!(
@@ -98,14 +84,12 @@ pub enum ChargePreparation {
 
 pub fn prepare_charge(target: i32) -> Result<ChargePreparation> {
     let status = platform::read_battery()?;
-    let plan = plan_charge(target, &status)?;
-    Ok(if plan.already_met {
-        ChargePreparation::AlreadyMet(status.percent)
-    } else {
-        ChargePreparation::Wait(PreparedCharge {
+    Ok(match plan_charge(target, &status)? {
+        ChargePlan::AlreadyMet => ChargePreparation::AlreadyMet(status.percent),
+        ChargePlan::Wait(charging_up) => ChargePreparation::Wait(PreparedCharge {
             initial_percent: status.percent,
-            charging_up: plan.charging_up,
-        })
+            charging_up,
+        }),
     })
 }
 
@@ -181,35 +165,41 @@ mod unix {
         (None, Some(std::process::id()))
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    fn reject_macos_ordinary_even_lid(even_lid: bool) -> Result<()> {
+        if even_lid {
+            Err(AppError::fail(
+                "ordinary supervisor received unexpected lid authority",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     struct UntilArgs {
         deadline: chrono::DateTime<Utc>,
         no_display: bool,
-        mode: String,
         detail: String,
         even_lid: bool,
         inhibitor_scope: String,
     }
 
     fn parse_until_args(args: &[String]) -> Result<UntilArgs> {
-        if args.len() != 7 {
-            return Err(AppError::fail("until supervisor expects 6 arguments"));
+        if args.len() != 6 {
+            return Err(AppError::fail("until supervisor expects 5 arguments"));
         }
+        let deadline = session::parse_utc(&args[1], "until deadline")?;
         let no_display = session::parse_bool(&args[2], "no-display")?;
-        let expected_mode = if no_display {
-            "system-only"
-        } else {
-            "display+system"
-        };
-        if args[3] != expected_mode {
-            return Err(AppError::fail("until supervisor received an invalid mode"));
-        }
+        let detail = args[3].clone();
+        let even_lid = session::parse_bool(&args[4], "even-lid")?;
+        #[cfg(target_os = "macos")]
+        reject_macos_ordinary_even_lid(even_lid)?;
         Ok(UntilArgs {
-            deadline: session::parse_utc(&args[1], "until deadline")?,
+            deadline,
             no_display,
-            mode: args[3].clone(),
-            detail: args[4].clone(),
-            even_lid: session::parse_bool(&args[5], "even-lid")?,
-            inhibitor_scope: args[6].clone(),
+            detail,
+            even_lid,
+            inhibitor_scope: args[5].clone(),
         })
     }
 
@@ -234,7 +224,7 @@ mod unix {
                     "until supervisor received unexpected lid authority",
                 ));
             }
-            platform::keep_awake_command(args.no_display, false, child_timeout, child_wait_pid)?
+            platform::keep_awake_command(args.no_display, child_timeout, child_wait_pid)?
         };
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
@@ -246,7 +236,7 @@ mod unix {
         }
         let mut published = Session {
             pid: std::process::id(),
-            mode: args.mode,
+            mode: session::mode_for(args.no_display).into(),
             trigger: "until-time".into(),
             detail: args.detail,
             started_at: Some(now),
@@ -287,21 +277,24 @@ mod unix {
     struct ChargeArgs {
         target: i32,
         no_display: bool,
-        mode: String,
         even_lid: bool,
         inhibitor_scope: String,
     }
 
     fn parse_charge_args(args: &[String]) -> Result<ChargeArgs> {
-        if args.len() != 6 {
-            return Err(AppError::fail("charge supervisor expects 5 arguments"));
+        if args.len() != 5 {
+            return Err(AppError::fail("charge supervisor expects 4 arguments"));
         }
+        let target = parse_charge_target(&args[1])?;
+        let no_display = session::parse_bool(&args[2], "no-display")?;
+        let even_lid = session::parse_bool(&args[3], "even-lid")?;
+        #[cfg(target_os = "macos")]
+        reject_macos_ordinary_even_lid(even_lid)?;
         Ok(ChargeArgs {
-            target: parse_charge_target(&args[1])?,
-            no_display: session::parse_bool(&args[2], "no-display")?,
-            mode: args[3].clone(),
-            even_lid: session::parse_bool(&args[4], "even-lid")?,
-            inhibitor_scope: args[5].clone(),
+            target,
+            no_display,
+            even_lid,
+            inhibitor_scope: args[4].clone(),
         })
     }
 
@@ -331,19 +324,14 @@ mod unix {
                     "charge supervisor received an unexpected inhibitor scope",
                 ));
             }
-            platform::keep_awake_command(
-                args.no_display,
-                args.even_lid,
-                child_timeout,
-                child_wait_pid,
-            )?
+            platform::keep_awake_command(args.no_display, child_timeout, child_wait_pid)?
         };
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
 
         let mut session = Session {
             pid: std::process::id(),
-            mode: args.mode,
+            mode: session::mode_for(args.no_display).into(),
             trigger: "until-charge".into(),
             detail: charge_detail(args.target, &charge),
             started_at: Some(Utc::now()),
@@ -388,7 +376,7 @@ mod unix {
         if args.len() != 9 {
             return Err(AppError::fail("lid supervisor expects 8 arguments"));
         }
-        let prior_disable_sleep = parse_disable_sleep(&args[5])?;
+        let prior_disable_sleep = session::parse_disable_sleep(&args[5])?;
         let mut cleanup = LidCleanup {
             child: None,
             prior_disable_sleep,
@@ -429,8 +417,7 @@ mod unix {
             return Ok(());
         }
         let (child_timeout, child_wait_pid) = supervisor_inhibitor_lifetime();
-        let keep_awake =
-            platform::keep_awake_command(no_display, true, child_timeout, child_wait_pid)?;
+        let keep_awake = platform::keep_awake_command(no_display, child_timeout, child_wait_pid)?;
         let mut child = sysutil::spawn_detached(&keep_awake.cmd)?;
         sysutil::require_child_alive(&mut child, &keep_awake.cmd)?;
         cleanup.child = Some(child);
@@ -440,12 +427,7 @@ mod unix {
         }
         let mut session = Session {
             pid: std::process::id(),
-            mode: if no_display {
-                "system-only"
-            } else {
-                "display+system"
-            }
-            .into(),
+            mode: session::mode_for(no_display).into(),
             trigger,
             detail,
             started_at: Some(now),
@@ -535,14 +517,6 @@ mod unix {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn parse_disable_sleep(raw: &str) -> Result<i32> {
-        match session::parse_u32(raw, "priorDisableSleep")? {
-            value @ (0 | 1) => Ok(value as i32),
-            _ => Err(AppError::fail("priorDisableSleep must be 0 or 1")),
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -560,33 +534,103 @@ mod unix {
         }
 
         #[test]
-        fn charge_supervisor_protocol_parses_canonical_even_lid_and_scope() {
-            let explicit = parse_charge_args(&strings(&[
+        fn charge_supervisor_protocol_uses_exact_arity_without_mode() {
+            let parsed = parse_charge_args(&strings(&[
                 "__supervise_charge__",
                 "80",
                 "true",
-                "system-only",
+                "false",
+                "",
+            ]))
+            .unwrap();
+            assert_eq!(parsed.target, 80);
+            assert!(parsed.no_display);
+            assert!(!parsed.even_lid);
+            assert!(parsed.inhibitor_scope.is_empty());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_lid_inclusive_scope_does_not_imply_explicit_even_lid() {
+            let charge = parse_charge_args(&strings(&[
+                "__supervise_charge__",
+                "80",
+                "false",
+                "false",
+                "sleep:handle-lid-switch",
+            ]))
+            .unwrap();
+            assert!(!charge.even_lid);
+            assert_eq!(charge.inhibitor_scope, "sleep:handle-lid-switch");
+
+            let until = parse_until_args(&strings(&[
+                "__supervise_until__",
+                "2024-01-02T03:04:05+00:00",
+                "false",
+                "until 03:04",
+                "false",
+                "sleep:handle-lid-switch",
+            ]))
+            .unwrap();
+            assert!(!until.even_lid);
+            assert_eq!(until.inhibitor_scope, "sleep:handle-lid-switch");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_protocol_preserves_explicit_even_lid() {
+            let charge = parse_charge_args(&strings(&[
+                "__supervise_charge__",
+                "80",
+                "true",
                 "true",
                 "sleep:handle-lid-switch",
             ]))
             .unwrap();
-            assert_eq!(explicit.target, 80);
-            assert!(explicit.no_display);
-            assert_eq!(explicit.mode, "system-only");
-            assert!(explicit.even_lid);
-            assert_eq!(explicit.inhibitor_scope, "sleep:handle-lid-switch");
+            assert!(charge.even_lid);
 
-            let ordinary = parse_charge_args(&strings(&[
-                "__supervise_charge__",
-                "80",
-                "false",
-                "display+system",
-                "false",
-                "idle:sleep",
+            let until = parse_until_args(&strings(&[
+                "__supervise_until__",
+                "2024-01-02T03:04:05+00:00",
+                "true",
+                "until 03:04",
+                "true",
+                "sleep:handle-lid-switch",
             ]))
             .unwrap();
-            assert!(!ordinary.even_lid);
-            assert_eq!(ordinary.inhibitor_scope, "idle:sleep");
+            assert!(until.even_lid);
+        }
+
+        #[test]
+        fn macos_ordinary_authority_policy_rejects_even_lid() {
+            assert!(reject_macos_ordinary_even_lid(true).is_err());
+            assert!(reject_macos_ordinary_even_lid(false).is_ok());
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn macos_ordinary_hidden_protocols_reject_even_lid() {
+            assert!(
+                parse_charge_args(&strings(&[
+                    "__supervise_charge__",
+                    "80",
+                    "false",
+                    "true",
+                    "",
+                ]))
+                .is_err()
+            );
+            assert!(
+                parse_until_args(&strings(&[
+                    "__supervise_until__",
+                    "2024-01-02T03:04:05+00:00",
+                    "false",
+                    "until 03:04",
+                    "true",
+                    "",
+                ]))
+                .is_err()
+            );
         }
 
         #[test]
@@ -595,7 +639,6 @@ mod unix {
                 "__supervise_until__",
                 "2024-01-02T03:04:05+00:00",
                 "false",
-                "display+system",
                 "until 03:04",
                 "false",
                 "idle:sleep",
@@ -603,7 +646,6 @@ mod unix {
             .unwrap();
             assert_eq!(parsed.deadline.to_rfc3339(), "2024-01-02T03:04:05+00:00");
             assert!(!parsed.no_display);
-            assert_eq!(parsed.mode, "display+system");
             assert_eq!(parsed.detail, "until 03:04");
             assert!(!parsed.even_lid);
             assert_eq!(parsed.inhibitor_scope, "idle:sleep");
@@ -612,44 +654,49 @@ mod unix {
                 "__supervise_until__",
                 "not-a-deadline",
                 "false",
-                "display+system",
                 "until 03:04",
                 "false",
                 "idle:sleep",
             ]);
             assert!(parse_until_args(&malformed).is_err());
+
+            let missing = strings(&[
+                "__supervise_until__",
+                "2024-01-02T03:04:05+00:00",
+                "false",
+                "until 03:04",
+                "false",
+            ]);
+            assert!(parse_until_args(&missing).is_err());
+
+            let extra = strings(&[
+                "__supervise_until__",
+                "2024-01-02T03:04:05+00:00",
+                "false",
+                "until 03:04",
+                "false",
+                "idle:sleep",
+                "extra",
+            ]);
+            assert!(parse_until_args(&extra).is_err());
         }
 
         #[test]
         fn charge_supervisor_protocol_rejects_wrong_arity_or_malformed_even_lid() {
-            let missing = strings(&[
-                "__supervise_charge__",
-                "80",
-                "false",
-                "display+system",
-                "false",
-            ]);
+            let missing = strings(&["__supervise_charge__", "80", "false", "false"]);
             assert!(parse_charge_args(&missing).is_err());
 
             let extra = strings(&[
                 "__supervise_charge__",
                 "80",
                 "false",
-                "display+system",
                 "false",
                 "idle:sleep",
                 "extra",
             ]);
             assert!(parse_charge_args(&extra).is_err());
 
-            let malformed = strings(&[
-                "__supervise_charge__",
-                "80",
-                "false",
-                "display+system",
-                "True",
-                "idle:sleep",
-            ]);
+            let malformed = strings(&["__supervise_charge__", "80", "false", "True", "idle:sleep"]);
             assert!(parse_charge_args(&malformed).is_err());
         }
     }
@@ -668,36 +715,57 @@ mod windows {
 
     struct WorkerSpec {
         no_display: bool,
-        timeout: Option<Duration>,
         target: Option<sysutil::ProcessHandle>,
         charge: Option<(i32, bool)>,
-        publish: bool,
         session: Session,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum WorkerWait {
+        Forever,
+        Deadline(chrono::DateTime<Utc>),
+        Process,
+        Charge,
+    }
+
     impl WorkerSpec {
-        fn lifetime_elapsed(&self, started: Instant) -> bool {
-            if self.session.trigger == "until-time" {
-                self.session
+        fn deadline_elapsed(&self, now: chrono::DateTime<Utc>) -> bool {
+            crate::commands::session_deadline_elapsed(&self.session, now)
+        }
+
+        fn wait_strategy(&self) -> Result<WorkerWait> {
+            match self.session.trigger.as_str() {
+                "indefinite" => Ok(WorkerWait::Forever),
+                "timed" => self
+                    .session
                     .ends_at
-                    .is_some_and(|deadline| Utc::now() >= deadline)
-            } else {
-                self.timeout
-                    .is_some_and(|timeout| started.elapsed() >= timeout)
+                    .map(WorkerWait::Deadline)
+                    .ok_or_else(|| AppError::fail("timed Windows worker is missing its deadline")),
+                "until-time" => self
+                    .session
+                    .ends_at
+                    .map(WorkerWait::Deadline)
+                    .ok_or_else(|| {
+                        AppError::fail("until-time Windows worker is missing its deadline")
+                    }),
+                "while-pid" | "while-app" if self.target.is_some() => Ok(WorkerWait::Process),
+                "until-charge" if self.charge.is_some() => Ok(WorkerWait::Charge),
+                "while-pid" | "while-app" => Err(AppError::fail(
+                    "process-bound Windows worker is missing its target",
+                )),
+                "until-charge" => Err(AppError::fail(
+                    "charge-bound Windows worker is missing its target",
+                )),
+                _ => Err(AppError::fail("Windows worker has an invalid trigger")),
             }
         }
     }
 
     pub fn worker_command(
         session: &Session,
-        timeout_sec: Option<i64>,
         target: Option<(u32, u64)>,
         charge: Option<(i32, bool)>,
-        publish: bool,
     ) -> Result<Vec<String>> {
-        if timeout_sec.is_some_and(|timeout| timeout <= 0) {
-            return Err(AppError::fail("worker timeout must be positive"));
-        }
         if !matches!(session.mode.as_str(), "system-only" | "display+system") {
             return Err(AppError::fail("invalid worker mode"));
         }
@@ -711,9 +779,6 @@ mod windows {
             sysutil::self_exe()?,
             "__worker_windows__".into(),
             session.mode.clone(),
-            timeout_sec
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
             target_pid,
             target_start,
             charge_target,
@@ -728,40 +793,32 @@ mod windows {
                 .ends_at
                 .map(|time| time.to_rfc3339())
                 .unwrap_or_default(),
-            publish.to_string(),
         ])
     }
 
     pub fn run_worker(args: &[String]) -> Result<()> {
         let spec = parse_worker_args(args)?;
         let _execution_state = platform::ExecutionStateGuard::acquire(spec.no_display)?;
-        if spec.lifetime_elapsed(Instant::now()) {
+        if spec.deadline_elapsed(Utc::now()) {
             return Ok(());
         }
-        if spec.publish {
-            session::write(&spec.session)?;
-        }
+        session::write(&spec.session)?;
         run_worker_lifetime(&spec)?;
-        if spec.publish {
-            delete_owned_worker_state(&spec.session);
-        }
+        delete_owned_worker_state(&spec.session);
         Ok(())
     }
 
     fn parse_worker_args(args: &[String]) -> Result<WorkerSpec> {
-        if args.len() != 12 {
-            return Err(AppError::fail(
-                "Windows worker expects exactly 11 arguments",
-            ));
+        if args.len() != 10 {
+            return Err(AppError::fail("Windows worker expects exactly 9 arguments"));
         }
         let no_display = match args[1].as_str() {
             "system-only" => true,
             "display+system" => false,
             _ => return Err(AppError::fail("Windows worker has an invalid mode")),
         };
-        let timeout = optional_positive(&args[2], "timeout")?.map(Duration::from_secs);
-        let target_pid = optional_positive(&args[3], "target pid")?;
-        let target_start = optional_positive(&args[4], "target creation time")?;
+        let target_pid = optional_positive(&args[2], "target pid")?;
+        let target_start = optional_positive(&args[3], "target creation time")?;
         if target_pid.is_some() != target_start.is_some() {
             return Err(AppError::fail(
                 "Windows worker target identity is incomplete",
@@ -774,12 +831,12 @@ mod windows {
             },
             None => None,
         };
-        let charge_target = if args[5].is_empty() {
+        let charge_target = if args[4].is_empty() {
             None
         } else {
-            Some(parse_charge_target(&args[5])?)
+            Some(parse_charge_target(&args[4])?)
         };
-        let charge_up = match args[6].as_str() {
+        let charge_up = match args[5].as_str() {
             "" => None,
             "up" => Some(true),
             "down" => Some(false),
@@ -795,27 +852,25 @@ mod windows {
             ));
         }
         let identity = sysutil::current_identity()?;
-        let publish = session::parse_bool(&args[11], "publish")?;
         Ok(WorkerSpec {
             no_display,
-            timeout,
             target,
             charge: charge_target.zip(charge_up),
-            publish,
             session: Session {
                 pid: std::process::id(),
                 mode: args[1].clone(),
-                trigger: args[7].clone(),
-                detail: args[8].clone(),
-                started_at: Some(session::parse_utc(&args[9], "start time")?),
-                ends_at: if args[10].is_empty() {
+                trigger: args[6].clone(),
+                detail: args[7].clone(),
+                started_at: Some(session::parse_utc(&args[8], "start time")?),
+                ends_at: if args[9].is_empty() {
                     None
                 } else {
-                    Some(session::parse_utc(&args[10], "end time")?)
+                    Some(session::parse_utc(&args[9], "end time")?)
                 },
                 process_start: identity.start,
                 process_command: identity.command,
-                even_lid: !publish,
+                // Only guardian promotion can grant even-lid authority.
+                even_lid: false,
                 guardian_pid: 0,
                 guardian_start: 0,
                 original_scheme: String::new(),
@@ -826,40 +881,33 @@ mod windows {
     }
 
     fn run_worker_lifetime(spec: &WorkerSpec) -> Result<()> {
-        let start = Instant::now();
-        let mut last_battery = Instant::now();
-        let mut failures = 0;
-        loop {
-            if spec.lifetime_elapsed(start) {
-                break;
-            }
-            if let Some(target) = &spec.target
-                && !target.is_running()?
-            {
-                break;
-            }
-            if let Some((target, up)) = spec.charge
-                && last_battery.elapsed() >= POLL_INTERVAL
-            {
-                last_battery = Instant::now();
-                match poll_battery(target, up, &mut failures) {
-                    BatteryPoll::Continue => {}
-                    BatteryPoll::Reached => break,
-                    BatteryPoll::Failed => {
-                        return Err(AppError::fail("battery status remained unavailable"));
+        match spec.wait_strategy()? {
+            WorkerWait::Forever => loop {
+                // Only process termination ends an indefinite worker; park may wake spuriously.
+                std::thread::park();
+            },
+            WorkerWait::Deadline(deadline) => sysutil::wait_until(deadline)?,
+            WorkerWait::Process => spec
+                .target
+                .as_ref()
+                .expect("process wait strategy requires a target")
+                .wait_forever()?,
+            WorkerWait::Charge => {
+                let (target, up) = spec
+                    .charge
+                    .expect("charge wait strategy requires a battery target");
+                let mut failures = 0;
+                loop {
+                    sleep(POLL_INTERVAL);
+                    match poll_battery(target, up, &mut failures) {
+                        BatteryPoll::Continue => {}
+                        BatteryPoll::Reached => break,
+                        BatteryPoll::Failed => {
+                            return Err(AppError::fail("battery status remained unavailable"));
+                        }
                     }
                 }
             }
-            let deadline = if spec.session.trigger == "until-time" {
-                spec.session.ends_at
-            } else {
-                None
-            };
-            let Some(interval) = poll_interval(deadline, Utc::now(), Duration::from_millis(250))
-            else {
-                break;
-            };
-            sleep(interval);
         }
         Ok(())
     }
@@ -911,9 +959,7 @@ mod windows {
         }
         session::write_at(&args.state_path, &authority)?;
         platform::enable_lid(&snapshot)?;
-        while worker.is_running()? {
-            sleep(Duration::from_millis(250));
-        }
+        worker.wait_forever()?;
         platform::restore_lid_snapshot(&snapshot)
     }
 
@@ -937,13 +983,15 @@ mod windows {
         guardian: (u32, u64),
         worker_identity: &sysutil::Identity,
     ) -> Result<Session> {
-        let expected_deadline = if saved.trigger == "until-time" {
+        let requires_deadline = crate::commands::session_uses_deadline(&saved);
+        let expected_deadline = if requires_deadline {
             saved.ends_at
         } else {
             None
         };
         if !saved.owned_non_lid_by(args.worker_pid, args.worker_start)
             || !saved.matches_identity(worker_identity)
+            || requires_deadline && expected_deadline.is_none()
             || args.deadline != expected_deadline
         {
             return Err(AppError::fail(
@@ -1031,11 +1079,10 @@ mod windows {
         }
 
         #[test]
-        fn worker_argument_parser_is_strict() {
+        fn worker_argument_parser_is_strict_without_publish() {
             let valid = strings(&[
                 "__worker_windows__",
                 "system-only",
-                "60",
                 "",
                 "",
                 "80",
@@ -1044,32 +1091,142 @@ mod windows {
                 "80%",
                 "2024-01-02T03:04:05+00:00",
                 "",
-                "true",
             ]);
-            assert!(parse_worker_args(&valid).unwrap().publish);
-            assert!(parse_worker_args(&valid[..11]).is_err());
+            assert!(!parse_worker_args(&valid).unwrap().session.even_lid);
+            assert!(parse_worker_args(&valid[..9]).is_err());
+            let mut extra = valid.clone();
+            extra.push("true".into());
+            assert!(parse_worker_args(&extra).is_err());
             let mut incomplete = valid;
-            incomplete[3] = "42".into();
+            incomplete[2] = "42".into();
             assert!(parse_worker_args(&incomplete).is_err());
         }
 
         #[test]
-        fn until_worker_uses_the_absolute_end_without_changing_relative_timeouts() {
+        fn worker_command_omits_timeout_and_publish_authority() {
+            let session = Session {
+                mode: "system-only".into(),
+                trigger: "until-charge".into(),
+                detail: "80%".into(),
+                started_at: Some(
+                    session::parse_utc("2024-01-02T03:04:05+00:00", "start time").unwrap(),
+                ),
+                ..Session::default()
+            };
+            let command = worker_command(&session, None, Some((80, true))).unwrap();
+            assert_eq!(command.len(), 11);
+            assert_eq!(
+                &command[1..],
+                [
+                    "__worker_windows__",
+                    "system-only",
+                    "",
+                    "",
+                    "80",
+                    "up",
+                    "until-charge",
+                    "80%",
+                    "2024-01-02T03:04:05+00:00",
+                    "",
+                ]
+            );
+            assert!(!parse_worker_args(&command[1..]).unwrap().session.even_lid);
+        }
+
+        #[test]
+        fn timed_worker_command_round_trips_its_exact_absolute_end() {
+            let started_at = session::parse_utc("2024-01-02T03:04:05+00:00", "start time").unwrap();
+            let ends_at = session::parse_utc("2024-01-02T03:05:05.250+00:00", "end time").unwrap();
+            let session = Session {
+                mode: "display+system".into(),
+                trigger: "timed".into(),
+                detail: "60s".into(),
+                started_at: Some(started_at),
+                ends_at: Some(ends_at),
+                ..Session::default()
+            };
+
+            let command = worker_command(&session, None, None).unwrap();
+            let parsed = parse_worker_args(&command[1..]).unwrap();
+
+            assert_eq!(parsed.session.ends_at, Some(ends_at));
+            assert_eq!(
+                parsed.wait_strategy().unwrap(),
+                WorkerWait::Deadline(ends_at)
+            );
+        }
+
+        #[test]
+        fn deadline_workers_skip_publication_after_their_exact_end() {
+            let now = Utc::now();
             let mut spec = WorkerSpec {
                 no_display: false,
-                timeout: Some(Duration::from_secs(3_600)),
                 target: None,
                 charge: None,
-                publish: true,
                 session: Session {
                     trigger: "until-time".into(),
-                    ends_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+                    ends_at: Some(now - chrono::Duration::seconds(1)),
                     ..Session::default()
                 },
             };
-            assert!(spec.lifetime_elapsed(Instant::now()));
+            assert!(spec.deadline_elapsed(now));
             spec.session.trigger = "timed".into();
-            assert!(!spec.lifetime_elapsed(Instant::now()));
+            assert!(spec.deadline_elapsed(now));
+        }
+
+        #[test]
+        fn non_charge_workers_choose_one_blocking_wait_strategy() {
+            let spec = |trigger: &str| WorkerSpec {
+                no_display: false,
+                target: None,
+                charge: None,
+                session: Session {
+                    trigger: trigger.into(),
+                    ..Session::default()
+                },
+            };
+
+            assert_eq!(
+                spec("indefinite").wait_strategy().unwrap(),
+                WorkerWait::Forever
+            );
+
+            let deadline =
+                session::parse_utc("2024-01-02T03:04:06.250+00:00", "test time").unwrap();
+            let mut timed = spec("timed");
+            timed.session.ends_at = Some(deadline);
+            assert_eq!(
+                timed.wait_strategy().unwrap(),
+                WorkerWait::Deadline(deadline)
+            );
+
+            let mut until = spec("until-time");
+            until.session.ends_at = Some(deadline);
+            assert_eq!(
+                until.wait_strategy().unwrap(),
+                WorkerWait::Deadline(deadline)
+            );
+
+            for trigger in ["while-pid", "while-app"] {
+                let mut process = spec(trigger);
+                process.target = Some(sysutil::open_process_for_wait(std::process::id()).unwrap());
+                assert_eq!(process.wait_strategy().unwrap(), WorkerWait::Process);
+            }
+        }
+
+        #[test]
+        fn charge_worker_is_the_only_periodic_strategy() {
+            let charge = WorkerSpec {
+                no_display: false,
+                target: None,
+                charge: Some((80, true)),
+                session: Session {
+                    trigger: "until-charge".into(),
+                    ..Session::default()
+                },
+            };
+
+            assert_eq!(charge.wait_strategy().unwrap(), WorkerWait::Charge);
         }
 
         #[test]
@@ -1096,17 +1253,21 @@ mod windows {
         }
 
         #[test]
-        fn startup_guardian_checks_the_deadline_at_the_transition() {
-            let now = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
+        fn startup_guardian_rejects_elapsed_timed_deadline() {
+            let timed_deadline = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
                 .unwrap()
                 .with_timezone(&Utc);
             assert!(startup_guardian_should_enable(
-                Some(now + chrono::Duration::seconds(1)),
-                now,
+                Some(timed_deadline),
+                timed_deadline - chrono::Duration::milliseconds(1),
                 true,
             ));
-            assert!(!startup_guardian_should_enable(Some(now), now, true));
-            assert!(!startup_guardian_should_enable(None, now, false));
+            assert!(!startup_guardian_should_enable(
+                Some(timed_deadline),
+                timed_deadline,
+                true,
+            ));
+            assert!(!startup_guardian_should_enable(None, timed_deadline, false));
         }
 
         #[test]
@@ -1151,6 +1312,54 @@ mod windows {
                 ),
                 (args.scheme.as_str(), 1, 2)
             );
+        }
+
+        #[test]
+        fn timed_startup_guardian_requires_matching_deadline() {
+            let deadline = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05+00:00")
+                .unwrap()
+                .with_timezone(&Utc);
+            let identity = sysutil::Identity {
+                start: 9,
+                command: "C:\\tools\\wake.exe".into(),
+            };
+            let mut args = GuardianArgs {
+                worker_pid: 7,
+                worker_start: 9,
+                scheme: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+                ac: 1,
+                dc: 2,
+                restore_without_worker: false,
+                deadline: Some(deadline),
+                state_path: PathBuf::from("C:\\state\\session.properties"),
+            };
+            let mut saved = Session {
+                pid: 7,
+                mode: "display+system".into(),
+                trigger: "timed".into(),
+                detail: "60s".into(),
+                started_at: Some(deadline - chrono::Duration::minutes(1)),
+                ends_at: Some(deadline),
+                process_start: 9,
+                process_command: identity.command.clone(),
+                ..Session::default()
+            };
+
+            assert!(
+                promote_startup_guardian_authority(saved.clone(), &args, (11, 13), &identity,)
+                    .is_ok()
+            );
+
+            saved.ends_at = None;
+            args.deadline = None;
+            assert!(
+                promote_startup_guardian_authority(saved.clone(), &args, (11, 13), &identity,)
+                    .is_err()
+            );
+
+            saved.ends_at = Some(deadline);
+            args.deadline = Some(deadline + chrono::Duration::seconds(1));
+            assert!(promote_startup_guardian_authority(saved, &args, (11, 13), &identity).is_err());
         }
 
         #[test]
@@ -1237,14 +1446,13 @@ mod tests {
     #[test]
     fn charge_plan_table() {
         for (battery, expected) in [
-            (status(80, false, true, None), (true, false)),
-            (status(90, false, true, None), (false, false)),
-            (status(80, true, false, None), (true, false)),
-            (status(60, true, false, None), (false, true)),
-            (status(80, false, false, None), (true, false)),
+            (status(80, false, true, None), ChargePlan::AlreadyMet),
+            (status(90, false, true, None), ChargePlan::Wait(false)),
+            (status(80, true, false, None), ChargePlan::AlreadyMet),
+            (status(60, true, false, None), ChargePlan::Wait(true)),
+            (status(80, false, false, None), ChargePlan::AlreadyMet),
         ] {
-            let plan = plan_charge(80, &battery).unwrap();
-            assert_eq!((plan.already_met, plan.charging_up), expected);
+            assert_eq!(plan_charge(80, &battery).unwrap(), expected);
         }
     }
 
@@ -1257,6 +1465,17 @@ mod tests {
         ] {
             assert!(plan_charge(80, &battery).is_err());
         }
+    }
+
+    #[test]
+    fn charge_stops_after_bounded_consecutive_battery_failures() {
+        let error = AppError::fail("battery unavailable");
+        let mut failures = 0;
+
+        assert!(!battery_failures_exhausted(&mut failures, &error));
+        assert!(!battery_failures_exhausted(&mut failures, &error));
+        assert!(battery_failures_exhausted(&mut failures, &error));
+        assert_eq!(failures, MAX_BATTERY_FAILURES);
     }
 
     #[test]

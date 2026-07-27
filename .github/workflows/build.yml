@@ -180,14 +180,23 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: dist
+      - name: Read verified tag notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" \
+            --jq 'select(.object.type == "tag") | .object.sha')"
+          test -n "$tag_sha"
+          gh api "repos/$GH_REPO/git/tags/$tag_sha" \
+            --jq 'select(.verification.verified == true) | .verification.payload' \
+            | sed '1,/^$/d' > release-notes.md
+          test -s release-notes.md
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*/* --verify-tag --title "$GITHUB_REF_NAME" --notes-from-tag
+        run: gh release create "$GITHUB_REF_NAME" dist/*/* --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-notes.md

@@ -1090,6 +1090,9 @@ fn exact_worker(saved: &Session, terminate: bool) -> Result<Option<sysutil::Proc
 
 #[cfg(windows)]
 fn finish_or_recover_lid(saved: &Session) -> Result<()> {
+    if lid_restored(saved)? {
+        return session::delete_state_file();
+    }
     let snapshot = platform::LidSnapshot {
         scheme: platform::parse_guid(&saved.original_scheme)?,
         ac: saved.original_ac,

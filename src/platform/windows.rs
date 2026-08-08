@@ -391,10 +391,14 @@ pub fn lid_health(active_scheme_matches: bool, values: (u32, u32)) -> LidHealth 
 }
 
 fn power_error(action: &str, code: u32) -> AppError {
-    let hint = if code == ERROR_ACCESS_DENIED {
-        "; power settings are restricted on this device; run wake from an elevated terminal if you are authorized"
-    } else {
-        ""
+    let hint = match code {
+        ERROR_ACCESS_DENIED => {
+            "; power settings are restricted on this device; run wake from an elevated terminal if you are authorized"
+        }
+        ERROR_ACCESS_DISABLED_BY_POLICY => {
+            "; the setting is managed by group policy on this device"
+        }
+        _ => "",
     };
     AppError::fail(format!("could not {action} (error {code}){hint}"))
 }
@@ -550,7 +554,10 @@ mod tests {
         use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
         let denied = power_error("write the AC lid action", ERROR_ACCESS_DENIED);
         assert!(denied.message().contains("restricted"));
+        let policy = power_error("write the AC lid action", ERROR_ACCESS_DISABLED_BY_POLICY);
+        assert!(policy.message().contains("group policy"));
         let generic = power_error("write the AC lid action", 87);
         assert!(!generic.message().contains("restricted"));
+        assert!(!generic.message().contains("group policy"));
     }
 }

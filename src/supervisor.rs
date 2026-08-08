@@ -4,7 +4,9 @@ use crate::session::{self, Session};
 use crate::sysutil;
 use chrono::Utc;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(windows))]
+use std::time::Instant;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BATTERY_FAILURES: u8 = 3;
@@ -928,7 +930,6 @@ mod windows {
         scheme: String,
         ac: u32,
         dc: u32,
-        restore_without_worker: bool,
         deadline: Option<chrono::DateTime<Utc>>,
         state_path: PathBuf,
     }
@@ -941,10 +942,6 @@ mod windows {
             ac: args.ac,
             dc: args.dc,
         };
-        if args.restore_without_worker {
-            wait_for_recovery_authorization(&args, guardian)?;
-            return platform::restore_lid_snapshot(&snapshot);
-        }
         let Some(worker) = sysutil::open_exact_process(args.worker_pid, args.worker_start, false)?
         else {
             return Ok(());
@@ -1015,46 +1012,20 @@ mod windows {
         worker_running && deadline.is_none_or(|deadline| now < deadline)
     }
 
-    fn wait_for_recovery_authorization(args: &GuardianArgs, guardian: (u32, u64)) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            if let Some(session::SavedState::Valid(saved)) =
-                session::read_saved_at(&args.state_path)
-                && saved.matches_lid_authority(
-                    (args.worker_pid, args.worker_start),
-                    guardian,
-                    (&args.scheme, args.ac, args.dc),
-                )
-            {
-                return Ok(());
-            }
-            sleep(Duration::from_millis(100));
-        }
-        Err(AppError::fail(
-            "guardian authorization state did not appear",
-        ))
-    }
-
     fn parse_guardian_args(args: &[String]) -> Result<GuardianArgs> {
-        if args.len() != 9 {
+        if args.len() != 8 {
             return Err(AppError::fail(
-                "Windows guardian expects eight immutable arguments",
+                "Windows guardian expects seven immutable arguments",
             ));
         }
         let scheme = args[3].clone();
         platform::parse_guid(&scheme)?;
-        let restore_without_worker = session::parse_bool(&args[6], "restore-without-worker")?;
-        let deadline = if args[7].is_empty() {
+        let deadline = if args[6].is_empty() {
             None
         } else {
-            Some(session::parse_utc(&args[7], "guardian deadline")?)
+            Some(session::parse_utc(&args[6], "guardian deadline")?)
         };
-        if restore_without_worker && deadline.is_some() {
-            return Err(AppError::fail(
-                "recovery guardian received an unexpected deadline",
-            ));
-        }
-        let state_path = PathBuf::from(&args[8]);
+        let state_path = PathBuf::from(&args[7]);
         if !state_path.is_absolute() {
             return Err(AppError::fail("guardian state path must be absolute"));
         }
@@ -1064,7 +1035,6 @@ mod windows {
             scheme,
             ac: session::parse_u32(&args[4], "original AC value")?,
             dc: session::parse_u32(&args[5], "original DC value")?,
-            restore_without_worker,
             deadline,
             state_path,
         })
@@ -1230,26 +1200,24 @@ mod windows {
         }
 
         #[test]
-        fn guardian_protocol_requires_explicit_dead_worker_authority() {
-            for restore_without_worker in ["false", "true"] {
-                let args = strings(&[
-                    "__guard_windows__",
-                    "7",
-                    "9",
-                    "381b4222-f694-41f0-9685-ff5bb260df2e",
-                    "1",
-                    "2",
-                    restore_without_worker,
-                    "",
-                    "C:\\state\\session.properties",
-                ]);
-                let parsed = parse_guardian_args(&args).unwrap();
-                assert_eq!(
-                    parsed.restore_without_worker,
-                    restore_without_worker == "true"
-                );
-                assert!(parsed.deadline.is_none());
-            }
+        fn guardian_parser_takes_exactly_seven_immutable_arguments() {
+            let valid = strings(&[
+                "__guard_windows__",
+                "7",
+                "9",
+                "381b4222-f694-41f0-9685-ff5bb260df2e",
+                "1",
+                "2",
+                "",
+                "C:\\state\\session.properties",
+            ]);
+            let parsed = parse_guardian_args(&valid).unwrap();
+            assert!(parsed.deadline.is_none());
+
+            let mut legacy = valid.clone();
+            legacy.insert(6, "true".into());
+            assert!(parse_guardian_args(&legacy).is_err());
+            assert!(parse_guardian_args(&valid[..7]).is_err());
         }
 
         #[test]
@@ -1285,7 +1253,6 @@ mod windows {
                 scheme: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
                 ac: 1,
                 dc: 2,
-                restore_without_worker: false,
                 deadline: Some(deadline),
                 state_path: PathBuf::from("C:\\state\\session.properties"),
             };
@@ -1329,7 +1296,6 @@ mod windows {
                 scheme: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
                 ac: 1,
                 dc: 2,
-                restore_without_worker: false,
                 deadline: Some(deadline),
                 state_path: PathBuf::from("C:\\state\\session.properties"),
             };
@@ -1370,7 +1336,6 @@ mod windows {
                 scheme: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
                 ac: 1,
                 dc: 2,
-                restore_without_worker: false,
                 deadline: None,
                 state_path: PathBuf::from("C:\\state\\session.properties"),
             };

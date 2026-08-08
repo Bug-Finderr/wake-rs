@@ -675,12 +675,12 @@ pub(crate) fn session_deadline_elapsed(saved: &Session, now: DateTime<Utc>) -> b
 }
 
 #[cfg(windows)]
-fn startup_guardian_mode(saved: &Session) -> sysutil::GuardianMode {
-    sysutil::GuardianMode::Startup(if session_uses_deadline(saved) {
+fn startup_guardian_deadline(saved: &Session) -> Option<DateTime<Utc>> {
+    if session_uses_deadline(saved) {
         saved.ends_at
     } else {
         None
-    })
+    }
 }
 
 #[cfg(windows)]
@@ -766,13 +766,13 @@ fn start_windows(mut parsed: Parsed) -> Result<()> {
 
     let snapshot = snapshot.expect("even-lid snapshot was captured");
     let scheme = platform::format_guid(&snapshot.scheme);
-    let guardian = match sysutil::spawn_elevated_guardian(
+    let guardian = match sysutil::spawn_guardian(
         saved.pid,
         saved.process_start,
         &scheme,
         snapshot.ac,
         snapshot.dc,
-        startup_guardian_mode(&saved),
+        startup_guardian_deadline(&saved),
         &state_path,
     ) {
         Ok(guardian) => guardian,
@@ -915,7 +915,7 @@ fn wait_for_lid_ready(
             return Err(AppError::fail("worker exited during even-lid startup"));
         }
         if !guardian.is_running()? {
-            return Err(AppError::fail("elevated guardian exited before readiness"));
+            return Err(AppError::fail("guardian exited before readiness"));
         }
         if let Some(session::SavedState::Valid(saved)) = session::read_saved_for_recovery() {
             let health = platform::lid_health(
@@ -992,7 +992,7 @@ fn stop_windows() -> Result<()> {
         WindowsState::BrokenGuardian { saved, worker } => {
             worker.terminate_and_wait(StdDuration::from_secs(6))?;
             Err(AppError::fail(format!(
-                "guardian for worker {} is not running; the exact worker was stopped, but recovery state was retained at {}; run 'wake stop' again to start elevated recovery",
+                "guardian for worker {} is not running; the exact worker was stopped, but recovery state was retained at {}; run 'wake stop' again to start recovery",
                 saved.pid,
                 session::state_file().display()
             )))
@@ -1090,35 +1090,15 @@ fn exact_worker(saved: &Session, terminate: bool) -> Result<Option<sysutil::Proc
 
 #[cfg(windows)]
 fn finish_or_recover_lid(saved: &Session) -> Result<()> {
+    if lid_restored(saved)? {
+        return session::delete_state_file();
+    }
     let snapshot = platform::LidSnapshot {
         scheme: platform::parse_guid(&saved.original_scheme)?,
         ac: saved.original_ac,
         dc: saved.original_dc,
     };
-    if platform::restore_lid_snapshot(&snapshot).is_ok() {
-        return session::delete_state_file();
-    }
-    recover_even_lid_windows(saved)
-}
-
-#[cfg(windows)]
-fn recover_even_lid_windows(saved: &Session) -> Result<()> {
-    let state_path = session::state_file();
-    let guardian = sysutil::spawn_elevated_guardian(
-        saved.pid,
-        saved.process_start,
-        &saved.original_scheme,
-        saved.original_ac,
-        saved.original_dc,
-        sysutil::GuardianMode::Recovery,
-        &state_path,
-    )?;
-    let mut authorized = saved.clone();
-    authorized.guardian_pid = guardian.pid();
-    authorized.guardian_start = guardian.identity().start;
-    session::write(&authorized)?;
-    wait_for_guardian_exit(&guardian, StdDuration::from_secs(30))?;
-    verify_lid_restored(&authorized)?;
+    platform::restore_lid_snapshot(&snapshot)?;
     session::delete_state_file()?;
     eprintln!("wake: recovered the recorded lid values");
     Ok(())
@@ -1665,10 +1645,7 @@ mod tests {
             ..Session::default()
         };
 
-        let sysutil::GuardianMode::Startup(deadline) = startup_guardian_mode(&saved) else {
-            panic!("startup must use startup guardian mode");
-        };
-        assert_eq!(deadline, Some(ends_at));
+        assert_eq!(startup_guardian_deadline(&saved), Some(ends_at));
     }
 
     #[cfg(windows)]

@@ -1,11 +1,16 @@
 use crate::error::{AppError, Result};
 use crate::supervisor::BatteryStatus;
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_ACCESS_DISABLED_BY_POLICY, ERROR_SUCCESS, LocalFree,
+};
 use windows_sys::Win32::System::Power::{
+    ACCESS_AC_POWER_SETTING_INDEX, ACCESS_ACTIVE_SCHEME, ACCESS_DC_POWER_SETTING_INDEX,
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, GetSystemPowerStatus,
     PowerGetActiveScheme, PowerReadACValueIndex, PowerReadDCValueIndex, PowerSetActiveScheme,
-    PowerWriteACValueIndex, PowerWriteDCValueIndex, SYSTEM_POWER_STATUS, SetThreadExecutionState,
+    PowerSettingAccessCheckEx, PowerWriteACValueIndex, PowerWriteDCValueIndex, SYSTEM_POWER_STATUS,
+    SetThreadExecutionState,
 };
+use windows_sys::Win32::System::Registry::KEY_WRITE;
 use windows_sys::core::GUID;
 
 const EXPECTED: &[&str] = &["wake.exe", "wake"];
@@ -89,9 +94,49 @@ pub struct LidSnapshot {
 }
 
 pub fn capture_lid_snapshot() -> Result<LidSnapshot> {
+    check_lid_write_access()?;
     let scheme = active_scheme()?;
     let (ac, dc) = read_lid_values(&scheme)?;
     Ok(LidSnapshot { scheme, ac, dc })
+}
+
+fn check_lid_write_access() -> Result<()> {
+    let checks = [
+        (
+            ACCESS_AC_POWER_SETTING_INDEX,
+            &LID_ACTION as *const GUID,
+            "AC lid action",
+        ),
+        (
+            ACCESS_DC_POWER_SETTING_INDEX,
+            &LID_ACTION as *const GUID,
+            "DC lid action",
+        ),
+        (
+            ACCESS_ACTIVE_SCHEME,
+            std::ptr::null(),
+            "active power scheme",
+        ),
+    ];
+    for (accessor, setting, action) in checks {
+        // SAFETY: `setting` is null or points at LID_ACTION, which outlives the call.
+        let code = unsafe { PowerSettingAccessCheckEx(accessor, setting, KEY_WRITE) };
+        lid_access_result(action, code)?;
+    }
+    Ok(())
+}
+
+fn lid_access_result(action: &str, code: u32) -> Result<()> {
+    match code {
+        ERROR_SUCCESS => Ok(()),
+        ERROR_ACCESS_DISABLED_BY_POLICY => Err(AppError::fail(format!(
+            "the {action} is managed by group policy on this device; --even-lid cannot change it"
+        ))),
+        code => Err(power_error(
+            &format!("verify write access to the {action}"),
+            code,
+        )),
+    }
 }
 
 pub fn active_scheme() -> Result<GUID> {
@@ -346,7 +391,16 @@ pub fn lid_health(active_scheme_matches: bool, values: (u32, u32)) -> LidHealth 
 }
 
 fn power_error(action: &str, code: u32) -> AppError {
-    AppError::fail(format!("could not {action} (error {code})"))
+    let hint = match code {
+        ERROR_ACCESS_DENIED => {
+            "; power settings are restricted on this device; run wake from an elevated terminal if you are authorized"
+        }
+        ERROR_ACCESS_DISABLED_BY_POLICY => {
+            "; the setting is managed by group policy on this device"
+        }
+        _ => "",
+    };
+    AppError::fail(format!("could not {action} (error {code}){hint}"))
 }
 
 fn guid_eq(left: &GUID, right: &GUID) -> bool {
@@ -482,5 +536,28 @@ mod tests {
         assert_eq!(lid_health(true, (0, 0)), LidHealth::Healthy);
         assert_eq!(lid_health(false, (0, 0)), LidHealth::DegradedScheme);
         assert_eq!(lid_health(true, (0, 1)), LidHealth::DegradedValues);
+    }
+
+    #[test]
+    fn lid_access_check_distinguishes_policy_from_other_failures() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DISABLED_BY_POLICY;
+        assert!(lid_access_result("AC lid action", ERROR_SUCCESS).is_ok());
+        let policy =
+            lid_access_result("AC lid action", ERROR_ACCESS_DISABLED_BY_POLICY).unwrap_err();
+        assert!(policy.message().contains("group policy"));
+        let other = lid_access_result("AC lid action", 1640).unwrap_err();
+        assert!(other.message().contains("1640"));
+    }
+
+    #[test]
+    fn access_denied_power_errors_note_restricted_settings() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        let denied = power_error("write the AC lid action", ERROR_ACCESS_DENIED);
+        assert!(denied.message().contains("restricted"));
+        let policy = power_error("write the AC lid action", ERROR_ACCESS_DISABLED_BY_POLICY);
+        assert!(policy.message().contains("group policy"));
+        let generic = power_error("write the AC lid action", 87);
+        assert!(!generic.message().contains("restricted"));
+        assert!(!generic.message().contains("group policy"));
     }
 }

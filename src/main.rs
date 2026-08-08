@@ -91,7 +91,7 @@ usage:
 platforms:
   macOS: caffeinate; --even-lid uses sudo
   Linux: systemd-inhibit; --even-lid requires the logind handle-lid-switch inhibitor
-  Windows: native power APIs; --even-lid uses one UAC guardian
+  Windows: native power APIs; --even-lid adjusts the power-plan lid action
 
 durations:
   plain seconds or ordered d/h/m/s units; maximum 30d

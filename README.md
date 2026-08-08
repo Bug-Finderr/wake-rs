@@ -61,7 +61,7 @@ Only one session can be active. `wake stop` is safe to repeat.
 |---|---|---|---|
 | macOS | `caffeinate` | `pmset` | Changes `SleepDisabled` 0 to 1 with `sudo` |
 | Linux | `systemd-inhibit` | `/sys/class/power_supply` | Requires a systemd-logind lid-switch inhibitor; errors if refused |
-| Windows | Native `SetThreadExecutionState` worker | `GetSystemPowerStatus` | One UAC prompt starts a narrow guardian that restores the exact power-plan values |
+| Windows | Native `SetThreadExecutionState` worker | `GetSystemPowerStatus` | A narrow guardian restores the exact power-plan values; no prompts or elevation |
 
 On Linux, `--even-lid` requires `idle:sleep:handle-lid-switch`, or `sleep:handle-lid-switch` with `--no-display`. It never falls back, needs no `sudo`, and leaves no persistent setting; the inhibitor ends with the `systemd-inhibit` process. Without `--even-lid`, `wake` may fall back and report what was lost. This covers only logind-managed suspend, not privileged or non-logind paths such as direct `/sys/power/state` writes, acpid, WSL, or containers.
 

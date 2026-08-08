@@ -40,19 +40,21 @@ Linux `--even-lid` requires the exact systemd-logind inhibitor scope for the ses
 
 ### Windows
 
-Every session uses a detached non-elevated `wake` worker. Its main thread calls `SetThreadExecutionState`, waits for the selected condition, and clears the assertion before exiting. Timed, process-bound, and charge conditions therefore share one native lifecycle.
+Every session uses a detached `wake` worker. Its main thread calls `SetThreadExecutionState`, waits for the selected condition, and clears the assertion before exiting. Timed, process-bound, and charge conditions therefore share one native lifecycle.
 
-`--even-lid` additionally launches one elevated guardian through `ShellExecuteExW`:
+`--even-lid` additionally launches one detached guardian. Windows grants standard users write access to power-plan values by default, so nothing in the lifecycle requests elevation:
 
-1. The foreground captures the active power-scheme GUID and raw AC/DC lid actions.
-2. The worker first publishes ordinary, non-lid session state before the UAC prompt.
+1. The foreground checks lid write access through `PowerSettingAccessCheckEx` and captures the active power-scheme GUID and raw AC/DC lid actions. A group-policy override or restricted access fails the start before anything launches.
+2. The worker first publishes ordinary, non-lid session state.
 3. The guardian validates that provisional worker identity, rechecks the active scheme and captured values, rejects an elapsed absolute deadline, then atomically publishes durable restoration authority immediately before its first power write.
 4. It sets the recorded scheme to Do Nothing and verifies the active scheme and values before startup succeeds.
 5. It holds an exact handle to the worker, then restores wake-owned AC/DC fields when that worker exits.
 
-The guardian never chooses privileged write targets from mutable state. It does not overwrite a third-party lid value, reactivate a scheme the user switched away from, or delete the state record. A later non-elevated invocation verifies restoration and removes the record.
+The guardian never chooses write targets from mutable state. It does not overwrite a third-party lid value, reactivate a scheme the user switched away from, or delete the state record. A later invocation verifies restoration and removes the record.
 
-A guardian crash or power loss can require one later UAC-approved recovery. No user-mode process can guarantee immediate cleanup after its own forced termination without becoming a persistent service, which `wake` deliberately is not.
+A guardian crash, a correlated tree-kill (for example a kill-on-close job object tearing down the launching context, which the guardian shares as an ordinary child process), or power loss can leave the override in place. The next `wake` invocation restores the recorded values directly in the foreground and removes the record; there is no separate recovery process, because a respawned guardian would hold the same token and could not do more than the foreground write. No user-mode process can guarantee immediate cleanup after its own forced termination without becoming a persistent service, which `wake` deliberately is not.
+
+Restricted machines fail with distinct errors, at startup and equally during a recovery pass. A group-policy override reports the lid action as policy-managed, because policy binds elevated writers too and a plan-store write would be silently ineffective. A tightened power-setting ACL reports restricted settings and suggests an elevated terminal, which a wake started there inherits.
 
 ## Session state
 

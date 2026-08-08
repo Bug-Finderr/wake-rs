@@ -306,8 +306,8 @@ fn detach(command: &mut Command) {
 
 #[cfg(windows)]
 pub use win::{
-    GuardianMode, ProcessHandle, child_identity, current_identity, open_exact_process,
-    open_process_for_wait, spawn_elevated_guardian, spawn_worker, wait_until,
+    ProcessHandle, child_identity, current_identity, open_exact_process, open_process_for_wait,
+    spawn_guardian, spawn_worker, wait_until,
 };
 
 #[cfg(windows)]
@@ -315,8 +315,6 @@ mod win {
     use super::Identity;
     use crate::error::{AppError, Result};
     use chrono::{DateTime, Utc};
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::path::Path;
@@ -324,18 +322,14 @@ mod win {
     use std::ptr::null;
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_CANCELLED, ERROR_INVALID_PARAMETER, FILETIME, GetHandleInformation,
-        GetLastError, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_FAILED,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, GetHandleInformation, GetLastError, HANDLE,
+        HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_NO_WINDOW, CreateWaitableTimerW, DETACHED_PROCESS, GetCurrentProcess,
         GetExitCodeProcess, GetProcessId, GetProcessTimes, INFINITE, OpenProcess,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
         QueryFullProcessImageNameW, SetWaitableTimer, TerminateProcess, WaitForSingleObject,
-    };
-    use windows_sys::Win32::UI::Shell::{
-        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
 
     pub struct OwnedHandle(HANDLE);
@@ -585,34 +579,6 @@ mod win {
         duration.as_millis().min(u128::from(u32::MAX - 1)) as u32
     }
 
-    fn wide(value: &OsStr) -> Vec<u16> {
-        value.encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    pub fn quote_windows_arg(arg: &str) -> String {
-        if !arg.is_empty() && !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
-            return arg.to_string();
-        }
-        let mut quoted = String::from("\"");
-        let mut backslashes = 0;
-        for ch in arg.chars() {
-            if ch == '\\' {
-                backslashes += 1;
-            } else if ch == '"' {
-                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            } else {
-                quoted.extend(std::iter::repeat_n('\\', backslashes));
-                quoted.push(ch);
-                backslashes = 0;
-            }
-        }
-        quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
-        quoted.push('"');
-        quoted
-    }
-
     struct InheritGuard(Vec<(HANDLE, u32)>);
 
     impl Drop for InheritGuard {
@@ -667,75 +633,64 @@ mod win {
         })
     }
 
-    pub enum GuardianMode {
-        Startup(Option<chrono::DateTime<chrono::Utc>>),
-        Recovery,
-    }
-
-    pub fn spawn_elevated_guardian(
+    pub(super) fn guardian_args(
         worker_pid: u32,
         worker_start: u64,
         scheme: &str,
         ac: u32,
         dc: u32,
-        mode: GuardianMode,
+        deadline: Option<DateTime<Utc>>,
         state_path: &Path,
-    ) -> Result<ProcessHandle> {
-        let (restore_without_worker, deadline) = match mode {
-            GuardianMode::Startup(deadline) => (false, deadline),
-            GuardianMode::Recovery => (true, None),
-        };
-        let exe = std::env::current_exe()
-            .map_err(|error| AppError::fail(format!("can't determine executable path: {error}")))?;
-        if !state_path.is_absolute() {
-            return Err(AppError::fail("guardian state path must be absolute"));
-        }
-        let params = [
+    ) -> Vec<String> {
+        vec![
             "__guard_windows__".to_string(),
             worker_pid.to_string(),
             worker_start.to_string(),
             scheme.to_string(),
             ac.to_string(),
             dc.to_string(),
-            restore_without_worker.to_string(),
             deadline.map(|value| value.to_rfc3339()).unwrap_or_default(),
             state_path.to_string_lossy().into_owned(),
         ]
-        .iter()
-        .map(|arg| quote_windows_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-        let verb = wide(OsStr::new("runas"));
-        let file = wide(exe.as_os_str());
-        let params = wide(OsStr::new(&params));
+    }
 
-        // SAFETY: The structure and wide strings remain valid through ShellExecuteExW. hProcess is
-        // transferred into OwnedHandle on success.
-        unsafe {
-            let mut info = SHELLEXECUTEINFOW {
-                cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-                fMask: SEE_MASK_NOCLOSEPROCESS,
-                lpVerb: verb.as_ptr(),
-                lpFile: file.as_ptr(),
-                lpParameters: params.as_ptr(),
-                nShow: 0,
-                ..SHELLEXECUTEINFOW::default()
-            };
-            if ShellExecuteExW(&mut info) == 0 {
-                let code = GetLastError();
-                if code == ERROR_CANCELLED {
-                    return Err(AppError::fail(
-                        "elevation was cancelled; --even-lid was not enabled",
-                    ));
-                }
-                return Err(AppError::fail(format!(
-                    "could not launch the elevated guardian (error {code})"
-                )));
-            }
-            ProcessHandle::from_owned(OwnedHandle::new(info.hProcess)?)?.ok_or_else(|| {
-                AppError::fail("elevated guardian exited before publishing its identity")
-            })
+    pub fn spawn_guardian(
+        worker_pid: u32,
+        worker_start: u64,
+        scheme: &str,
+        ac: u32,
+        dc: u32,
+        deadline: Option<DateTime<Utc>>,
+        state_path: &Path,
+    ) -> Result<ProcessHandle> {
+        let exe = std::env::current_exe()
+            .map_err(|error| AppError::fail(format!("can't determine executable path: {error}")))?;
+        if !state_path.is_absolute() {
+            return Err(AppError::fail("guardian state path must be absolute"));
         }
+        let mut command = Command::new(exe);
+        command
+            .args(guardian_args(
+                worker_pid,
+                worker_start,
+                scheme,
+                ac,
+                dc,
+                deadline,
+                state_path,
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        let _inheritance = suspend_stdio_inheritance();
+        let child = command
+            .spawn()
+            .map_err(|error| AppError::fail(format!("could not launch the guardian: {error}")))?;
+        // The held Child handle keeps the pid from being reused before the exact open below.
+        let identity = child_identity(&child)?;
+        open_exact_process(child.id(), identity.start, false)?
+            .ok_or_else(|| AppError::fail("guardian exited before publishing its identity"))
     }
 
     fn last_error(message: &str) -> AppError {
@@ -950,14 +905,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_argv_quoting_handles_spaces_quotes_and_trailing_slashes() {
-        assert_eq!(win::quote_windows_arg("plain"), "plain");
-        assert_eq!(win::quote_windows_arg(""), "\"\"");
-        assert_eq!(win::quote_windows_arg("two words"), "\"two words\"");
-        assert_eq!(win::quote_windows_arg("a\\\"b"), "\"a\\\\\\\"b\"");
-        assert_eq!(
-            win::quote_windows_arg("C:\\dir with space\\"),
-            "\"C:\\dir with space\\\\\""
-        );
+    fn guardian_arguments_follow_the_eight_field_protocol() {
+        use std::path::Path;
+        let scheme = "381b4222-f694-41f0-9685-ff5bb260df2e";
+        let state = Path::new("C:\\state\\session.properties");
+        let indefinite = win::guardian_args(7, 9, scheme, 1, 2, None, state);
+        assert_eq!(indefinite.len(), 8);
+        assert_eq!(indefinite[0], "__guard_windows__");
+        assert_eq!(&indefinite[1..6], ["7", "9", scheme, "1", "2"]);
+        assert_eq!(indefinite[6], "");
+        assert_eq!(indefinite[7], "C:\\state\\session.properties");
+
+        let deadline = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let timed = win::guardian_args(7, 9, scheme, 1, 2, Some(deadline), state);
+        assert_eq!(timed[6], deadline.to_rfc3339());
     }
 }
